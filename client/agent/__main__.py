@@ -80,6 +80,7 @@ def _cmd_info(config: AgentConfig, config_path: str | None) -> int:
         f"(версия {config.credentials_version}, пароль {_mask(config.one_c_profile.password_enc)})"
     )
     print(f"Устройства:    версия списка {config.devices_version} (Д-1)")
+    print(f"Состояние:     {config.state_path} (текущая операция, §7.3)")
     print(f"Логи:          {config.log_dir}")
     return 0
 

@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "AGENT_CONFIG_FILE_NAME",
+    "AGENT_STATE_FILE_NAME",
     "CONFIG_PATH_ENV",
     "DEFAULT_AGENT_PORT",
     "DEFAULT_BASE_1C_PATH",
@@ -48,6 +49,8 @@ DEFAULT_LOG_DIR = Path(r"C:\ProgramData\MagazAgent\logs")
 
 #: Имя файла конфига и переменные окружения для нестандартных развёртываний
 AGENT_CONFIG_FILE_NAME = "agent-config.json"
+#: Файл состояния текущей 1С-операции (§7.3): лежит рядом с конфигом
+AGENT_STATE_FILE_NAME = "agent-state.json"
 CONFIG_PATH_ENV = "MAGAZ_AGENT_CONFIG"
 LOG_DIR_ENV = "MAGAZ_AGENT_LOG_DIR"
 
@@ -104,6 +107,11 @@ class AgentConfig(BaseModel):
         """Каталог логов службы (§7.1): `C:\\ProgramData\\MagazAgent\\logs`."""
         override = os.environ.get(LOG_DIR_ENV)
         return Path(override) if override else DEFAULT_LOG_DIR
+
+    @property
+    def state_path(self) -> Path:
+        """`agent-state.json` рядом с рабочей папкой агента (§7.3)."""
+        return self.work_path / AGENT_STATE_FILE_NAME
 
 
 def get_application_root() -> Path:
