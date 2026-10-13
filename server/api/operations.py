@@ -16,7 +16,10 @@
 * **пароль 1С в задаче не появляется (П-1, I-7):** параметры чистятся, а
   реквизиты подключения сервер берёт из карточки магазина;
 * **Q53** — отсутствие файла не блокирует запуск: возвращается `warning`,
-  который UI показывает жёлтым, а жёсткая блокировка отдана явному флагу.
+  который UI показывает жёлтым, а жёсткая блокировка отдана явному флагу;
+* **R12/FR-28 (П-5)** — запуск `run_merge` / `run_update_db` не создаётся, если
+  нарушает запрет «одна серверная ИБ — одно обновление»: ответ `409`, задачи не
+  создаются вовсе (в том числе в массовом запуске: либо все, либо ни одной).
 """
 
 from __future__ import annotations
@@ -403,6 +406,94 @@ def _create_job(
     return command
 
 
+# --- Запрет одновременного обновления одной ИБ (R12, FR-28, П-5) --------------
+
+
+def _guard_update(session: Session, stores: list[Store], *, kind: str) -> None:
+    """Отказать в запуске, если он нарушает запрет R12 (FR-28, П-5).
+
+    Вызывается **внутри** `command_service.dispatch_guard()`: проверка и создание
+    задач обязаны быть одним критическим участком (§11.4), иначе два админа,
+    нажавшие кнопку одновременно, проскочили бы запрет.
+
+    Проверяются только действия, меняющие ИБ: «Проверить файлы», «Скачать» и
+    «Сообщение» не блокируются — они серверную базу не трогают.
+    """
+    if kind not in command_service.UPDATE_KINDS:
+        return
+
+    conflicts = command_service.find_update_conflicts(session, stores)
+    if not conflicts:
+        return
+
+    reasons = " ".join(
+        f"{number}) {item.message}." for number, item in enumerate(conflicts, start=1)
+    )
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            "Запуск отменён: нарушен запрет одновременного обновления одной серверной ИБ "
+            f"(R12), задачи не созданы. {reasons}"
+        ),
+    )
+
+
+def _dispatch_bulk(
+    session: Session,
+    stores: list[Store],
+    *,
+    kind: str,
+    params: dict[str, Any],
+    author: str,
+    action_name: str,
+) -> tuple[list[BulkActionJobOut], str | None]:
+    """Расставить задачи по магазинам и собрать строки прогресса (§11.4).
+
+    Идёт внутри `command_service.dispatch_guard()`. Отключённый магазин даёт
+    строку `skipped`: админ видит, что магазин пропущен, а не «ничего не вышло».
+    """
+    results: list[BulkActionJobOut] = []
+    warning: str | None = None
+
+    for store in stores:
+        if not store.is_active:
+            results.append(
+                BulkActionJobOut(
+                    store_id=store.id,
+                    store_name=store.name,
+                    status="skipped",
+                    detail="Магазин отключён (is_active=false)",
+                )
+            )
+            continue
+        command = _create_job(
+            session,
+            store,
+            kind=kind,
+            params=params,
+            author=author,
+            action_name=action_name,
+        )
+        results.append(
+            BulkActionJobOut(
+                store_id=store.id,
+                store_name=store.name,
+                job_id=command.id,
+                status=str(command.status),
+                detail=dispatcher_hint(store, command),
+            )
+        )
+        if kind == str(CommandKind.RUN_MERGE) and warning is None:
+            warning = _merge_warning(
+                session,
+                store,
+                file_name=str(params.get("file_name") or ""),
+                extension_name=params.get("extension_name"),
+            )
+
+    return results, warning
+
+
 # --- Одиночное действие (§5.2.2, §11.4) -------------------------------------
 
 
@@ -432,14 +523,16 @@ def store_action(  # noqa: PLR0913 - параметры HTTP-точки
         )
 
     kind, params = _validate_action(payload.action, payload.params)
-    command = _create_job(
-        session,
-        store,
-        kind=kind,
-        params=params,
-        author=admin.username,
-        action_name=payload.action,
-    )
+    with command_service.dispatch_guard():
+        _guard_update(session, [store], kind=kind)
+        command = _create_job(
+            session,
+            store,
+            kind=kind,
+            params=params,
+            author=admin.username,
+            action_name=payload.action,
+        )
 
     warning: str | None = None
     if kind == str(CommandKind.RUN_MERGE):
@@ -517,46 +610,17 @@ def bulk_action(  # noqa: PLR0913 - параметры HTTP-точки
             detail="Не выбрано ни одного магазина (store_ids / cluster / all)",
         )
 
-    results: list[BulkActionJobOut] = []
-    warning: str | None = None
-    created = 0
-
-    for store in stores:
-        if not store.is_active:
-            results.append(
-                BulkActionJobOut(
-                    store_id=store.id,
-                    store_name=store.name,
-                    status="skipped",
-                    detail="Магазин отключён (is_active=false)",
-                )
-            )
-            continue
-        command = _create_job(
+    with command_service.dispatch_guard():
+        _guard_update(session, stores, kind=kind)
+        results, warning = _dispatch_bulk(
             session,
-            store,
+            stores,
             kind=kind,
             params=params,
             author=admin.username,
             action_name=payload.action,
         )
-        created += 1
-        results.append(
-            BulkActionJobOut(
-                store_id=store.id,
-                store_name=store.name,
-                job_id=command.id,
-                status=str(command.status),
-                detail=dispatcher_hint(store, command),
-            )
-        )
-        if kind == str(CommandKind.RUN_MERGE) and warning is None:
-            warning = _merge_warning(
-                session,
-                store,
-                file_name=str(params.get("file_name") or ""),
-                extension_name=params.get("extension_name"),
-            )
+    created = sum(1 for item in results if item.job_id is not None)
 
     audit_service.record(
         session,

@@ -64,6 +64,8 @@ const link = reactive({ url: '' })
 const busyAction = ref<ActionName | null>(null)
 const warning = ref('')
 const errorMessage = ref('')
+/** Конфликт R12 (409): запуск отменён, потому что ИБ уже обновляется (§11.4) */
+const conflict = ref('')
 const lastOutcome = ref<ActionOutcome | null>(null)
 
 /** Что показать в шапке панели: кто получит операцию. */
@@ -90,6 +92,15 @@ function notifyError(error: unknown, fallback: string): void {
       : error instanceof ApiError
         ? error.message
         : fallback
+
+  // 409 — не «поломка», а запрет (§5.2.2, R12/FR-28): показываем его спокойным
+  // жёлтым блоком и объясняем, что исключить из запуска, а не красной ошибкой.
+  if (error instanceof ApiError && error.isConflict) {
+    conflict.value = detail
+    toast.add({ severity: 'warn', summary: 'Конфликт запуска (R12)', detail, life: 8000 })
+    return
+  }
+
   errorMessage.value = detail
   toast.add({ severity: 'error', summary: 'Операция не выполнена', detail, life: 6000 })
 }
@@ -103,6 +114,7 @@ async function run(
   busyAction.value = action
   warning.value = ''
   errorMessage.value = ''
+  conflict.value = ''
 
   try {
     const outcome = await dispatchAction(targets.value, action, params)
@@ -147,6 +159,16 @@ async function run(
       data-test="operation-warning"
     >
       {{ warning }}
+    </Message>
+    <Message
+      v-if="conflict"
+      severity="warn"
+      :closable="false"
+      class="mt-3"
+      data-test="operation-conflict"
+    >
+      <span class="font-semibold">Запуск отменён: одна серверная ИБ не обновляется дважды (R12).</span>
+      <span class="mt-1 block">{{ conflict }}</span>
     </Message>
     <Message v-if="errorMessage" severity="error" :closable="false" class="mt-3">
       {{ errorMessage }}

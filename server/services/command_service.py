@@ -13,18 +13,28 @@
   200 КБ): храним **хвост** лога, потому что итог операции 1С пишет в конец;
 * **§4.3** — `finished_at` ставится только у завершающих статусов, а
   `started_at` — при первой попытке отправки, поэтому в UI видно и «ещё не
-  началось», и «идёт N секунд».
+  началось», и «идёт N секунд»;
+* **R12/FR-28** — запуск обновления отклоняется, если ту же серверную ИБ
+  (`cluster_name` + `database_name`) уже обновляет другой магазин или у самого
+  магазина висит незавершённая задача обновления. Проверка
+  (`find_update_conflicts`) и постановка задач идут в одном критическом участке
+  (`dispatch_guard`), поэтому два администратора, нажавшие кнопку одновременно,
+  не «проскочат» запрет.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from server.db.models import Command, JobLog
+from server.db.models import Command, JobLog, Store
 from shared.enums import CommandKind, CommandStatus, JobLogLevel
 from shared.timeutil import utcnow
 
@@ -33,10 +43,14 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ACTIVE_STATUSES",
     "FINISHED_STATUSES",
+    "UPDATE_KINDS",
+    "UpdateConflict",
     "add_log",
     "count_active",
     "counts_by_status",
     "create_command",
+    "dispatch_guard",
+    "find_update_conflicts",
     "get_command",
     "list_commands",
     "list_pending",
@@ -79,6 +93,18 @@ MAX_LOG_LINE_CHARS = 4000
 
 #: Маркеры ошибки в логе 1С (Приложение B: `Ошибка`, `Error`)
 ERROR_MARKERS = ("Ошибка", "ошибка", "Error", "error", "FAILED")
+
+#: Виды задач, которые меняют серверную ИБ 1С: их параллельный запуск запрещён (R12)
+UPDATE_KINDS: tuple[str, ...] = (str(CommandKind.RUN_MERGE), str(CommandKind.RUN_UPDATE_DB))
+
+#: Человекочитаемые названия операций обновления — для текстов конфликтов R12
+KIND_LABELS: dict[str, str] = {
+    str(CommandKind.RUN_MERGE): "слияние конфигурации",
+    str(CommandKind.RUN_UPDATE_DB): "обновление конфигурации БД",
+}
+
+#: Замок критического участка «проверка R12 → создание задач» (FR-28, §14.1)
+_DISPATCH_LOCK = threading.RLock()
 
 
 def sanitize_params(params: dict[str, Any] | None) -> dict[str, Any]:
@@ -303,3 +329,186 @@ def status_age_sec(command: Command, *, now: Any = None) -> float:  # noqa: ANN4
         return 0.0
     moment = now or utcnow()
     return max(0.0, (moment - reference).total_seconds())
+
+
+# --- Запрет одновременного обновления одной ИБ (R12, FR-28, П-5) --------------
+
+
+@dataclass(frozen=True)
+class UpdateConflict:
+    """Причина, по которой запуск обновления запрещён (R12, FR-28, П-5).
+
+    Три случая одной структурой: `same_store` — у магазина уже есть незавершённая
+    задача обновления («одного `ip`» из ответа заказчика), `same_database` — ИБ
+    магазина прямо сейчас обновляет другой магазин, `same_database_batch` — в
+    одном запуске два магазина одной серверной ИБ.
+    """
+
+    reason: str
+    store_ids: tuple[int, ...]
+    store_names: tuple[str, ...]
+    cluster_name: str | None = None
+    database_name: str | None = None
+    job_id: int | None = None
+    job_kind: str | None = None
+    busy_store_name: str | None = None
+
+    @property
+    def stores_text(self) -> str:
+        """Магазины в тексте ответа: «Магазин №5», «Магазин №6»."""
+        return ", ".join(f"«{name}»" for name in self.store_names)
+
+    @property
+    def database_text(self) -> str:
+        """Серверная ИБ в терминах 1С: `cluster_name\\database_name` (§2 Q2)."""
+        return f"{self.cluster_name or '—'}\\{self.database_name or '—'}"
+
+    @property
+    def message(self) -> str:
+        """Готовый текст конфликта для `detail` ответа `409` (§5.2.2)."""
+        if self.reason == "same_store":
+            label = KIND_LABELS.get(str(self.job_kind), "обновление")
+            return (
+                f"магазин {self.stores_text} уже выполняет операцию «{label}» "
+                f"(задача #{self.job_id}): дождитесь её завершения и запустите снова"
+            )
+        if self.reason == "same_database":
+            return (
+                f"серверную ИБ «{self.database_text}» уже обновляет магазин "
+                f"«{self.busy_store_name}» (задача #{self.job_id}): исключите магазин "
+                f"{self.stores_text} из запуска или дождитесь завершения"
+            )
+        return (
+            f"магазины {self.stores_text} работают с одной серверной ИБ "
+            f"«{self.database_text}»: одновременное обновление запрещено — "
+            "исключите один из магазинов из запуска и повторите"
+        )
+
+
+def _ib_key(store: Store) -> tuple[str, str] | None:
+    """Ключ серверной ИБ магазина: `cluster_name` + `database_name` (§2 Q2).
+
+    Регистр и лишние пробелы не важны: `srv-1c` и ` SRV-1C ` — одна ИБ. `None`
+    означает «ИБ не определена» (одно из полей пустое): по такой паре запрет R12
+    не применяется, иначе магазины без заполненной базы блокировали бы друг друга.
+    """
+    cluster = (store.cluster_name or "").strip().casefold()
+    database = (store.database_name or "").strip().casefold()
+    if not cluster or not database:
+        return None
+    return cluster, database
+
+
+def active_update_commands(
+    session: Session, *, kinds: Sequence[str] = UPDATE_KINDS
+) -> list[Command]:
+    """Незавершённые задачи, меняющие серверную ИБ, — вход проверки R12.
+
+    Один запрос на весь запуск: задач «в работе» мало даже при парке 35–40
+    магазинов (§2 Q7). Карточка магазина нужна для его ИБ, поэтому `selectinload`.
+    """
+    stmt = (
+        select(Command)
+        .where(Command.kind.in_(list(kinds)), Command.status.in_(ACTIVE_STATUSES))
+        .options(selectinload(Command.store))
+        .order_by(Command.id)
+    )
+    commands = list(session.scalars(stmt).all())
+    logger.debug("Незавершённых задач обновления: %s", len(commands))
+    return commands
+
+
+def find_update_conflicts(
+    session: Session,
+    stores: Sequence[Store],
+    *,
+    kinds: Sequence[str] = UPDATE_KINDS,
+) -> list[UpdateConflict]:
+    """Проверить запрет одновременного обновления одной ИБ (R12, FR-28, П-5).
+
+    Запрет жёсткий: любая найденная строка — основание отдать `409` и **не**
+    создавать задачи. Отключённые магазины не рассматриваются: по ним действие
+    всё равно пропускается (§11.4), «занимать ИБ» они не могут.
+    """
+    targets = [store for store in stores if store.is_active]
+    if not targets:
+        return []
+
+    busy_by_store: dict[int, Command] = {}
+    busy_by_database: dict[tuple[str, str], Command] = {}
+    for command in active_update_commands(session, kinds=kinds):
+        busy_by_store.setdefault(int(command.store_id), command)
+        store_row = command.store
+        key = _ib_key(store_row) if store_row is not None else None
+        if key is not None:
+            busy_by_database.setdefault(key, command)
+
+    conflicts: list[UpdateConflict] = []
+    groups: dict[tuple[str, str], list[Store]] = {}
+    for store in targets:
+        key = _ib_key(store)
+        if key is not None:
+            groups.setdefault(key, []).append(store)
+
+        busy = busy_by_store.get(int(store.id))
+        if busy is not None:
+            conflicts.append(
+                UpdateConflict(
+                    reason="same_store",
+                    store_ids=(int(store.id),),
+                    store_names=(store.name,),
+                    cluster_name=store.cluster_name,
+                    database_name=store.database_name,
+                    job_id=int(busy.id),
+                    job_kind=str(busy.kind),
+                )
+            )
+            continue
+
+        busy_other = busy_by_database.get(key) if key is not None else None
+        if busy_other is not None and int(busy_other.store_id) != int(store.id):
+            other = busy_other.store
+            conflicts.append(
+                UpdateConflict(
+                    reason="same_database",
+                    store_ids=(int(store.id),),
+                    store_names=(store.name,),
+                    cluster_name=store.cluster_name,
+                    database_name=store.database_name,
+                    job_id=int(busy_other.id),
+                    job_kind=str(busy_other.kind),
+                    busy_store_name=getattr(other, "name", None) or f"id={busy_other.store_id}",
+                )
+            )
+
+    for key, group in groups.items():
+        # Если ИБ уже занята, точнее сообщить «её обновляет магазин X» (выше),
+        # чем перечислять пару магазинов одного запуска.
+        if len(group) < 2 or key in busy_by_database:
+            continue
+        conflicts.append(
+            UpdateConflict(
+                reason="same_database_batch",
+                store_ids=tuple(int(item.id) for item in group),
+                store_names=tuple(item.name for item in group),
+                cluster_name=group[0].cluster_name,
+                database_name=group[0].database_name,
+            )
+        )
+
+    conflicts.sort(key=lambda item: (item.reason, item.store_ids))
+    return conflicts
+
+
+@contextmanager
+def dispatch_guard() -> Iterator[None]:
+    """Держать проверку R12 и постановку задач в одном критическом участке.
+
+    Запрет «одна ИБ — одно обновление» нельзя проверить «в вакууме»: между
+    проверкой и `INSERT` два администратора могли бы проскочить оба. Сервер
+    работает одним процессом uvicorn (§14.1), а админские эндпоинты объявлены
+    синхронными (`def`), то есть выполняются в threadpool FastAPI, — поэтому
+    обычного потокового замка достаточно, и он не блокирует event loop.
+    """
+    with _DISPATCH_LOCK:
+        yield

@@ -43,14 +43,26 @@ def jobs(session: Session) -> list[Command]:
     return list(session.scalars(select(Command).order_by(Command.id)))
 
 
-def add_store(session: Session, *, name: str, ip: str, cluster: str, active: bool = True) -> Store:
-    """Второй магазин для массовых операций (§11.4)."""
+def add_store(
+    session: Session,
+    *,
+    name: str,
+    ip: str,
+    cluster: str,
+    database: str = "trade",
+    active: bool = True,
+) -> Store:
+    """Второй магазин для массовых операций (§11.4).
+
+    `database` нужен тестам запрета R12: «одна серверная ИБ» — это совпадение
+    `cluster_name` + `database_name` (§9.2 FR-28).
+    """
     session.rollback()
     store = Store(
         name=name,
         ip_address=ip,
         cluster_name=cluster,
-        database_name="trade",
+        database_name=database,
         version_1c="8.3.24.1548",
         user_name_1c="Администратор",
         agent_token=f"token-{ip.replace('.', '-')}",
@@ -586,3 +598,171 @@ class TestAgentCommandResult:
 
         assert without_token.status_code == 401
         assert from_foreign_ip.status_code == 403
+
+
+class TestUpdateConflictBlock:
+    """Жёсткий запрет одновременного обновления одной ИБ (R12, §9.2 FR-28, П-5).
+
+    Проверяется то, что видит админ: запуск обновления отклоняется `409`, задачи
+    не создаются, а текст объясняет, кого исключить. Действия, не меняющие ИБ,
+    проходят. Диспетчер в тестах выключен, поэтому созданная задача остаётся
+    «в работе» и играет роль «ИБ уже занята».
+    """
+
+    def _launch(self, client: TestClient, store: Store, action: str = "run_merge") -> int:
+        """Поставить обновление магазину и вернуть id задачи (ожидается `202`)."""
+        params = {"file_name": "update"} if action == "run_merge" else {"is_fast_update": False}
+        response = client.post(actions_url(store.id), json={"action": action, "params": params})
+        assert response.status_code == 202, response.text
+        return int(response.json()["job"]["id"])
+
+    @pytest.mark.parametrize("action", ["run_merge", "run_update_db"])
+    def test_bulk_update_of_one_database_is_rejected(
+        self, auth_client: TestClient, session: Session, store: Store, action: str
+    ) -> None:
+        """Два магазина одной ИБ в одном запуске — `409` и ни одной задачи (FR-28)."""
+        second = add_store(session, name="Магазин №6", ip="10.10.5.11", cluster="srv-1c")
+        params = {"file_name": "update"} if action == "run_merge" else {"is_fast_update": False}
+
+        response = auth_client.post(
+            BULK_URL, json={"action": action, "params": params, "all": True}
+        )
+
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        assert "R12" in detail
+        assert "одной серверной ИБ" in detail
+        assert store.name in detail and second.name in detail, "видно, кого исключить"
+        assert jobs(session) == [], "при конфликте задачи не создаются вовсе"
+
+    def test_launch_on_same_store_is_rejected(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """Повторный запуск обновления на том же магазине («одного ip») — `409`."""
+        first = self._launch(auth_client, store)
+
+        response = auth_client.post(
+            actions_url(store.id),
+            json={"action": "run_update_db", "params": {"is_fast_update": False}},
+        )
+
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        assert "уже выполняет операцию" in detail
+        assert f"#{first}" in detail
+        assert len(jobs(session)) == 1, "вторая задача не создана"
+
+    def test_launch_on_another_store_of_same_database_is_rejected(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """ИБ занята другим магазином — `409` с указанием, кто её обновляет."""
+        second = add_store(session, name="Магазин №6", ip="10.10.5.11", cluster="srv-1c")
+        self._launch(auth_client, store)
+
+        response = auth_client.post(
+            actions_url(second.id), json={"action": "run_merge", "params": {"file_name": "update"}}
+        )
+
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        assert store.name in detail and "уже обновляет" in detail
+        assert len(jobs(session)) == 1
+
+    def test_launch_is_allowed_after_previous_job_finished(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """Пока задача не завершена — запрет; после завершения запуск проходит."""
+        self._launch(auth_client, store)
+        stored = jobs(session)[0]
+        stored.status = CommandStatus.SUCCESS
+        session.commit()
+
+        response = auth_client.post(
+            actions_url(store.id),
+            json={"action": "run_update_db", "params": {"is_fast_update": True}},
+        )
+
+        assert response.status_code == 202, response.text
+        assert len(jobs(session)) == 2
+
+    def test_actions_that_do_not_change_database_are_allowed(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """`check_files`, `download_file`, `send_message` не блокируются (§11.4)."""
+        second = add_store(session, name="Магазин №6", ip="10.10.5.11", cluster="srv-1c")
+        self._launch(auth_client, store)
+
+        check = auth_client.post(
+            BULK_URL,
+            json={"action": "check_files", "params": {"filename": "update"}, "all": True},
+        )
+        download = auth_client.post(
+            BULK_URL,
+            json={
+                "action": "download_file",
+                "params": {"url-file": "https://disk.yandex.ru/d/XXXX/update.cf"},
+                "store_ids": [store.id, second.id],
+            },
+        )
+        notice = auth_client.post(
+            actions_url(store.id),
+            json={
+                "action": "send_message",
+                "params": {"text_message": "База будет обновлена через 5 минут"},
+            },
+        )
+
+        assert check.status_code == 202, check.text
+        assert download.status_code == 202, download.text
+        assert notice.status_code == 202, notice.text
+
+    @pytest.mark.parametrize(
+        ("cluster", "database"),
+        [("srv-1c", "trade2"), ("srv-9c", "trade")],
+    )
+    def test_other_database_or_cluster_is_allowed(
+        self,
+        auth_client: TestClient,
+        session: Session,
+        store: Store,
+        cluster: str,
+        database: str,
+    ) -> None:
+        """Разные ИБ (`cluster_name` или `database_name`) не конфликтуют (FR-28)."""
+        add_store(session, name="Магазин №6", ip="10.10.5.11", cluster=cluster, database=database)
+
+        response = auth_client.post(
+            BULK_URL,
+            json={"action": "run_merge", "params": {"file_name": "update"}, "all": True},
+        )
+
+        assert response.status_code == 202, response.text
+        assert response.json()["total"] == 2
+
+    def test_store_without_database_does_not_block_others(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """Пустая база = ИБ не определена: запрет по паре не применяется (FR-28)."""
+        add_store(session, name="Магазин №6", ip="10.10.5.11", cluster="srv-1c", database="")
+
+        response = auth_client.post(
+            BULK_URL,
+            json={"action": "run_merge", "params": {"file_name": "update"}, "all": True},
+        )
+
+        assert response.status_code == 202, response.text
+        assert len(jobs(session)) == 2
+
+    def test_disabled_store_does_not_block_launch(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """Отключённый магазин пропускается и ИБ не занимает (§11.4, FR-28)."""
+        add_store(session, name="Магазин №6", ip="10.10.5.11", cluster="srv-1c", active=False)
+
+        response = auth_client.post(
+            BULK_URL,
+            json={"action": "run_merge", "params": {"file_name": "update"}, "all": True},
+        )
+
+        assert response.status_code == 202, response.text
+        assert len(jobs(session)) == 1

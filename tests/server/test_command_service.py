@@ -7,12 +7,15 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import timedelta
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from server.db.models import JobLog, Store
+from server.db.models import Command, JobLog, Store
 from server.services import command_service, settings_service
 from shared.enums import CommandKind, CommandStatus, JobLogLevel
 from shared.timeutil import utcnow
@@ -199,3 +202,151 @@ class TestQueries:
             item.id for item in command_service.list_commands(session, active_only=True)
         ] == [first.id]
         assert [item.id for item in command_service.list_pending(session)] == [first.id]
+
+
+class TestUpdateConflicts:
+    """Запрет одновременного обновления одной ИБ (§9.2 FR-28, П-5) — сервисный слой."""
+
+    def _store(
+        self, session: Session, *, name: str, ip: str, cluster: str, database: str
+    ) -> Store:
+        """Магазин с явной серверной ИБ (`cluster_name` + `database_name`)."""
+        store = Store(
+            name=name,
+            ip_address=ip,
+            cluster_name=cluster,
+            database_name=database,
+            version_1c="8.3.24.1548",
+            user_name_1c="Администратор",
+            agent_token=f"token-{ip.replace('.', '-')}",
+        )
+        session.add(store)
+        session.commit()
+        return store
+
+    def _job(self, session: Session, store: Store) -> Command:
+        """Незавершённая задача обновления магазина (диспетчера в тестах нет)."""
+        command = command_service.create_command(
+            session, store_id=store.id, kind=CommandKind.RUN_MERGE, params={"file_name": "update"}
+        )
+        session.commit()
+        return command
+
+    def _pair(self, session: Session, *, second_cluster: str, second_database: str) -> tuple:
+        """Два магазина: первый — `srv-1c\\trade`, второй — с заданными реквизитами ИБ."""
+        first = self._store(session, name="Магазин №5", ip="10.10.5.10", cluster="srv-1c", database="trade")
+        second = self._store(
+            session, name="Магазин №6", ip="10.10.5.11", cluster=second_cluster, database=second_database
+        )
+        return first, second
+
+    def test_same_store_busy_is_conflict(self, session: Session) -> None:
+        store = self._store(session, name="Магазин №5", ip="10.10.5.10", cluster="srv-1c", database="trade")
+        job = self._job(session, store)
+
+        conflicts = command_service.find_update_conflicts(session, [store])
+
+        assert [item.reason for item in conflicts] == ["same_store"]
+        assert f"#{job.id}" in conflicts[0].message
+        assert "слияние конфигурации" in conflicts[0].message, "видно, что именно идёт"
+
+    def test_same_database_in_one_run_is_conflict(self, session: Session) -> None:
+        first, second = self._pair(session, second_cluster="srv-1c", second_database="trade")
+
+        conflicts = command_service.find_update_conflicts(session, [first, second])
+
+        assert [item.reason for item in conflicts] == ["same_database_batch"]
+        assert first.name in conflicts[0].message and second.name in conflicts[0].message
+        assert "srv-1c\\trade" in conflicts[0].message
+
+    def test_busy_database_of_another_store_is_conflict(self, session: Session) -> None:
+        first, second = self._pair(session, second_cluster="srv-1c", second_database="trade")
+        self._job(session, first)
+
+        conflicts = command_service.find_update_conflicts(session, [second])
+
+        assert [item.reason for item in conflicts] == ["same_database"]
+        assert "уже обновляет" in conflicts[0].message
+        assert first.name in conflicts[0].message
+
+    def test_case_and_spaces_do_not_hide_same_database(self, session: Session) -> None:
+        """`SRV-1C` и `srv-1c`, `Trade` и `trade` — одна ИБ (FR-28)."""
+        first, second = self._pair(session, second_cluster=" SRV-1C ", second_database="Trade")
+
+        conflicts = command_service.find_update_conflicts(session, [first, second])
+
+        assert [item.reason for item in conflicts] == ["same_database_batch"]
+
+    @pytest.mark.parametrize(
+        ("cluster", "database"),
+        [("srv-1c", "trade2"), ("srv-9c", "trade"), ("srv-1c", "")],
+    )
+    def test_other_database_is_not_a_conflict(
+        self, session: Session, cluster: str, database: str
+    ) -> None:
+        """Другая ИБ или незаполненная база — запрета нет (FR-28)."""
+        first, second = self._pair(session, second_cluster=cluster, second_database=database)
+
+        assert command_service.find_update_conflicts(session, [first, second]) == []
+
+    def test_finished_job_is_not_a_conflict(self, session: Session) -> None:
+        store = self._store(session, name="Магазин №5", ip="10.10.5.10", cluster="srv-1c", database="trade")
+        job = self._job(session, store)
+        command_service.set_status(session, job, CommandStatus.SUCCESS)
+
+        assert command_service.find_update_conflicts(session, [store]) == []
+
+    def test_disabled_store_is_ignored(self, session: Session) -> None:
+        """Отключённый магазин в выборку не попадает и ИБ не «занимает» (§11.4)."""
+        first, second = self._pair(session, second_cluster="srv-1c", second_database="trade")
+        second.is_active = False
+
+        assert command_service.find_update_conflicts(session, [first, second]) == []
+
+
+class TestDispatchGuard:
+    """Критический участок «проверка R12 → создание задач» (§9.2 FR-28, П-5).
+
+    Проверка запрета и `INSERT` задач должны быть неразрывны: иначе два админа,
+    нажавшие кнопку одновременно, проскочили бы оба.
+    """
+
+    def test_guard_serializes_threads(self) -> None:
+        """Второй поток не входит в участок, пока первый его не отпустил."""
+        order: list[str] = []
+        inside = threading.Event()
+        release = threading.Event()
+
+        def holder() -> None:
+            with command_service.dispatch_guard():
+                order.append("первый вошёл")
+                inside.set()
+                release.wait(timeout=5)
+                order.append("первый вышел")
+
+        def second() -> None:
+            inside.wait(timeout=5)
+            with command_service.dispatch_guard():
+                order.append("второй вошёл")
+
+        first_thread = threading.Thread(target=holder)
+        second_thread = threading.Thread(target=second)
+
+        first_thread.start()
+        assert inside.wait(timeout=5), "первый поток вошёл в участок"
+        second_thread.start()
+        time.sleep(0.05)  # даём второму потоку дойти до замка
+        assert order == ["первый вошёл"], "пока первый держит замок, второго внутри нет"
+
+        release.set()
+        first_thread.join(timeout=5)
+        second_thread.join(timeout=5)
+
+        assert order == ["первый вошёл", "первый вышел", "второй вошёл"]
+
+    def test_guard_is_reentrant(self) -> None:
+        """Вложенный вход не блокирует сам себя (RLock: эндпоинт → хелпер)."""
+        with command_service.dispatch_guard(), command_service.dispatch_guard():
+            entered = True
+
+        assert entered

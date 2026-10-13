@@ -128,7 +128,7 @@ function errorMessage(status: number, parsed: unknown): string {
   if (status === 401) return 'Требуется вход в дашборд'
   if (status === 403) return 'Недостаточно прав'
   if (status === 404) return 'Не найдено'
-  if (status === 409) return 'Операция конфликтует с текущей'
+  if (status === 409) return 'Конфликт: операция уже выполняется или серверная ИБ занята другой операцией (R12)'
   if (status === 422) return 'Проверьте заполненные поля'
   return `Ошибка ${status}`
 }
