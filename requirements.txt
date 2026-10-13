@@ -1,0 +1,13 @@
+# --- Сервер дашборда «Magaz UI» (§14.1) ---
+# Версии зафиксированы по фактическому прогону Э1 (Python 3.12, Windows).
+# Обновление — осознанное действие с повторным прогоном тестов.
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+SQLAlchemy==2.1.4
+alembic==1.20.0
+pydantic==2.14.1
+pydantic-settings==2.15.0
+itsdangerous==2.2.0
+cryptography==50.0.2
+httpx==0.28.1
+

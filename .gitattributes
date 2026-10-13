@@ -1,0 +1,16 @@
+# Нормализация переводов строк: в репозитории — LF, в рабочей копии — как удобно ОС.
+# Это убирает «шум» предупреждений git на Windows и разницу diff между машинами.
+* text=auto
+
+# Файлы, которым нужен именно CRLF (Windows-скрипты и службы)
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Бинарные файлы (git не должен их трогать)
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
+*.exe binary
+*.db binary

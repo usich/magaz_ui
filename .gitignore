@@ -1,0 +1,50 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# --- Данные и секреты сервера (не в git) ---
+server/data/*.db
+server/data/*.db-journal
+server/data/*.db-wal
+server/data/*.db-shm
+server/data/*.log
+server/data/secrets.key
+server/data/logs/
+
+# --- Агент: рабочие артефакты кассы (не в git) ---
+client/**/agent-config.json
+client/**/notifications.json
+client/**/devices.json
+client/**/agent-state.json
+client/**/log-*.txt
+logs/
+
+# --- Фронтенд ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+
+# --- Сборка PyInstaller ---
+build/
+dist/
+*.spec.bak
+
+# --- IDE / ОС ---
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+
+# --- Артефакты локальных прогонов (логи запуска, MCP-браузер) ---
+*.out.log
+*.err.log
+*.pid
+.playwright-mcp/
+
