@@ -20,12 +20,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from server.api import operations as operations_api
 from server.api import stores as stores_api
 from server.config import API_PREFIX
 from server.core.context import AppContext
 from server.core.dependencies import get_client_ip, get_context, get_db, require_active_admin
 from server.db.models import AdminUser, AuditLog, Store
-from server.services import admin_service, audit_service, settings_service, store_service
+from server.services import admin_service, audit_service, command_service, settings_service, store_service
 from shared.timeutil import to_iso_z
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,9 @@ SETTINGS_DESCRIPTIONS: dict[str, str] = {
     "default_file_name": "Имя файла обновления по умолчанию",
     "command_retry_max": "Попытки отправки команды агенту",
     "log_excerpt_limit_bytes": "Обрезка лога при сохранении в БД, байт",
+    # Д-7 (Э4): порог ожидания операции и период сверки учётных данных (П-1)
+    "command_poll_timeout_sec": "Предел ожидания операции 1С (после — статус timeout), с",
+    "credentials_push_interval_sec": "Как часто сверять версию учётных данных 1С на кассе, с",
     "notification_snooze_min": "Через сколько минут вернуть отложенное уведомление",
     "device_check_interval_sec": "Интервал опроса оборудования подсети агентом, с",
     "device_online_window_sec": "Окно, в котором устройство считается онлайн, с",
@@ -130,6 +134,9 @@ auth_router = APIRouter(prefix="/auth", tags=["admin-auth"])
 protected_router = APIRouter(dependencies=[Depends(require_active_admin)])
 #: Магазины (Э2): CRUD, токен, учётные данные 1С, «проверить сейчас» (§5.2.2, §11.2)
 router.include_router(stores_api.router)
+#: Операции (Э4): одиночные и массовые действия, история задач, матрица файлов
+#: (§5.2.2, §11.3, §11.4, §11.6)
+router.include_router(operations_api.router)
 
 
 # --- Вход/выход (§4.2, §8.1) ------------------------------------------------
@@ -254,6 +261,8 @@ def system_info_payload(session: Session, context: AppContext) -> dict[str, Any]
             "online_window_sec": online_window,
             "admins_total": _count(session, AdminUser),
             "audit_events": _count(session, AuditLog),
+            # Э4: плитка «Задач в работе» на главной (§11.1) — queued/sent/running
+            "jobs_active": command_service.count_active(session),
         },
         "settings_keys": len(settings_service.DEFAULT_SETTINGS),
     }

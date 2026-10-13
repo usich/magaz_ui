@@ -41,9 +41,10 @@ STORE_IP = "10.10.5.10"
 def settings(tmp_path) -> Settings:  # noqa: ANN001 - pytest tmp_path
     """Настройки сервера, полностью изолированные во временном каталоге.
 
-    Health Monitor выключен: тесты не должны ходить в сеть за спиной сценария.
-    Там, где мониторинг проверяется, он запускается явно (`run_cycle`,
-    `HealthMonitor.poll_once`) с подменённым транспортом.
+    Health Monitor и Диспетчер выключены: тесты не должны ходить в сеть за спиной
+    сценария. Там, где фоновая работа проверяется, она запускается явно
+    (`run_cycle`, `HealthMonitor.poll_once`, `CommandDispatcher.process_once`)
+    с подменённым транспортом.
     """
     return Settings(
         database_url=f"sqlite:///{(tmp_path / 'magaz.db').as_posix()}",
@@ -52,6 +53,7 @@ def settings(tmp_path) -> Settings:  # noqa: ANN001 - pytest tmp_path
         frontend_dist_dir=tmp_path / "dist",
         serve_spa=True,
         health_monitor_enabled=False,
+        dispatcher_enabled=False,
         log_file=tmp_path / "logs" / "server.log",
         log_level="WARNING",
         _env_file=None,

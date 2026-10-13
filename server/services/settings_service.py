@@ -35,6 +35,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "default_file_name": "update",
     "command_retry_max": "3",
     "log_excerpt_limit_bytes": "204800",
+    # Д-7 (Э4): предел ожидания операции 1С и период сверки учётных данных (П-1)
+    "command_poll_timeout_sec": "3600",
+    "credentials_push_interval_sec": "300",
     "notification_snooze_min": "15",
     "device_check_interval_sec": "60",
     "device_online_window_sec": "180",

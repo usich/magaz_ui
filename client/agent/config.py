@@ -38,6 +38,7 @@ __all__ = [
     "describe_os",
     "get_application_root",
     "load_config",
+    "save_one_c_profile",
 ]
 
 #: Значения по умолчанию §7.1/§7.2 (переопределяются конфигом агента)
@@ -138,6 +139,35 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
         data = json.load(handle)
     logger.debug("Конфиг агента прочитан: %s", resolved)
     return AgentConfig.model_validate(data)
+
+
+def save_one_c_profile(path: str | Path, profile: "OneCProfile") -> Path:
+    """Сохранить профиль 1С в `agent-config.json`, не трогая остальные поля (§7.2, П-1).
+
+    Запись атомарная (временный файл + `os.replace`): если кассу выключат в
+    момент push-а `POST /credentials`, конфиг останется читаемым — либо старый,
+    либо новый. Значение пароля здесь уже зашифровано (Fernet + DPAPI).
+    """
+    target = Path(path)
+    data: dict = {}
+    if target.is_file():
+        with target.open("r", encoding="utf-8-sig") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            data = loaded
+    data["one_c_profile"] = {
+        "user_name": profile.user_name,
+        "password_enc": profile.password_enc,
+        "credentials_version": int(profile.credentials_version),
+    }
+
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp, target)
+    logger.info("Профиль 1С сохранён в %s (версия %s)", target, profile.credentials_version)
+    return target
 
 
 def describe_os() -> str:

@@ -8,7 +8,7 @@
  * кэширует, чтобы не расходиться с фактом.
  */
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { RouterLink, useRoute } from 'vue-router'
 import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
 import InputText from 'primevue/inputtext'
@@ -18,12 +18,14 @@ import { useToast } from 'primevue/usetoast'
 
 import { ApiError } from '@/api/client'
 import type { StoreHealth } from '@/api/types'
-import StagePlaceholder from '@/components/StagePlaceholder.vue'
+import OperationPanel from '@/components/OperationPanel.vue'
+import { JOB_KIND_LABELS, JOB_STATUS_LABELS, jobStatusSeverity, useJobsStore } from '@/stores/jobs'
 import { useStoresStore } from '@/stores/stores'
 
 const route = useRoute()
 const toast = useToast()
 const stores = useStoresStore()
+const jobs = useJobsStore()
 
 const storeId = computed(() => Number(route.params.id))
 const store = computed(() => stores.byId(storeId.value))
@@ -47,7 +49,23 @@ onMounted(async () => {
   if (store.value) {
     credentials.user_name_1c = store.value.user_name_1c
   }
+  jobs.storeId = storeId.value
+  await jobs.load()
 })
+
+function kindLabel(kind: string): string {
+  return JOB_KIND_LABELS[kind] ?? kind
+}
+
+function statusLabel(status: string): string {
+  return JOB_STATUS_LABELS[status] ?? status
+}
+
+/** После запуска операции перечитываем историю: задача уже в очереди (§11.6). */
+async function reloadJobs(): Promise<void> {
+  jobs.storeId = storeId.value
+  await jobs.load()
+}
 
 function notifyError(error: unknown, fallback: string): void {
   const message = error instanceof ApiError ? error.message : fallback
@@ -332,16 +350,79 @@ function formatTime(value: string | null | undefined): string {
       </div>
     </section>
 
-    <StagePlaceholder
-      title="История задач, логи и оборудование подсети"
-      stage="Э4 / Э4Б"
-      description="Карточка магазина наполняется дальше по плану §12: операции 1С с логами и таблица оборудования магазина."
-      :bullets="[
-        'История задач магазина и полный текст логов (Э4)',
-        'Досылка учётных данных 1С агенту автоматически (П-1, Э4)',
-        'Оборудование подсети: добавить, «проверить сейчас», отключить из опроса (Д-1, Э4Б)',
-      ]"
+    <OperationPanel
+      :store-ids="[storeId]"
+      title="Операции магазина"
+      @submitted="reloadJobs"
     />
+
+    <section class="rounded-xl border border-slate-200 bg-white p-5">
+      <header class="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 class="font-semibold">История задач магазина</h3>
+          <p class="magaz-muted text-xs">
+            Последние операции с логами; полный лог открывается в задаче (§11.6).
+          </p>
+        </div>
+        <div class="flex items-center gap-2">
+          <span v-if="jobs.lastLoadedAt" class="magaz-muted text-xs">
+            обновлено {{ jobs.lastLoadedAt.toLocaleTimeString('ru-RU') }}
+          </span>
+          <Button
+            label="Обновить"
+            icon="pi pi-refresh"
+            size="small"
+            text
+            :loading="jobs.isLoading"
+            data-test="store-jobs-refresh"
+            @click="reloadJobs"
+          />
+        </div>
+      </header>
+
+      <div class="mt-3 overflow-x-auto">
+        <table class="magaz-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Операция</th>
+              <th>Статус</th>
+              <th>Автор</th>
+              <th>Создана</th>
+              <th>Последнее сообщение</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="job in jobs.items" :key="job.id" :data-test="`store-job-${job.id}`">
+              <td class="magaz-mono">{{ job.id }}</td>
+              <td>{{ kindLabel(job.kind) }}</td>
+              <td>
+                <Tag
+                  :value="statusLabel(job.status)"
+                  :severity="jobStatusSeverity(job.status)"
+                />
+              </td>
+              <td>{{ job.created_by ?? '—' }}</td>
+              <td class="magaz-muted whitespace-nowrap">{{ formatTime(job.created_at) }}</td>
+              <td class="max-w-sm truncate" :title="job.last_message ?? job.last_error ?? ''">
+                {{ job.last_message ?? job.last_error ?? '—' }}
+              </td>
+              <td>
+                <RouterLink :to="{ name: 'job-detail', params: { id: job.id } }">
+                  <Button label="Лог" icon="pi pi-list" size="small" text />
+                </RouterLink>
+              </td>
+            </tr>
+            <tr v-if="!jobs.items.length">
+              <td colspan="7" class="magaz-muted py-6 text-center" data-test="store-jobs-empty">
+                Операций ещё не было: запустите проверку файлов или слияние выше.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
 
     <Dialog
       v-model:visible="isTokenOpen"

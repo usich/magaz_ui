@@ -96,6 +96,15 @@ class Settings(BaseSettings):
     #: Пауза перед первым циклом мониторинга, с (даёт серверу подняться)
     health_monitor_startup_delay_sec: float = 0.0
 
+    #: --- Диспетчер операций (Э4, §3.2) ---
+    #: Фоновая отправка задач и опрос `/check-*` (можно выключить в тестах)
+    dispatcher_enabled: bool = True
+    #: Пауза перед первым циклом диспетчера, с
+    dispatcher_startup_delay_sec: float = 0.0
+    #: Таймаут одного запроса сервера к агенту: операции живут минуты, но сам
+    #: HTTP-вызов (`/run-*`, `/check-*`) должен отвечать быстро (§5.1.1)
+    agent_request_timeout_sec: float = 15.0
+
     #: Логи сервера
     log_level: str = "INFO"
     log_file: Path = LOG_DIR / "server.log"

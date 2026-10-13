@@ -86,13 +86,20 @@ def _cmd_info(config: AgentConfig, config_path: str | None) -> int:
 
 
 def _cmd_run(args: argparse.Namespace, config: AgentConfig, config_path: str | None) -> int:
-    """Запустить агент (uvicorn). `--console` включается флагом, а не отдельной командой."""
+    """Запустить агент (uvicorn). `--console` включается флагом, а не отдельной командой.
+
+    Путь конфига передаётся в приложение **всегда**, когда файл существует: по
+    этому пути агент сохраняет профиль 1С, доставленный push-ом `POST /credentials`
+    (П-1). Иначе после перезапуска службы пароль пришлось бы ждать снова — конфиг
+    читается из `--config`, переменной `MAGAZ_AGENT_CONFIG` или рабочей папки (§7.1).
+    """
     import uvicorn
 
     log_file = configure_logging(config, console=args.console, level=args.log_level)
     port = args.port or config.port
+    resolved_config = Path(config_path) if config_path else default_config_path()
     application = create_agent_app(
-        config, config_path=Path(config_path) if config_path else None
+        config, config_path=resolved_config if resolved_config.is_file() else None
     )
     logger.info(
         "MagazAgent стартует: магазин id=%s, порт %s, рабочая папка %s, лог %s",

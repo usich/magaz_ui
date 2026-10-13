@@ -24,6 +24,11 @@ client/**/devices.json
 client/**/agent-state.json
 client/**/log-*.txt
 logs/
+# Локальный запуск агента из корня репозитория (`work_dir` не задан) кладёт свои
+# файлы рядом с кодом: состояние операции, ключ профиля 1С и логи 1С (§7.1, §7.3)
+/agent-state.json
+/.credentials.key
+/log-*.txt
 
 # --- Фронтенд ---
 frontend/node_modules/

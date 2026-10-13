@@ -13,13 +13,16 @@
 
 Плюс точки мониторинга Э2 (`GET /health`, `GET /version`), в которых `busy`
 теперь заполняется исполнителем операций, а `interrupted_operation` доносит до
-сервера операцию, прерванную перезагрузкой кассы (§7.3).
+сервера операцию, прерванную перезагрузкой кассы (§7.3), и `POST /credentials`
+(Э4, П-1) — приём учётных данных 1С от сервера.
 
 Авторизация: `X-Agent-Token` из конфига магазина плюс, если задан
 `allowed_server_ips`, проверка IP источника (§5.1, §8.1). Повторный запуск
 1С-операции, пока идёт предыдущая, отвечает `409 Conflict` (I-13, Q23); лог
-обнуляется до постановки задачи в очередь (I-3). Уведомления (`/notify`,
-`/notifications/*`) и `/credentials`, `/devices/*` подключаются на этапах Э4–Э5.
+обнуляется до постановки задачи в очередь (I-3). Пароль 1С приходит только
+push-ом, шифруется Fernet-ом с ключом под DPAPI машины и в логи не попадает
+(П-1, I-7). Уведомления (`/notify`, `/notifications/*`) и `/devices/*`
+подключаются на этапах Э4Б–Э5.
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ from client.agent.processes import DEFAULT_PROVIDER, ProcessProvider
 from shared.schemas import (
     CheckFilesParams,
     CheckFilesResponse,
+    CredentialsPush,
     DownloadParams,
     HealthResponse,
     JobStateResponse,
@@ -133,6 +137,11 @@ def create_agent_app(
         paths=one_c_paths,
         state_path=state_path or config.state_path,
         provider=process_provider,
+    )
+    #: П-1: профиль 1С агента — расшифровка пароля и приём push-а `/credentials`
+    profile_store = credentials.OneCProfileStore(
+        config.one_c_profile,
+        config_path=config_path,
     )
 
     @asynccontextmanager
@@ -253,6 +262,34 @@ def create_agent_app(
         )
 
     @app.post(
+        "/credentials",
+        dependencies=[Depends(require_agent_token)],
+        summary="Приём учётных данных 1С от сервера (П-1)",
+        tags=["agent"],
+    )
+    def push_credentials(payload: CredentialsPush) -> dict[str, object]:
+        """Сохранить логин и пароль 1С из push-а `POST /credentials` (§5.1.2, §8.3).
+
+        Пароль шифруется Fernet-ом с ключом под DPAPI этой машины и попадает
+        только в `agent-config.json` (`one_c_profile.password_enc`). В логах,
+        ответе и `/health` значения пароля нет — наружу отдаётся версия профиля
+        (I-7), поэтому после приёма `/health` сразу докладывает новую версию и
+        сервер перестаёт считать учётные данные устаревшими.
+        """
+        try:
+            profile = profile_store.apply_push(payload)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+        config.one_c_profile = profile
+        return {
+            "stored": True,
+            "credentials_version": profile.credentials_version,
+            "password_set": bool(profile.password_enc),
+        }
+
+    @app.post(
         "/run-merge",
         status_code=status.HTTP_202_ACCEPTED,
         dependencies=[Depends(require_agent_token)],
@@ -265,7 +302,7 @@ def create_agent_app(
         Для расширения передайте `extension_name`, для основной конфигурации —
         не передавайте. Пока идёт операция, повторный запуск отвечает `409`.
         """
-        prepared = credentials.apply_profile_password(params, config.one_c_profile)
+        prepared = profile_store.prepare(params)
         try:
             state = await operations.submit_merge(prepared)
         except OperationBusyError as exc:
@@ -307,7 +344,7 @@ def create_agent_app(
         `is_fast_update = false` — полный цикл: завершение сеансов → `taskkill
         1cv8.exe` → `/UpdateDBCfg` → разрешение работы пользователей.
         """
-        prepared = credentials.apply_profile_password(params, config.one_c_profile)
+        prepared = profile_store.prepare(params)
         try:
             state = await operations.submit_update_db(prepared)
         except OperationBusyError as exc:

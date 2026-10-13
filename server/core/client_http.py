@@ -24,7 +24,13 @@ import httpx
 from pydantic import ValidationError
 
 from server.config import Settings
-from shared.schemas import HealthResponse
+from shared.schemas import (
+    CheckFilesResponse,
+    CredentialsPush,
+    HealthResponse,
+    MergeParams,
+    UpdateParams,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +41,7 @@ __all__ = [
     "AgentOfflineError",
     "AgentProtocolError",
     "AgentTarget",
+    "JOB_STATE_PATHS",
     "build_agent_target",
 ]
 
@@ -45,6 +52,21 @@ DEFAULT_AGENT_PORT = 8383
 
 HEALTH_PATH = "/health"
 VERSION_PATH = "/version"
+#: §5.1.1: перенос v2 — эти пути и их коды менять нельзя (Приложение B)
+CHECK_FILES_PATH = "/check-files"
+RUN_MERGE_PATH = "/run-merge"
+RUN_UPDATE_DB_PATH = "/run-update-db"
+DOWNLOAD_FILE_PATH = "/download-file"
+SEND_MESSAGE_PATH = "/send-message"
+#: §5.1.2: push учётных данных 1С (П-1)
+CREDENTIALS_PATH = "/credentials"
+
+#: Тип задачи → путь опроса его состояния (`/check-*`, Приложение B)
+JOB_STATE_PATHS: dict[str, str] = {
+    "run_merge": "/check-merge",
+    "run_update_db": "/check-update-db",
+}
+
 
 
 class AgentError(Exception):
@@ -156,6 +178,7 @@ class AgentClient:
         path: str,
         *,
         json_body: Any = None,  # noqa: ANN401 - тело запроса к агенту
+        query: dict[str, Any] | None = None,
     ) -> httpx.Response:
         """Выполнить запрос к агенту; сетевые сбои → `AgentOfflineError`.
 
@@ -163,7 +186,7 @@ class AgentClient:
         (Э4 использует статус `/check-*` как результат операции).
         """
         try:
-            return await self.client.request(method, path, json=json_body)
+            return await self.client.request(method, path, json=json_body, params=query)
         except httpx.HTTPError as exc:
             logger.debug(
                 "Агент магазина id=%s недоступен (%s %s): %s",
@@ -230,3 +253,87 @@ class AgentClient:
                 f"Агент магазина id={self.target.store_id} вернул не объект в /version"
             )
         return body
+
+    # --- Эндпоинты §5.1.1 (перенос v2): их вызывает диспетчер (Э4) ----------
+
+    async def check_files(self, filename: str) -> CheckFilesResponse:
+        """`POST /check-files` — наличие `.cf/.cfe/.xml` и их размеры (Q52)."""
+        body = await self.request_json("POST", CHECK_FILES_PATH, json_body={"filename": filename})
+        try:
+            return CheckFilesResponse.model_validate(body)
+        except ValidationError as exc:
+            raise AgentProtocolError(
+                "Агент магазина id="
+                f"{self.target.store_id} вернул неожиданный /check-files ({exc.error_count()} ошибок)"
+            ) from exc
+
+    async def run_merge(self, params: MergeParams | dict[str, Any]) -> dict[str, Any]:
+        """`POST /run-merge` — поставить слияние (перенос v2, ответ `202`)."""
+        return await self._accepted(RUN_MERGE_PATH, params)
+
+    async def run_update_db(self, params: UpdateParams | dict[str, Any]) -> dict[str, Any]:
+        """`POST /run-update-db` — поставить обновление БД (перенос v2, ответ `202`)."""
+        return await self._accepted(RUN_UPDATE_DB_PATH, params)
+
+    async def download_file(self, url_file: str) -> dict[str, Any]:
+        """`POST /download-file` — скачать пакет по ссылке (ФН2, FR-1)."""
+        return await self._accepted(DOWNLOAD_FILE_PATH, {"url-file": url_file})
+
+    async def send_message(self, text_message: str) -> dict[str, Any]:
+        """`POST /send-message` — окно `msg` + завершение `1cv8.exe` (FR-8)."""
+        return await self._accepted(SEND_MESSAGE_PATH, {"text_message": text_message})
+
+    async def check_job_state(
+        self, kind: str, *, extension: bool = False
+    ) -> tuple[int, dict[str, Any]]:
+        """`GET /check-merge` / `GET /check-update-db` — статус операции (FR-7).
+
+        Возвращает пару «код ответа + тело», потому что по Приложению B код и
+        есть результат: `202` — идёт, `200` — успех, `400` — ошибка.
+        """
+        if kind not in JOB_STATE_PATHS:
+            raise AgentProtocolError(f"Неизвестный тип задачи для опроса: {kind!r}")
+
+        path = JOB_STATE_PATHS[kind]
+        response = await self.request(
+            "GET", path, query={"extension": str(bool(extension)).lower()}
+        )
+        status_code = response.status_code
+        if status_code in (401, 403):
+            self._raise_for_status(response)
+        if status_code not in (200, 202, 400):
+            self._raise_for_status(response)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise AgentProtocolError(
+                f"Агент магазина id={self.target.store_id} вернул не-JSON в {path}",
+                status_code=status_code,
+            ) from exc
+        if not isinstance(body, dict):
+            raise AgentProtocolError(
+                f"Агент магазина id={self.target.store_id} вернул не объект в {path}",
+                status_code=status_code,
+            )
+        return status_code, body
+
+    async def push_credentials(self, payload: CredentialsPush) -> dict[str, Any]:
+        """`POST /credentials` — доставить учётные данные 1С на кассу (П-1, §8.3).
+
+        Значение пароля живёт только в теле запроса: ни в лог, ни в БД оно не
+        попадает (I-7).
+        """
+        body = await self.request_json(
+            "POST", CREDENTIALS_PATH, json_body=payload.model_dump()
+        )
+        if not isinstance(body, dict):
+            raise AgentProtocolError(
+                f"Агент магазина id={self.target.store_id} вернул не объект в /credentials"
+            )
+        return body
+
+    async def _accepted(self, path: str, payload: Any) -> dict[str, Any]:  # noqa: ANN401
+        """Общий разбор ответа `/run-*`: `202` + JSON-подтверждение."""
+        body = await self.request_json("POST", path, json_body=payload)
+        return body if isinstance(body, dict) else {}
+

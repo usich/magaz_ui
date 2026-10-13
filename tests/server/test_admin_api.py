@@ -110,7 +110,7 @@ class TestSettingsApi:
 
         assert response.status_code == 200
         by_key = {item["key"]: item for item in body}
-        assert len(by_key) == 12, "все ключи §4.9 присутствуют"
+        assert len(by_key) == 14, "все ключи §4.9 присутствуют (включая добавку Д-7)"
         assert by_key["health_interval_sec"]["value"] == "15"
         assert by_key["health_interval_sec"]["default"] == "15"
         assert by_key["health_interval_sec"]["is_default"] is True
@@ -190,5 +190,6 @@ class TestSystemInfo:
         assert body["spa"]["built"] is False, "SPA ещё не собрана в тестах"
         assert body["counts"]["stores_total"] == 1
         assert body["counts"]["admins_total"] == 1
-        assert body["settings_keys"] == 12
+        assert body["counts"]["jobs_active"] == 0, "Э4: плитка «Задач в работе»"
+        assert body["settings_keys"] == 14
 

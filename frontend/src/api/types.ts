@@ -32,6 +32,8 @@ export interface SystemCounts {
   online_window_sec: number
   admins_total: number
   audit_events: number
+  /** Э4: задачи в работе (queued/sent/running) — плитка «Задач в работе» */
+  jobs_active: number
 }
 
 export interface SystemInfo {
@@ -157,4 +159,133 @@ export interface StoreListFilters {
   cluster?: string
   status?: StoreStatusFilter
   includeInactive?: boolean
+}
+
+/** Задача в истории операций (§4.3, §11.6). Секретов здесь нет по построению. */
+export interface JobItem {
+  id: number
+  store_id: number
+  store_name: string | null
+  kind: string
+  status: string
+  params: Record<string, unknown> | null
+  attempts: number
+  last_error: string | null
+  log_files: string[]
+  created_by: string | null
+  created_at: string | null
+  started_at: string | null
+  finished_at: string | null
+  last_message: string | null
+  excerpt_preview: string | null
+}
+
+/** Строка журнала задачи (§4.4). */
+export interface JobLogEntry {
+  id: number
+  level: string
+  message: string
+  created_at: string | null
+}
+
+export interface JobDetail extends JobItem {
+  logs: JobLogEntry[]
+}
+
+/** Ответ `GET /jobs`: элементы, счётчики по статусам, всего и «в работе» (§11.6). */
+export interface JobsPage {
+  items: JobItem[]
+  counts: Record<string, number>
+  total: number
+  active: number
+}
+
+export interface JobFilters {
+  storeId?: number | null
+  kind?: string
+  status?: string
+  activeOnly?: boolean
+  limit?: number
+  offset?: number
+}
+
+/** Строка матрицы файлов (§11.3): последний снимок проверки на магазин. */
+export interface FileMatrixRow {
+  store_id: number
+  store_name: string
+  ip_address: string
+  cluster_name: string
+  is_active: boolean
+  is_online: boolean
+  filename: string
+  checked_at: string | null
+  cf_exists: boolean
+  cfe_exists: boolean
+  xml_exists: boolean
+  cf_size: number | null
+  cfe_size: number | null
+  xml_size: number | null
+  cf_mtime: string | null
+  cfe_mtime: string | null
+  xml_mtime: string | null
+  has_file: boolean
+  checked: boolean
+}
+
+export interface FileMatrix {
+  filename: string
+  rows: FileMatrixRow[]
+  total: number
+  present: number
+  missing_current: number
+}
+
+export interface FileMatrixFilters {
+  filename?: string
+  cluster?: string
+  includeInactive?: boolean
+}
+
+/** Действия сервера над магазином (§5.2.2, §11.4). */
+export type ActionName =
+  | 'check_files'
+  | 'download_file'
+  | 'run_merge'
+  | 'run_update_db'
+  | 'send_message'
+  | 'notify'
+
+export interface ActionPayload {
+  action: ActionName
+  params?: Record<string, unknown>
+}
+
+/** Ответ одиночного действия: задача + предупреждение Q53. */
+export interface ActionResponse {
+  job: JobItem
+  message: string
+  warning: string | null
+}
+
+export interface BulkActionPayload extends ActionPayload {
+  store_ids?: number[]
+  cluster?: string | null
+  all?: boolean
+}
+
+/** Строка прогресса массового действия (§11.4). */
+export interface BulkActionJob {
+  store_id: number
+  store_name: string
+  job_id: number | null
+  status: string
+  detail: string | null
+}
+
+export interface BulkActionResponse {
+  action: string
+  message: string
+  total: number
+  jobs: BulkActionJob[]
+  warning: string | null
 }

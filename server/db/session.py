@@ -16,6 +16,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from server.config import get_settings
 
+#: Сколько секунд SQLite ждёт освобождения блокировки файла БД (фоновые задачи + API)
+SQLITE_BUSY_TIMEOUT_SEC = 30
+
 
 def _enable_sqlite_foreign_keys(dbapi_connection: Any, _record: Any) -> None:  # noqa: ANN401
     """Включить контроль внешних ключей для каждого соединения SQLite."""
@@ -31,6 +34,10 @@ def create_db_engine(url: str, *, echo: bool = False) -> Engine:
     connect_args: dict[str, Any] = {}
     if url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
+        # Фон (Health Monitor, диспетчер) и запросы админа живут в одном файле
+        # SQLite, поэтому ждём освобождения блокировки, а не падаем «database is
+        # locked»: секунды ожидания дешевле потерянной задачи.
+        connect_args["timeout"] = SQLITE_BUSY_TIMEOUT_SEC
 
     engine = create_engine(
         url,

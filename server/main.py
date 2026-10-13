@@ -25,6 +25,7 @@ from server.api import admin as admin_api
 from server.api import agent_report, spa
 from server.config import API_PREFIX, Settings, get_settings
 from server.core.context import AppContext, build_app_context
+from server.core.dispatcher import CommandDispatcher
 from server.core.health_monitor import HealthMonitor
 from server.core.logging_setup import configure_logging
 from server.services import settings_service
@@ -64,6 +65,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("%s v%s запускается; БД: %s", APP_NAME, settings.app_version, settings.database_url)
 
     monitor: HealthMonitor | None = None
+    dispatcher: CommandDispatcher | None = None
     try:
         _assert_schema_ready(context)
         with context.db.session() as session:
@@ -77,11 +79,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             monitor = HealthMonitor(context.db, settings, transport=agent_transport)
             monitor.start()
         app.state.health_monitor = monitor
+
+        # Э4: диспетчер — отправка задач на кассы, опрос `/check-*`, retry и
+        # доставка учётных данных 1С (П-1)
+        if settings.dispatcher_enabled:
+            dispatcher = CommandDispatcher(
+                context.db,
+                settings,
+                transport=agent_transport,
+                secret_box=context.secret_box,
+            )
+            dispatcher.start()
+        app.state.dispatcher = dispatcher
         yield
     except SQLAlchemyError:  # pragma: no cover - нужен реальный сбой БД
         logger.exception("Ошибка БД при старте сервера")
         raise
     finally:
+        if dispatcher is not None:
+            await dispatcher.stop()
         if monitor is not None:
             await monitor.stop()
         context.dispose()

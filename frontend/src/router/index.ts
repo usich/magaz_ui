@@ -84,6 +84,13 @@ export const routes: RouteRecordRaw[] = [
     meta: { title: 'Задачи', stage: 'Э4' },
   },
   {
+    path: '/jobs/:id(\\d+)',
+    name: 'job-detail',
+    component: () => import('@/views/JobDetailView.vue'),
+    props: true,
+    meta: { title: 'Задача и лог', stage: 'Э4' },
+  },
+  {
     path: '/audit',
     name: 'audit',
     component: () => import('@/views/AuditView.vue'),

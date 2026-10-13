@@ -2,8 +2,17 @@
 
 import { api } from './client'
 import type {
+  ActionPayload,
+  ActionResponse,
   AdminUser,
   AuditEntry,
+  BulkActionPayload,
+  BulkActionResponse,
+  FileMatrix,
+  FileMatrixFilters,
+  JobDetail,
+  JobFilters,
+  JobsPage,
   LoginPayload,
   ServerHealth,
   SettingItem,
@@ -97,4 +106,51 @@ export const storesApi = {
 
   /** «Проверить сейчас»: живой `GET /health` агента (Д-3). */
   check: (id: number) => api.post<StoreHealth>(`/admin/stores/${id}/check`),
+}
+
+/**
+ * Операции над магазинами (Э4, §5.2.2, §11.4).
+ *
+ * Одиночное действие и массовое — разные точки контракта: первая адресуется
+ * магазину, вторая выбирает получателей (`store_ids` → `cluster` → `all`).
+ * Обе отвечают `202`: сервер не держит HTTP-запрос, пока касса обновляется, —
+ * задачу забирает диспетчер.
+ */
+export const actionsApi = {
+  /** `POST /admin/stores/{id}/actions` — операция для одного магазина. */
+  run: (storeId: number, payload: ActionPayload) =>
+    api.post<ActionResponse>(`/admin/stores/${storeId}/actions`, payload),
+
+  /** `POST /admin/bulk/actions` — операция для выбранных магазинов, кластера или всех. */
+  runBulk: (payload: BulkActionPayload) => api.post<BulkActionResponse>('/admin/bulk/actions', payload),
+}
+
+/** История задач и журналы (§5.2.2, §11.6). */
+export const jobsApi = {
+  list: (filters: JobFilters = {}) => {
+    const query = new URLSearchParams()
+    if (filters.storeId) query.set('store_id', String(filters.storeId))
+    if (filters.kind) query.set('kind', filters.kind)
+    if (filters.status) query.set('status', filters.status)
+    if (filters.activeOnly) query.set('active_only', 'true')
+    if (filters.limit !== undefined) query.set('limit', String(filters.limit))
+    if (filters.offset !== undefined) query.set('offset', String(filters.offset))
+    const suffix = query.toString() ? `?${query}` : ''
+    return api.get<JobsPage>(`/admin/jobs${suffix}`)
+  },
+
+  /** Карточка задачи с полным журналом (`/jobs/{id}`, §11.6). */
+  get: (id: number) => api.get<JobDetail>(`/admin/jobs/${id}`),
+}
+
+/** Матрица файлов обновления (§11.3, Q52). */
+export const filesApi = {
+  matrix: (filters: FileMatrixFilters = {}) => {
+    const query = new URLSearchParams()
+    if (filters.filename?.trim()) query.set('filename', filters.filename.trim())
+    if (filters.cluster?.trim()) query.set('cluster', filters.cluster.trim())
+    if (filters.includeInactive) query.set('include_inactive', 'true')
+    const suffix = query.toString() ? `?${query}` : ''
+    return api.get<FileMatrix>(`/admin/files/matrix${suffix}`)
+  },
 }

@@ -1,0 +1,721 @@
+"""API операций, задач и матрицы файлов (§5.2.2, §11.3, §11.4, §11.6) — состав Э4.
+
+Модуль закрывает четыре узла контракта:
+
+* `POST /stores/{id}/actions` — одиночное действие над магазином;
+* `POST /bulk/actions` — массовое действие (по списку id, по кластеру, по всем);
+* `GET /jobs`, `GET /jobs/{id}` — история операций и полный журнал задачи;
+* `GET /files/matrix` — матрица «магазин × (cf/cfe/cfe/xml)» с размерами, датами
+  и счётчиком «файл есть у N из M» (§11.3).
+
+Ключевые правила, за которые отвечает модуль:
+
+* **задача не выполняется в HTTP-запросе.** Действие создаёт строку `commands`
+  в статусе `queued` и отвечает `202`; на кассу её ставит диспетчер (§3.3, I-8).
+  Поэтому админская кнопка не «висит» на операции 1С длиной в час;
+* **пароль 1С в задаче не появляется (П-1, I-7):** параметры чистятся, а
+  реквизиты подключения сервер берёт из карточки магазина;
+* **Q53** — отсутствие файла не блокирует запуск: возвращается `warning`,
+  который UI показывает жёлтым, а жёсткая блокировка отдана явному флагу.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from server.core.dependencies import get_client_ip, get_db, require_active_admin
+from server.db.models import AdminUser, Command, FileCheck, JobLog, Store
+from server.services import audit_service, command_service, settings_service
+from shared.enums import ActionKind, CommandKind, CommandStatus
+from shared.schemas import CheckFilesParams
+from shared.timeutil import to_iso_z, utcnow
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "SUPPORTED_ACTIONS",
+    "router",
+    "resolve_target_stores",
+]
+
+router = APIRouter(tags=["admin-operations"], dependencies=[Depends(require_active_admin)])
+
+#: 422 без deprecation-предупреждения Starlette (`HTTP_422_UNPROCESSABLE_CONTENT`
+#: появился в новых релизах, старое имя помечено устаревшим) — как в `admin.py`
+HTTP_422 = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
+
+#: Действия, которые сервер умеет ставить в очередь на этом этапе (§11.4).
+#: `notify` появится вместе с уведомлениями (Э5): его отказ — честный `422`.
+SUPPORTED_ACTIONS: frozenset[str] = frozenset(
+    {
+        str(ActionKind.CHECK_FILES),
+        str(ActionKind.DOWNLOAD_FILE),
+        str(ActionKind.RUN_MERGE),
+        str(ActionKind.RUN_UPDATE_DB),
+        str(ActionKind.SEND_MESSAGE),
+    }
+)
+
+#: Размер хвоста лога, который показывается прямо в списке задач (§11.6)
+EXCERPT_PREVIEW_CHARS = 600
+
+ACTION_KIND: dict[str, str] = {
+    str(ActionKind.CHECK_FILES): str(CommandKind.CHECK_FILES),
+    str(ActionKind.DOWNLOAD_FILE): str(CommandKind.DOWNLOAD_FILE),
+    str(ActionKind.RUN_MERGE): str(CommandKind.RUN_MERGE),
+    str(ActionKind.RUN_UPDATE_DB): str(CommandKind.RUN_UPDATE_DB),
+    str(ActionKind.SEND_MESSAGE): str(CommandKind.SEND_MESSAGE),
+}
+
+
+# --- Схемы запросов и ответов -----------------------------------------------
+
+
+class ActionRequest(BaseModel):
+    """Тело `POST /stores/{id}/actions` (§5.2.2)."""
+
+    action: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class BulkActionRequest(BaseModel):
+    """Тело `POST /bulk/actions`: выбор магазинов + действие (§11.4)."""
+
+    action: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    store_ids: list[int] = Field(default_factory=list)
+    cluster: str | None = None
+    all: bool = False
+
+
+class JobOut(BaseModel):
+    """Задача в списке `/jobs` (§4.3). Секретов здесь нет по построению."""
+
+    id: int
+    store_id: int
+    store_name: str | None = None
+    kind: str
+    status: str
+    params: dict[str, Any] | None = None
+    attempts: int = 0
+    last_error: str | None = None
+    log_files: list[str] = Field(default_factory=list)
+    created_by: str | None = None
+    created_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    last_message: str | None = None
+    excerpt_preview: str | None = None
+
+    @classmethod
+    def from_model(cls, command: Command, *, last_message: str | None = None) -> "JobOut":
+        excerpt = command.log_excerpt or ""
+        return cls(
+            id=command.id,
+            store_id=command.store_id,
+            store_name=getattr(command.store, "name", None),
+            kind=command.kind,
+            status=command.status,
+            params=command.params,
+            attempts=int(command.attempts or 0),
+            last_error=command.last_error,
+            log_files=list(command.log_files or []),
+            created_by=command.created_by,
+            created_at=to_iso_z(command.created_at),
+            started_at=to_iso_z(command.started_at),
+            finished_at=to_iso_z(command.finished_at),
+            last_message=last_message,
+            excerpt_preview=excerpt[-EXCERPT_PREVIEW_CHARS:] if excerpt else None,
+        )
+
+
+class JobLogOut(BaseModel):
+    """Строка журнала задачи (§4.4)."""
+
+    id: int
+    level: str
+    message: str
+    created_at: str | None = None
+
+    @classmethod
+    def from_model(cls, entry: JobLog) -> "JobLogOut":
+        return cls(
+            id=entry.id,
+            level=entry.level,
+            message=entry.message,
+            created_at=to_iso_z(entry.created_at),
+        )
+
+
+class JobDetailOut(JobOut):
+    """Задача с полным журналом (`GET /jobs/{id}`, §11.6)."""
+
+    logs: list[JobLogOut] = Field(default_factory=list)
+
+
+class JobsPageOut(BaseModel):
+    """Страница истории задач: элементы, счётчики по статусам, всего (§11.6)."""
+
+    items: list[JobOut] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+    total: int = 0
+    active: int = 0
+
+
+class FileMatrixRow(BaseModel):
+    """Строка матрицы `/files`: магазин и его последняя проверка (§11.3)."""
+
+    store_id: int
+    store_name: str
+    ip_address: str
+    cluster_name: str
+    is_active: bool
+    is_online: bool
+    filename: str
+    checked_at: str | None = None
+    cf_exists: bool = False
+    cfe_exists: bool = False
+    xml_exists: bool = False
+    cf_size: int | None = None
+    cfe_size: int | None = None
+    xml_size: int | None = None
+    cf_mtime: str | None = None
+    cfe_mtime: str | None = None
+    xml_mtime: str | None = None
+    has_file: bool = False
+    checked: bool = False
+
+
+class FileMatrixOut(BaseModel):
+    """Ответ `GET /files/matrix`: строки и счётчики «файл есть у N из M»."""
+
+    filename: str
+    rows: list[FileMatrixRow] = Field(default_factory=list)
+    total: int = 0
+    present: int = 0
+    missing_current: int = 0
+
+
+class BulkActionJobOut(BaseModel):
+    """Результат массового действия по одному магазину (§11.4: прогресс-таблица)."""
+
+    store_id: int
+    store_name: str
+    job_id: int | None = None
+    status: str = CommandStatus.QUEUED
+    detail: str | None = None
+
+
+class ActionOut(BaseModel):
+    """Ответ одиночного действия: задача + предупреждение (Q53)."""
+
+    job: JobOut
+    message: str
+    warning: str | None = None
+
+
+class BulkActionOut(BaseModel):
+    """Ответ массового действия: по строке на магазин."""
+
+    action: str
+    message: str
+    total: int = 0
+    jobs: list[BulkActionJobOut] = Field(default_factory=list)
+    warning: str | None = None
+
+
+# --- Вспомогательные функции ------------------------------------------------
+
+
+def _get_store(session: Session, store_id: int) -> Store:
+    """Магазин по id или понятный `404` (§5.2.2, Приложение B)."""
+    store = session.get(Store, store_id)
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Магазин id={store_id} не найден"
+        )
+    return store
+
+
+def _validate_filename(value: str) -> str:
+    """Имя файла без разделителей пути (I-2): правило берём из схемы агента."""
+    try:
+        return CheckFilesParams(filename=value).filename
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=HTTP_422, detail=str(exc)
+        ) from exc
+
+
+def _validate_action(action: str, params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Проверить действие и его параметры; вернуть тип задачи и чистые параметры.
+
+    Пароль 1С здесь принципиально не принимается: реквизиты подключения сервер
+    берёт из карточки магазина, а пароль доставляет отдельно (П-1). Любое
+    присланное значение `password` отбрасывается `sanitize_params()` (I-7).
+    """
+    name = (action or "").strip()
+    if name not in ACTION_KIND:
+        hint = " (уведомления появятся на этапе Э5)" if name == str(ActionKind.NOTIFY) else ""
+        raise HTTPException(
+            status_code=HTTP_422,
+            detail=f"Неизвестное действие {action!r}{hint}",
+        )
+
+    raw = dict(params or {})
+    clean: dict[str, Any] = {}
+
+    if name == str(ActionKind.CHECK_FILES):
+        filename = str(raw.get("filename") or "").strip()
+        if filename:
+            clean["filename"] = _validate_filename(filename)
+
+    elif name == str(ActionKind.DOWNLOAD_FILE):
+        url = str(raw.get("url-file") or raw.get("url_file") or "").strip()
+        if not url:
+            raise HTTPException(
+                status_code=HTTP_422,
+                detail="Не передана ссылка на файл (поле url-file)",
+            )
+        clean["url-file"] = url
+
+    elif name == str(ActionKind.SEND_MESSAGE):
+        text = str(raw.get("text_message") or "").strip()
+        if not text:
+            raise HTTPException(
+                status_code=HTTP_422,
+                detail="Текст сообщения не может быть пустым",
+            )
+        clean["text_message"] = text
+
+    elif name == str(ActionKind.RUN_MERGE):
+        file_name = str(raw.get("file_name") or "").strip()
+        if not file_name:
+            raise HTTPException(
+                status_code=HTTP_422,
+                detail="Не указано имя файла слияния (file_name)",
+            )
+        clean["file_name"] = _validate_filename(file_name)
+        clean["full_merge"] = bool(raw.get("full_merge"))
+        extension_name = str(raw.get("extension_name") or "").strip()
+        if extension_name:
+            clean["extension_name"] = extension_name
+
+    elif name == str(ActionKind.RUN_UPDATE_DB):
+        clean["is_fast_update"] = bool(raw.get("is_fast_update"))
+        extension_name = str(raw.get("extension_name") or "").strip()
+        if extension_name:
+            clean["extension_name"] = extension_name
+
+    return ACTION_KIND[name], command_service.sanitize_params(clean)
+
+
+def resolve_target_stores(
+    session: Session,
+    *,
+    store_ids: list[int] | None = None,
+    cluster: str | None = None,
+    all_stores: bool = False,
+) -> list[Store]:
+    """Выбрать магазины для массовой операции (§11.4: выбор / кластер / все).
+
+    Приоритет источников: список id → кластер → «все». Неактивные магазины
+    (мягко удалённые) в выборку попадают, но действие по ним пропускается: так
+    админ видит в прогрессе, что магазин отключён, а не «ничего не произошло».
+    """
+    stmt = select(Store).order_by(Store.name)
+    if store_ids:
+        stmt = stmt.where(Store.id.in_([int(item) for item in store_ids]))
+    elif (cluster or "").strip():
+        stmt = stmt.where(Store.cluster_name == cluster.strip())
+    elif not all_stores:
+        return []
+    return list(session.scalars(stmt).all())
+
+
+def _merge_warning(
+    session: Session, store: Store, *, file_name: str, extension_name: str | None
+) -> str | None:
+    """Предупреждение об отсутствии файла на кассе — Q53 (не блокирует запуск).
+
+    Источник — последний снимок `file_checks` (§4.5), поэтому проверка ничего не
+    стоит: за свежестью следит админ кнопкой «Проверить файлы» (§11.3).
+    """
+    column = "cfe" if extension_name else "cf"
+    stmt = (
+        select(FileCheck)
+        .where(FileCheck.store_id == store.id, FileCheck.filename == file_name)
+        .order_by(FileCheck.id.desc())
+        .limit(1)
+    )
+    snapshot = session.scalars(stmt).first()
+    if snapshot is None:
+        return (
+            f"Файлы «{file_name}» на кассе ещё не проверялись: "
+            "сначала выполните «Проверить файлы»"
+        )
+    if getattr(snapshot, f"{column}_exists"):
+        return None
+    checked_at = to_iso_z(snapshot.checked_at) or "—"
+    return (
+        f"На кассе нет файла {file_name}.{column} (последняя проверка {checked_at}): "
+        "слияние может завершиться ошибкой"
+    )
+
+
+def _last_messages(session: Session, command_ids: list[int]) -> dict[int, str]:
+    """Последняя строка журнала по каждой задаче — для списка `/jobs` (один запрос)."""
+    if not command_ids:
+        return {}
+    rows = session.execute(
+        select(JobLog.command_id, JobLog.message)
+        .where(JobLog.command_id.in_(command_ids))
+        .order_by(JobLog.id)
+    ).all()
+    return {int(command_id): str(message) for command_id, message in rows}
+
+
+def _create_job(
+    session: Session,
+    store: Store,
+    *,
+    kind: str,
+    params: dict[str, Any],
+    author: str,
+    action_name: str,
+) -> Command:
+    """Поставить задачу в очередь и объяснить это в её журнале (§4.3, §11.6)."""
+    command = command_service.create_command(
+        session, store_id=store.id, kind=kind, params=params, created_by=author
+    )
+    command.store = store
+    command_service.add_log(
+        session,
+        command,
+        f"Задача создана ({action_name}) администратором {author}; отправку выполнит диспетчер",
+    )
+    return command
+
+
+# --- Одиночное действие (§5.2.2, §11.4) -------------------------------------
+
+
+@router.post(
+    "/stores/{store_id}/actions",
+    response_model=ActionOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Действие над магазином",
+)
+def store_action(  # noqa: PLR0913 - параметры HTTP-точки
+    store_id: int,
+    payload: ActionRequest,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+) -> ActionOut:
+    """Поставить операцию магазину: ответ `202`, работу выполняет диспетчер (§3.3).
+
+    `202` здесь — не «уже выполнено», а «принято в работу» (Приложение B): сервер
+    не держит HTTP-запрос открытым, пока касса обновляет конфигурацию.
+    """
+    store = _get_store(session, store_id)
+    if not store.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Магазин отключён: операции по нему не выполняются",
+        )
+
+    kind, params = _validate_action(payload.action, payload.params)
+    command = _create_job(
+        session,
+        store,
+        kind=kind,
+        params=params,
+        author=admin.username,
+        action_name=payload.action,
+    )
+
+    warning: str | None = None
+    if kind == str(CommandKind.RUN_MERGE):
+        warning = _merge_warning(
+            session,
+            store,
+            file_name=str(params.get("file_name") or ""),
+            extension_name=params.get("extension_name"),
+        )
+
+    audit_service.record(
+        session,
+        action="store_action",
+        actor=admin.username,
+        entity="store",
+        entity_id=store.id,
+        details={
+            "action": payload.action,
+            "job_id": command.id,
+            "params": params,
+            "warning": bool(warning),
+        },
+        ip_address=get_client_ip(request),
+    )
+    session.flush()
+
+    return ActionOut(
+        job=JobOut.from_model(command, last_message=None),
+        message=(
+            f"Задача #{command.id} поставлена в очередь: "
+            f"{dispatcher_hint(store, command)}"
+        ),
+        warning=warning,
+    )
+
+
+def dispatcher_hint(store: Store, command: Command) -> str:
+    """Пояснение для UI: что произойдёт дальше (офлайн-касса — не ошибка, §11.4)."""
+    if command.status == str(CommandStatus.QUEUED):
+        return f"магазин «{store.name}» получит её при следующем опросе диспетчера"
+    return "задача отправлена на кассу"
+
+
+# --- Массовое действие (§5.2.2, §11.4) -------------------------------------
+
+
+@router.post(
+    "/bulk/actions",
+    response_model=BulkActionOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Массовое действие",
+)
+def bulk_action(  # noqa: PLR0913 - параметры HTTP-точки
+    payload: BulkActionRequest,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+) -> BulkActionOut:
+    """Поставить одну и ту же операцию пачке магазинов (§11.4).
+
+    Выбор: `store_ids` (чекбоксы) → `cluster` (весь кластер) → `all: true`.
+    По каждому магазину возвращается строка прогресса: `queued` или `skipped`
+    (товар отключён) — ровно то, что рисует прогресс-таблица в UI.
+    """
+    kind, params = _validate_action(payload.action, payload.params)
+    stores = resolve_target_stores(
+        session,
+        store_ids=payload.store_ids,
+        cluster=payload.cluster,
+        all_stores=payload.all,
+    )
+    if not stores:
+        raise HTTPException(
+            status_code=HTTP_422,
+            detail="Не выбрано ни одного магазина (store_ids / cluster / all)",
+        )
+
+    results: list[BulkActionJobOut] = []
+    warning: str | None = None
+    created = 0
+
+    for store in stores:
+        if not store.is_active:
+            results.append(
+                BulkActionJobOut(
+                    store_id=store.id,
+                    store_name=store.name,
+                    status="skipped",
+                    detail="Магазин отключён (is_active=false)",
+                )
+            )
+            continue
+        command = _create_job(
+            session,
+            store,
+            kind=kind,
+            params=params,
+            author=admin.username,
+            action_name=payload.action,
+        )
+        created += 1
+        results.append(
+            BulkActionJobOut(
+                store_id=store.id,
+                store_name=store.name,
+                job_id=command.id,
+                status=str(command.status),
+                detail=dispatcher_hint(store, command),
+            )
+        )
+        if kind == str(CommandKind.RUN_MERGE) and warning is None:
+            warning = _merge_warning(
+                session,
+                store,
+                file_name=str(params.get("file_name") or ""),
+                extension_name=params.get("extension_name"),
+            )
+
+    audit_service.record(
+        session,
+        action="bulk_action",
+        actor=admin.username,
+        entity="stores",
+        entity_id=None,
+        details={
+            "action": payload.action,
+            "params": params,
+            "stores": [item.store_id for item in results],
+            "created": created,
+        },
+        ip_address=get_client_ip(request),
+    )
+    session.flush()
+
+    return BulkActionOut(
+        action=payload.action,
+        message=f"Задачи поставлены: {created} из {len(results)} магазинов",
+        total=len(results),
+        jobs=results,
+        warning=warning,
+    )
+
+
+# --- История задач (§11.6) --------------------------------------------------
+
+
+@router.get("/jobs", response_model=JobsPageOut, summary="История операций")
+def list_jobs(  # noqa: PLR0913 - параметры HTTP-точки
+    session: Annotated[Session, Depends(get_db)],
+    store_id: Annotated[int | None, Query(ge=1)] = None,
+    kind: Annotated[str | None, Query(max_length=32)] = None,
+    job_status: Annotated[str | None, Query(alias="status", max_length=32)] = None,
+    active_only: Annotated[bool, Query()] = False,
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> JobsPageOut:
+    """Список задач с фильтрами: магазин, тип, статус, «только в работе» (§11.6)."""
+    commands = command_service.list_commands(
+        session,
+        store_id=store_id,
+        kind=(kind or "").strip() or None,
+        status=(job_status or "").strip() or None,
+        active_only=active_only,
+        limit=limit,
+        offset=offset,
+    )
+    messages = _last_messages(session, [command.id for command in commands])
+    counts = command_service.counts_by_status(session, store_id=store_id)
+    return JobsPageOut(
+        items=[
+            JobOut.from_model(command, last_message=messages.get(command.id))
+            for command in commands
+        ],
+        counts=counts,
+        total=sum(counts.values()),
+        active=sum(counts.get(status_name, 0) for status_name in command_service.ACTIVE_STATUSES),
+    )
+
+
+@router.get("/jobs/{job_id}", response_model=JobDetailOut, summary="Задача и полный журнал")
+def get_job(job_id: int, session: Annotated[Session, Depends(get_db)]) -> JobDetailOut:
+    """Карточка задачи `/jobs/{id}`: параметры, статус, полный журнал (§11.6)."""
+    command = command_service.get_command(session, job_id)
+    if command is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Задача id={job_id} не найдена"
+        )
+    logs = list(command.logs)
+    base = JobOut.from_model(command, last_message=logs[-1].message if logs else None)
+    return JobDetailOut(**base.model_dump(), logs=[JobLogOut.from_model(entry) for entry in logs])
+
+
+# --- Матрица файлов (§11.3) -------------------------------------------------
+
+
+@router.get("/files/matrix", response_model=FileMatrixOut, summary="Матрица файлов обновления")
+def files_matrix(  # noqa: PLR0913 - параметры HTTP-точки
+    session: Annotated[Session, Depends(get_db)],
+    filename: Annotated[str | None, Query(max_length=200)] = None,
+    store_id: Annotated[int | None, Query(ge=1)] = None,
+    cluster: Annotated[str | None, Query(max_length=200)] = None,
+    include_inactive: Annotated[bool, Query()] = False,
+) -> FileMatrixOut:
+    """Матрица «магазин × (cf/cfe/xml)»: последний снимок на магазин (§4.5, §11.3).
+
+    Дополнительно отдаются счётчики `present` / `missing_current`, из которых UI
+    рисует «файл есть у N из M» и красную подсветку магазинов без файла (Q53).
+    """
+    name = (filename or "").strip() or settings_service.get_str(session, "default_file_name")
+    _validate_filename(name)
+
+    stores = resolve_target_stores(
+        session,
+        store_ids=[store_id] if store_id else None,
+        cluster=cluster,
+        all_stores=True,
+    )
+    if not include_inactive:
+        visible = [store for store in stores if store.is_active]
+    else:
+        visible = stores
+
+    snapshots: dict[int, FileCheck] = {}
+    if visible:
+        rows = session.scalars(
+            select(FileCheck)
+            .where(
+                FileCheck.store_id.in_([store.id for store in visible]),
+                FileCheck.filename == name,
+            )
+            .order_by(FileCheck.id)
+        ).all()
+        for snapshot in rows:  # последний снимок перезаписывает предыдущий (§4.5)
+            snapshots[int(snapshot.store_id)] = snapshot
+
+    window = settings_service.get_int(session, "online_window_sec")
+    now = utcnow()
+    matrix: list[FileMatrixRow] = []
+    for store in visible:
+        snapshot = snapshots.get(store.id)
+        exists = bool(
+            snapshot
+            and (snapshot.cf_exists or snapshot.cfe_exists or snapshot.xml_exists)
+        )
+        matrix.append(
+            FileMatrixRow(
+                store_id=store.id,
+                store_name=store.name,
+                ip_address=store.ip_address,
+                cluster_name=store.cluster_name,
+                is_active=store.is_active,
+                is_online=store.is_online(now, window),
+                filename=name,
+                checked_at=to_iso_z(snapshot.checked_at) if snapshot else None,
+                cf_exists=bool(snapshot.cf_exists) if snapshot else False,
+                cfe_exists=bool(snapshot.cfe_exists) if snapshot else False,
+                xml_exists=bool(snapshot.xml_exists) if snapshot else False,
+                cf_size=snapshot.cf_size if snapshot else None,
+                cfe_size=snapshot.cfe_size if snapshot else None,
+                xml_size=snapshot.xml_size if snapshot else None,
+                cf_mtime=to_iso_z(snapshot.cf_mtime) if snapshot else None,
+                cfe_mtime=to_iso_z(snapshot.cfe_mtime) if snapshot else None,
+                xml_mtime=to_iso_z(snapshot.xml_mtime) if snapshot else None,
+                has_file=exists,
+                checked=snapshot is not None,
+            )
+        )
+
+    present = sum(1 for row in matrix if row.has_file)
+    return FileMatrixOut(
+        filename=name,
+        rows=matrix,
+        total=len(matrix),
+        present=present,
+        missing_current=len(matrix) - present,
+    )
+
+
+

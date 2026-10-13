@@ -15,6 +15,7 @@ import { useToast } from 'primevue/usetoast'
 
 import { ApiError } from '@/api/client'
 import type { AgentConfigBlock, StoreCreatePayload, StoreItem, StoreUpdatePayload } from '@/api/types'
+import OperationPanel from '@/components/OperationPanel.vue'
 import { useStoresStore } from '@/stores/stores'
 
 const toast = useToast()
@@ -44,6 +45,11 @@ const configBlock = ref<AgentConfigBlock | null>(null)
 const isConfigOpen = ref(false)
 const tokenResult = ref<{ store_id: number; agent_token: string; warning: string } | null>(null)
 const isTokenOpen = ref(false)
+
+// Массовые операции (§11.4): «все магазины» или один кластер целиком
+const isOperationsOpen = ref(false)
+const operationsTarget = ref<'all' | 'cluster'>('all')
+const operationsCluster = ref('')
 
 const dialogTitle = computed(() =>
   editingId.value === null ? 'Новый магазин' : 'Изменить магазин',
@@ -243,6 +249,14 @@ function formatTime(value: string | null): string {
           :loading="stores.isLoading"
           data-test="refresh-stores"
           @click="stores.load()"
+        />
+        <Button
+          label="Массовые операции"
+          icon="pi pi-sitemap"
+          size="small"
+          severity="secondary"
+          data-test="open-bulk-operations"
+          @click="isOperationsOpen = true"
         />
         <Button
           label="Добавить магазин"
@@ -496,6 +510,60 @@ function formatTime(value: string | null): string {
           @click="copyText(tokenResult?.agent_token ?? '')"
         />
         <Button label="Готово" size="small" text @click="isTokenOpen = false" />
+      </template>
+    </Dialog>
+
+    <Dialog
+      v-model:visible="isOperationsOpen"
+      header="Массовые операции"
+      modal
+      :style="{ width: '900px' }"
+      data-test="bulk-operations-dialog"
+    >
+      <p class="magaz-muted text-sm">
+        Операция ставится всем активным магазинам или всему кластеру сразу (§11.4). Отключённые
+        магазины пропускаются, о них сообщит прогресс.
+      </p>
+
+      <div class="mt-3 flex flex-wrap items-end gap-3">
+        <label class="space-y-1">
+          <span class="magaz-muted text-xs">Кому</span>
+          <select
+            v-model="operationsTarget"
+            class="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+            data-test="bulk-operations-target"
+          >
+            <option value="all">Все активные магазины</option>
+            <option value="cluster">Один кластер</option>
+          </select>
+        </label>
+        <label v-if="operationsTarget === 'cluster'" class="space-y-1">
+          <span class="magaz-muted text-xs">Кластер</span>
+          <select
+            v-model="operationsCluster"
+            class="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+            data-test="bulk-operations-cluster"
+          >
+            <option value="">— выберите —</option>
+            <option v-for="item in stores.clusters" :key="item" :value="item">{{ item }}</option>
+          </select>
+        </label>
+      </div>
+
+      <OperationPanel
+        v-if="operationsTarget === 'all' || operationsCluster"
+        class="mt-4"
+        :all="operationsTarget === 'all'"
+        :cluster="operationsTarget === 'cluster' ? operationsCluster : null"
+        title="Операции"
+        :show-download-link="true"
+      />
+      <Message v-else severity="info" :closable="false" class="mt-4">
+        Выберите кластер, чтобы запустить массовую операцию.
+      </Message>
+
+      <template #footer>
+        <Button label="Закрыть" size="small" text @click="isOperationsOpen = false" />
       </template>
     </Dialog>
   </div>

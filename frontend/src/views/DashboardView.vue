@@ -2,7 +2,9 @@
 /**
  * Главная (§11.1). Э2: плитки «Всего / Онлайн / Офлайн» берутся из
  * `/admin/system/info` (статус считает Health Monitor), раскрывающийся список
- * магазинов — из `/admin/stores`. Автообновление — polling каждые ~10 с.
+ * магазинов — из `/admin/stores`. Э4: плитка «Задач в работе» — это
+ * `counts.jobs_active` (задачи в очереди и в работе у диспетчера).
+ * Автообновление — polling каждые ~10 с.
  */
 import { computed, onMounted, onUnmounted } from 'vue'
 import Button from 'primevue/button'
@@ -63,7 +65,12 @@ function formatTime(value: string | null): string {
       />
       <StatusTile label="Устройства онлайн" value="—" icon="pi pi-wifi" hint="этап Э4Б (Д-1)" />
       <StatusTile label="Ждут ознакомления" value="—" icon="pi pi-bell" hint="этап Э5" />
-      <StatusTile label="Задач в работе" value="—" icon="pi pi-spin pi-spinner" hint="этап Э4" />
+      <StatusTile
+        label="Задач в работе"
+        :value="counts?.jobs_active ?? '—'"
+        icon="pi pi-spin pi-spinner"
+        hint="очередь и выполнение"
+      />
     </section>
 
     <section class="rounded-xl border border-slate-200 bg-white p-5">

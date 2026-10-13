@@ -13,10 +13,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+
 import httpx
 
 __all__ = [
     "ConcurrencyProbe",
+    "ScriptedAgent",
     "health_body",
     "ok_transport",
     "status_transport",
@@ -107,3 +110,199 @@ class ConcurrencyProbe:
     def transport(self) -> httpx.MockTransport:
         """Транспорт, который можно передать в клиент/приложение."""
         return httpx.MockTransport(self.handle)
+
+
+class ScriptedAgent:
+    """Мок агента для «эталонного сценария» Э4 (§13: внешние вызовы — моками).
+
+    Агент ведёт себя как настоящий: принимает `/run-*` и отвечает `202`, затем на
+    `/check-*` отвечает `202`, пока «операция идёт», и наконец `200` с логом (или
+    `400` с ошибкой). Переходы настраиваются, поэтому один и тот же мок годится
+    для успеха, ошибки, таймаута и «1С не запустилась».
+
+    Все запросы записываются в `requests`, а тела — в `json_bodies()`: по ним
+    проверяется, что пароль 1С в командах не появляется (I-7).
+    """
+
+    def __init__(
+        self,
+        *,
+        checks_before_success: int | None = 1,
+        fail_operation: bool = False,
+        busy: bool = True,
+        interrupted: str | None = None,
+        cf_exists: bool = False,
+        cfe_exists: bool = False,
+        xml_exists: bool = False,
+        download_polls_before_file: int = 1,
+        credentials_version: int = 1,
+        devices_version: int = 1,
+        merge_message: str = "Merge process started in the background.",
+        update_message: str = "Update DB process started in the background.",
+    ) -> None:
+        self.checks_before_success = checks_before_success
+        self.fail_operation = fail_operation
+        self.busy = busy
+        self.interrupted = interrupted
+        self.cf_exists = cf_exists
+        self.cfe_exists = cfe_exists
+        self.xml_exists = xml_exists
+        self.download_polls_before_file = download_polls_before_file
+        self.download_polls = 0
+        self.download_requested = False
+        self.credentials_version = credentials_version
+        self.devices_version = devices_version
+        self.merge_message = merge_message
+        self.update_message = update_message
+
+        self.requests: list[dict[str, object]] = []
+        self.checks = 0
+        self.operation: str | None = None
+        self.credentials_pushes: list[dict[str, object]] = []
+
+    # --- Диагностика для тестов --------------------------------------------
+
+    def paths(self) -> list[str]:
+        """Только пути запросов — удобно проверять «что и в каком порядке звали»."""
+        return [str(item["path"]) for item in self.requests]
+
+    def json_bodies(self) -> list[object]:
+        """Тела всех запросов (для проверок «пароля нигде нет», I-7)."""
+        return [item["json"] for item in self.requests if item["json"] is not None]
+
+    @property
+    def transport(self) -> httpx.MockTransport:
+        """Транспорт для клиентов сервера (`AgentClient(transport=...)`)."""
+        return httpx.MockTransport(self.handle)
+
+    # --- Обработчик ---------------------------------------------------------
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        """Ответить так, как это сделала бы касса (§5.1.1, §5.1.2)."""
+        path = request.url.path
+        try:
+            body = json.loads(request.content.decode("utf-8")) if request.content else None
+        except ValueError:
+            body = None
+        self.requests.append(
+            {
+                "method": request.method,
+                "path": path,
+                "json": body,
+                "query": dict(request.url.params),
+            }
+        )
+
+        if path == "/health":
+            return httpx.Response(200, json=self._health())
+        if path == "/version":
+            return httpx.Response(200, json={"agent_version": "1.0.0", "store_id": 1})
+        if path == "/credentials":
+            self.credentials_pushes.append(body or {})
+            self.credentials_version = int((body or {}).get("credentials_version") or 1)
+            return httpx.Response(
+                200, json={"stored": True, "credentials_version": self.credentials_version}
+            )
+        if path == "/check-files":
+            if self.download_requested:
+                self.download_polls += 1
+            return httpx.Response(200, json=self._files())
+        if path == "/download-file":
+            self.download_polls = 0
+            self.download_requested = True
+            return httpx.Response(202, json={"message": "Download started in the background."})
+        if path == "/send-message":
+            return httpx.Response(
+                200,
+                json={
+                    "message": "Message sent and 1cv8 processes terminated.",
+                    "killed_1cv8": True,
+                },
+            )
+        if path in ("/run-merge", "/run-update-db"):
+            self.checks = 0
+            self.operation = path
+            message = self.merge_message if path == "/run-merge" else self.update_message
+            return httpx.Response(
+                202, json={"message": message, "log_path": self._log_path(path)}
+            )
+        if path in ("/check-merge", "/check-update-db"):
+            return self._check_state(path)
+        return httpx.Response(404, json={"detail": f"Неизвестный путь {path}"})
+
+    # --- Тела ответов -------------------------------------------------------
+
+    def _health(self) -> dict[str, object]:
+        """`GET /health` (§5.1.2) — с `busy`, версиями П-1/Д-1 и прерванной операцией."""
+        return health_body(
+            busy={"merge": self.busy, "update": self.busy},
+            credentials_version=self.credentials_version,
+            devices_version=self.devices_version,
+            interrupted_operation=self.interrupted,
+        )
+
+    def _files(self) -> dict[str, object]:
+        """`POST /check-files`: файл «появляется» после скачивания (ФН2, §11.3)."""
+        downloaded = self.download_requested and self.download_polls >= self.download_polls_before_file
+        has_cf = bool(self.cf_exists or downloaded)
+        return {
+            "cf_exists": has_cf,
+            "cfe_exists": bool(self.cfe_exists),
+            "xml_exists": bool(self.xml_exists),
+            "cf_size": 1024 if has_cf else None,
+            "cfe_size": None,
+            "xml_size": None,
+            "cf_mtime": "2026-10-13T10:00:00Z" if has_cf else None,
+            "cfe_mtime": None,
+            "xml_mtime": None,
+        }
+
+    def _log_path(self, path: str) -> str:
+        """Путь лога на кассе — имена как в v2 (§7.1, Приложение B)."""
+        if path == "/run-merge":
+            return r"C:\MagazAgent\log-merge.txt"
+        return r"C:\MagazAgent\log-update-db.txt"
+
+    def _check_state(self, path: str) -> httpx.Response:
+        """`GET /check-merge` / `GET /check-update-db`: `202 → 200/400` (§3.3)."""
+        if self.checks_before_success is None:
+            return httpx.Response(
+                202,
+                json={
+                    "status": "in_progress",
+                    "message": "Operation is in progress.",
+                    "logs": "",
+                },
+            )
+        self.checks += 1
+        if self.checks < self.checks_before_success:
+            return httpx.Response(
+                202,
+                json={
+                    "status": "in_progress",
+                    "message": "Operation is in progress.",
+                    "logs": "",
+                },
+            )
+        if self.fail_operation:
+            return httpx.Response(
+                400,
+                json={
+                    "status": "failed",
+                    "message": "Merge failed.",
+                    "logs": "Ошибка: конфликт объектов метаданных",
+                },
+            )
+        success = (
+            "Объединение конфигураций успешно завершено"
+            if path == "/check-merge"
+            else "Обновление конфигурации успешно завершено"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "message": "Completed successfully.",
+                "logs": f"{success}\nДлительность: 12 с",
+            },
+        )
