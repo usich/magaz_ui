@@ -17,8 +17,10 @@
 
 from pathlib import Path
 
-#: Корень репозитория: спека лежит в `deploy\`, поэтому на уровень выше
-REPO_ROOT = Path(SPECPATH).resolve().parents[1]  # noqa: F821 - задаёт PyInstaller
+#: Корень репозитория: `SPECPATH` — каталог спеки (`deploy\`), поэтому на уровень выше.
+#: Находка Э7: здесь стоял `parents[1]` — на уровень **выше** репозитория, и сборка падала
+#: с «script 'C:\...\PycharmProjects\client\agent\__main__.py' not found».
+REPO_ROOT = Path(SPECPATH).resolve().parent  # noqa: F821 - задаёт PyInstaller
 
 a = Analysis(  # noqa: F821 - задаёт PyInstaller
     [str(REPO_ROOT / "client" / "agent" / "__main__.py")],

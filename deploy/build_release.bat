@@ -21,17 +21,32 @@ pushd "%REPO_ROOT%"
 set "SKIP_UI="
 if /i "%~1"=="--skip-ui" set "SKIP_UI=1"
 
-if not defined SKIP_UI (
-  echo [1/3] Сборка SPA (npm ci + npm run build) ...
-  pushd frontend
-  if not exist node_modules ( npm ci ) else ( echo      node_modules уже есть — пропускаем npm ci )
-  call npm run build
-  if errorlevel 1 ( echo ОШИБКА сборки SPA & popd & popd & exit /b 1 )
-  popd
-) else (
-  echo [1/3] Сборка SPA пропущена (--skip-ui).
-)
+rem Ярлыки, а не вложенный блок: cmd считает `(` внутри `echo` в блоке началом
+rem вложенного блока, и строка с «(npm ci ...)» ломала разбор всего скрипта
+rem («... was unexpected at this time» — находка Э7). В текстах echo скобок нет.
+if defined SKIP_UI goto :skip_ui
 
+echo [1/3] Сборка SPA: npm ci + npm run build ...
+pushd frontend
+if not exist node_modules (
+  npm ci
+) else (
+  echo      node_modules уже есть - пропускаем npm ci
+)
+call npm run build
+if errorlevel 1 (
+  echo ОШИБКА сборки SPA
+  popd
+  popd
+  exit /b 1
+)
+popd
+goto :ui_done
+
+:skip_ui
+echo [1/3] Сборка SPA пропущена: берём уже собранную frontend\dist --skip-ui.
+
+:ui_done
 echo [2/3] Сборка exe агента и TrayAgent ...
 .venv\Scripts\python.exe -m PyInstaller --clean --noconfirm deploy\agent.spec
 if errorlevel 1 ( echo ОШИБКА сборки magaz-agent.exe & popd & exit /b 1 )

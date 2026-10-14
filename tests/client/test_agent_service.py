@@ -13,7 +13,10 @@
 
 from __future__ import annotations
 
+import re
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -60,23 +63,54 @@ class TestServiceCli:
 
     @pytest.mark.parametrize("command", ["install", "remove", "start", "stop", "debug"])
     def test_commands_report_unsupported_and_return_code(
-        self, command: str, capsys: pytest.CaptureFixture[str]
+        self,
+        command: str,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Ветка «нет `pywin32`»: команда объясняет ситуацию и возвращает код.
+
+        `service_available` подменяется на `False` сознательно. На сборочной машине
+        `pywin32` **установлен** (requirements-build.txt), и настоящий вызов тронул бы
+        живую службу: `install` зарегистрировал бы службу на exe с pytest, а `debug`
+        запустил бы её на переднем плане и повесил прогон (находка Э7 — тесты гоняются
+        на сборочной машине). Наличие `pywin32` проверяется отдельным тестом ниже.
+        """
+        # Две ссылки на функцию: CLI импортирует её к себе по имени (§7.5)
+        monkeypatch.setattr(agent_cli, "service_available", lambda: False)
+        monkeypatch.setattr(service, "service_available", lambda: False)
+
         code = agent_main([command])
 
-        if service.service_available():  # pragma: no cover - прогон со сборочной машины
-            assert code == 0
-            return
         assert code == service.UNSUPPORTED_CODE
         output = capsys.readouterr().out
         assert command in output
         assert "--console" in output, "подсказка обязана предложить режим отладки"
 
+    def test_command_argv_is_exe_and_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`HandleCommandLine` получает `[<exe>, <команда>]`, а не сырой `sys.argv`.
+
+        Это единственный тест, заходящий в ветку «`pywin32` есть», поэтому сам модуль
+        `win32serviceutil` подменяется (`sys.modules`): он импортируется внутри
+        `run_service_command`, и реальный вызов на сборочной машине был бы опасен.
+        """
+        captured: list[list[str]] = []
+        fake_module = SimpleNamespace(
+            HandleCommandLine=lambda _cls, argv: captured.append(list(argv))
+        )
+        monkeypatch.setitem(sys.modules, "win32serviceutil", fake_module)
+        monkeypatch.setattr(service, "service_available", lambda: True)
+        monkeypatch.setattr(service, "build_service_class", lambda: "MagazAgentService")
+
+        code = service.run_service_command("install", [r"C:\MagazAgent\magaz-agent.exe"])
+
+        assert code == 0
+        assert captured == [[r"C:\MagazAgent\magaz-agent.exe", "install"]]
+
     def test_run_service_command_without_pywin32_is_graceful(
-        self, capsys: pytest.CaptureFixture[str]
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        if service.service_available():  # pragma: no cover - сборочная машина
-            pytest.skip("pywin32 установлен: проверяется на кассе (Э7)")
+        monkeypatch.setattr(service, "service_available", lambda: False)
 
         code = service.run_service_command("start")
 
@@ -140,6 +174,54 @@ class TestDeployContract:
         for expected in ("magaz-agent.exe", "MagazTrayAgent.exe", "install_agent.bat", "agent-config.json"):
             assert expected in note, f"в памятке нет {expected}"
         assert "tray.log" in note, "в памятке должно быть, где искать логи трея"
+
+    def test_specs_resolve_repo_root_from_deploy_dir(self) -> None:
+        """`SPECPATH` — каталог спеки, значит корень репозитория — его родитель.
+
+        Находка Э7: в обоих спеках стоял `parents[1]` — на уровень **выше** репозитория,
+        и `deploy\\build_release.bat` падал с «script '...\\PycharmProjects\\client\\agent\\
+        __main__.py' not found»: сборка релиза никогда не доходила до конца.
+        """
+        for name in ("agent.spec", "tray.spec"):
+            spec = read_deploy(name)
+
+            assert re.search(r"REPO_ROOT = Path\(SPECPATH\)\.resolve\(\)\.parent\b", spec), (
+                f"{name}: корень репозитория считается от каталога спеки"
+            )
+            assert not re.search(r"REPO_ROOT\s*=.*parents\[1\]", spec), (
+                f"{name}: `parents[1]` уводит выше репозитория"
+            )
+
+    def test_bat_files_use_crlf(self) -> None:
+        """`cmd.exe` не переваривает `*.bat` с LF: скрипт рвётся на разборе блоков."""
+        for path in sorted(DEPLOY_DIR.glob("*.bat")):
+            raw = path.read_bytes()
+
+            assert b"\r\n" in raw, f"{path.name}: нужны CRLF-переводы строк"
+            assert b"\n" not in raw.replace(b"\r\n", b""), f"{path.name}: найден одиночный LF"
+
+    def test_echo_and_rem_inside_blocks_have_no_parentheses(self) -> None:
+        """Скобки в `echo`/`rem` **внутри блока** ломают разбор всего скрипта.
+
+        Находка Э7: строка `echo [1/3] Сборка SPA (npm ci + npm run build) ...` внутри
+        `if not defined SKIP_UI (...)` давала «... was unexpected at this time» — скрипт
+        сборки падал до первого действия, поэтому `dist\\release\\` и не появлялся.
+        Скобки в кавычках (пути вида `Program Files (x86)`) не считаются.
+        """
+        for path in sorted(DEPLOY_DIR.glob("*.bat")):
+            depth = 0
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                stripped = line.strip()
+                lowered = stripped.lower()
+                if lowered.startswith(("echo", "rem", "@echo")):
+                    assert not (depth > 0 and "(" in stripped), (
+                        f"{path.name}:{number}: скобка в {stripped.split()[0]} внутри блока — "
+                        "используйте ярлык (goto) вместо вложенного блока"
+                    )
+                    continue
+                code = re.sub(r'"[^"]*"', "", line)  # кавычки: пути со скобками
+                depth += code.count("(") - code.count(")")
+            assert depth == 0, f"{path.name}: непарные скобки"
 
 
 class TestAgentCliOptions:

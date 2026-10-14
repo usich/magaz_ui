@@ -39,7 +39,7 @@ if defined PURGE (
   if exist "%TARGET%" rmdir /s /q "%TARGET%"
   echo      Удалён.
 ) else (
-  echo      Оставлен (данные и логи не тронуты). Полное удаление: --purge
+  echo      Оставлен: данные и логи не тронуты. Полное удаление: --purge
 )
 echo Готово. Магазин в дашборде станет «офлайн» после окна online_window_sec (§3.3).
 endlocal

@@ -821,7 +821,7 @@ MagazAgent.exe preflight --json > preflight-store-5.json   # на кассе
 
 | Критерий | Проверка | Результат |
 |---|---|---|
-| Тесты Python | `pytest -q` | **654** теста (client 208, server 364, shared 82), полный прогон без падений; новых на Э7 — **81**: `tests/shared/test_preflight.py` 17, `tests/server/test_preflight.py` 32, `tests/client/test_agent_preflight.py` 25, `TestAgentCliOptions` 5, `TestProxyIsIgnored` 2 |
+| Тесты Python | `pytest -q` | **658** тестов (client 212, server 364, shared 82), полный прогон без падений; новых на Э7 — **85**: `tests/shared/test_preflight.py` 17, `tests/server/test_preflight.py` 32, `tests/client/test_agent_preflight.py` 25, `TestAgentCliOptions` 5, `TestProxyIsIgnored` 2, `TestServiceCli`/`TestDeployContract` 4 |
 | Проверка сервера на живом репозитории | `python -m server.cli preflight` | 12 пунктов: **10 OK, 2 «внимание»** — `MAGAZ_PUBLIC_SERVER_URL` не задан и 2 из 14 настроек §4.9 не подсеяны; код возврата `0` («можно начинать приёмку») |
 | Проверка кассы без конфига | `python -m client.agent preflight --no-server` | один пункт `ОШИБКА` «Не найден конфиг агента» + подсказка, код возврата `1` — вместо трейсбека при старте |
 | Тексты отчёта | `pytest tests/shared/test_preflight.py` | отчёт печатается в cp1251-консоли (символы `→`/`≥` заменяются), токен и пароль 1С в отчёт не попадают (I-7) |
@@ -856,10 +856,26 @@ MagazAgent.exe preflight --json > preflight-store-5.json   # на кассе
 (там же отмечено, что `use_msg_exe = false`: окно `msg.exe` на рабочем столе разработчика
 не нужно, дублирующий канал проверяется на кассе).
 
+### Сборка релиза: дистрибутив кассы собран и проверен
+
+`dist\release\` раньше **не существовал**: скрипт сборки падал на разборе (см. дефект 6 ниже).
+После исправления дистрибутив собирается одной командой и проверен не только «на наличие
+файлов» — собранные exe реально отработали в сквозном сценарии.
+
+| Что | Факт |
+|---|---|
+| Сборочные зависимости | `pip install -r requirements-build.txt`: pyinstaller 6.16.0, pywin32 311, pystray 0.19.5, pillow 11.3.0 (+ `-r requirements.txt`) |
+| Сборка | `deploy\build_release.bat --skip-ui` (SPA уже в `frontend\dist`) → `dist\magaz-agent.exe` 20.9 МБ, `dist\MagazTrayAgent.exe` 25.2 МБ |
+| Дистрибутив | `dist\release\`: оба exe + `install_agent.bat` + `uninstall_agent.bat` + `README_INSTALL.md` |
+| Диагностика exe | `magaz-agent.exe --version` → `MagazAgent 1.0.0`; `info --config …` читает конфиг магазина; `preflight --no-server` → 5 OK, 1 `ВНИМАНИЕ` (порт 8383 занят живым агентом), 1 `ОШИБКА` (нет 1С — на этой машине её нет) |
+| Трей exe | `MagazTrayAgent.exe --pending` → `#1 [important] …`, сессия Windows определена сама (`ilausicenko`) |
+| Сквозной сценарий через exe | exe-агент вместо python-агента: Д-3 «Проверить сейчас» → `200`, версия `1.0.0`, `busy`, сессии; дашборд `is_online = true`; уведомление → `MagazTrayAgent.exe --pending` показал `#5 [important]` → `--ack 5` → на сервере `acknowledged: 1`, `percent: 100` |
+
 ### Живые дефекты, найденные при подготовке
 
-Первые три пойманы «собачьим» прогоном CLI на реальном репозитории, ещё два — живым прогоном
-сервера с настоящим агентом, то есть именно тем способом, каким это запустят на стенде:
+Первые три пойманы «собачьим» прогоном CLI на реальном репозитории, ещё пять — живым прогоном
+сервера с настоящим агентом и первой сборкой релиза, то есть именно тем способом, каким это
+запустят на стенде:
 
 1. **`preflight` был добавлен в парсер, но не подключён в `server.cli.main`** — команда молча
    возвращала код `1` без единой строки отчёта. Тест на парсер это пропускал; теперь есть
@@ -886,6 +902,28 @@ MagazAgent.exe preflight --json > preflight-store-5.json   # на кассе
    Теперь у каждой подкоманды есть их копия (`argument_default=SUPPRESS`, чтобы подкоманда
    не затирала уже разобранное значение), тесты — `TestAgentCliOptions`. Расхождение
    «инструкция против кода» иначе не поймать: в текстах вызов выглядел рабочим.
+6. **Скрипт сборки релиза не запускался вообще.** `deploy\build_release.bat` падал сразу:
+   `... was unexpected at this time`. Причина — скобки в `echo` **внутри блока**: cmd считает
+   `(` началом вложенного блока, и хвост ` ...` после него оказывается неожиданным токеном.
+   Строка `echo [1/3] Сборка SPA (npm ci + npm run build) ...` стояла внутри
+   `if not defined SKIP_UI (...)`, поэтому скрипт не делал ничего — и `dist\release\` на этой
+   машине просто не появлялся. Строки того же класса нашлись в `install_agent.bat` (2) и
+   `uninstall_agent.bat` (1): на кассе установка упала бы на разборе (в пробном запуске это
+   не проявилось только потому, что скрипт выходил на более ранней проверке файлов). Исправлено:
+   ветвление через ярлыки (`goto`), в текстах `echo` скобок нет; регресс-тесты `TestDeployContract`
+   проверяют CRLF в `*.bat`, отсутствие скобок в `echo`/`rem` внутри блоков и отсутствие
+   одиночных `LF`.
+7. **В спеках PyInstaller корень репозитория считался на уровень выше.** `SPECPATH` — это
+   каталог спеки, поэтому `parents[1]` давал `C:\Users\...\PycharmProjects`, и сборка падала с
+   «script `...\PycharmProjects\client\agent\__main__.py` not found». Исправлено в `agent.spec`
+   и `tray.spec` (`Path(SPECPATH).resolve().parent`), проверка — в `TestDeployContract`.
+8. **Тесты на сборочной машине трогали живую службу.** После `pip install -r
+   requirements-build.txt` в `.venv` появился `pywin32`, и `agent_main(["install", …])`
+   вызывался **до** проверки `service_available()`: это настоящий `HandleCommandLine`, то есть
+   регистрация службы на exe с pytest, а `debug` — запуск службы на переднем плане (прогон
+   повис бы, а на машине с правами администратора осталась бы испорченная служба). Исправлено:
+   ветка «нет `pywin32`» проверяется с подменённым `service_available`, контракт argv — с
+   подменённым `sys.modules["win32serviceutil"]`; реальная служба в тестах не вызывается.
 
 ### Что осталось (только стенд)
 

@@ -31,7 +31,7 @@ if not exist "%TARGET%\magaz-agent.exe" (
 )
 if not exist "%TARGET%\agent-config.json" (
   echo      ПРЕДУПРЕЖДЕНИЕ: нет agent-config.json — возьмите его в карточке
-  echo      магазина (store_id, server_url, agent_token, base_1c_path).
+  echo      магазина: store_id, server_url, agent_token, base_1c_path.
 )
 
 echo [2/4] Установка службы MagazAgent ...
@@ -44,7 +44,7 @@ if errorlevel 1 (
 
 echo [3/4] Регистрация TrayAgent в Планировщике ...
 if defined NO_TRAY (
-  echo      Пропущено (--no-tray).
+  echo      Пропущено: --no-tray.
   goto :check
 )
 rem Без домена задача ставится группе "Users", в домене — группе домена.
