@@ -308,6 +308,11 @@ class Notification(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Э9: `plain` — прежний простой текст, `html` — разметка из редактора
+    #: (`shared.richtext` держит белый список тегов; миграция `e8a1c4d70f31`)
+    body_format: Mapped[str] = mapped_column(
+        String(8), default="plain", server_default="plain", nullable=False
+    )
     severity: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     requires_ack: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False
@@ -319,6 +324,11 @@ class Notification(TimestampMixin, Base):
     use_msg_exe: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true(), nullable=False
     )
+    #: Э9: «удалять после прочтения». `false` (по умолчанию) — прочитанное
+    #: остаётся на кассе справочником, `true` — исчезает после «Ознакомлен»
+    delete_after_read: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true(), nullable=False
     )
@@ -329,6 +339,12 @@ class Notification(TimestampMixin, Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
         order_by="NotificationTarget.id",
+    )
+    images: Mapped[list["NotificationImage"]] = relationship(
+        back_populates="notification",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="NotificationImage.id",
     )
 
     def __repr__(self) -> str:  # pragma: no cover - отладка
@@ -402,6 +418,41 @@ class NotificationReceipt(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - отладка
         return f"<NotificationReceipt id={self.id} user={self.session_user!r} status={self.status}>"
+
+
+class NotificationImage(Base):
+    """Картинка в теле уведомления (§4.6, Э9).
+
+    Файл лежит на диске (`storage/notifications/<id уведомления>/<имя>`), в БД —
+    только описание. В теле картинка адресуется меткой `magaz-image:<имя>`
+    (`shared.richtext`): SPA подставляет адрес админского API, касса — свой
+    локальный кэш, поэтому уведомление читается и без интернета (§7.4).
+    """
+
+    __tablename__ = "notification_images"
+    __table_args__ = (
+        UniqueConstraint("notification_id", "name", name="uq_notification_images_name"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    notification_id: Mapped[int] = mapped_column(
+        ForeignKey("notifications.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    notification: Mapped["Notification"] = relationship(back_populates="images")
+
+    def __repr__(self) -> str:  # pragma: no cover - отладка
+        return (
+            f"<NotificationImage id={self.id} notification_id={self.notification_id} "
+            f"name={self.name!r} size={self.size_bytes}>"
+        )
 
 
 class Setting(Base):

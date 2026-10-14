@@ -51,6 +51,8 @@ def settings(tmp_path) -> Settings:  # noqa: ANN001 - pytest tmp_path
         secrets_key_path=tmp_path / "secrets.key",
         cookie_secret_path=tmp_path / "cookie_secret.key",
         frontend_dist_dir=tmp_path / "dist",
+        # Э9: картинки уведомлений — во временном каталоге, а не в `server/data`
+        notification_images_dir=tmp_path / "notification-images",
         serve_spa=True,
         health_monitor_enabled=False,
         dispatcher_enabled=False,

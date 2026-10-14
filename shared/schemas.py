@@ -201,8 +201,14 @@ class NotifyRequest(BaseModel):
     id: int
     title: str
     body: str
+    #: Э9: `plain` — простой текст, `html` — разметка из редактора (§4.6)
+    body_format: str = "plain"
     severity: NotificationSeverity = NotificationSeverity.INFO
     requires_ack: bool = False
+    #: Э9: прочитанное уведомление исчезает с кассы или остаётся справочником
+    delete_after_read: bool = False
+    #: Э9: имена картинок тела; адрес касса строит сама (локальный кэш, §7.4)
+    images: list[str] = Field(default_factory=list)
     deadline_at: str | None = None
     repeat_every_min: int | None = None
     use_msg_exe: bool = True
@@ -223,6 +229,9 @@ class NotificationPendingItem(BaseModel):
     id: int
     title: str
     body: str
+    #: Э9: формат тела и картинки — окно кассы рисует разметку само (§7.4)
+    body_format: str = "plain"
+    images: list[str] = Field(default_factory=list)
     severity: NotificationSeverity
     requires_ack: bool
     repeat_every_min: int | None = None

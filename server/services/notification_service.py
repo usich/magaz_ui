@@ -25,11 +25,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import logging
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
@@ -37,11 +39,13 @@ from sqlalchemy.orm import Session, selectinload
 from server.db.models import (
     Command,
     Notification,
+    NotificationImage,
     NotificationReceipt,
     NotificationTarget,
     Store,
 )
 from server.services import command_service, settings_service
+from shared import richtext
 from shared.enums import (
     CommandKind,
     CommandStatus,
@@ -58,6 +62,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "CSV_HEADER",
     "DEFAULT_LIST_LIMIT",
+    "IMAGES_MAX_PER_NOTIFICATION",
+    "IMAGE_CONTENT_TYPES",
+    "IMAGE_MAX_BYTES",
     "OPEN_RECEIPT_STATUSES",
     "RECEIPT_STATUSES",
     "SEVERITIES",
@@ -68,10 +75,15 @@ __all__ = [
     "TARGET_TYPES",
     "NotificationNotFoundError",
     "NotificationValidationError",
+    "add_image",
     "apply_receipts",
     "cancel_notification",
     "create_notification",
+    "detect_image_content_type",
     "get_notification",
+    "image_directory",
+    "image_file_path",
+    "image_payload",
     "list_notifications",
     "mark_delivered",
     "normalize_params",
@@ -80,6 +92,7 @@ __all__ = [
     "push_payload",
     "report",
     "report_csv",
+    "severity_summary",
     "snooze_min",
     "state",
     "target_stores",
@@ -94,6 +107,18 @@ DEFAULT_LIST_LIMIT = 200
 TITLE_MAX_LENGTH = 200
 #: Ограничение текста: тело уведомления — короткое сообщение, а не документ
 BODY_MAX_LENGTH = 4000
+#: Э9: у тела с разметкой лимит выше — HTML-теги «съедают» символы, а картинки
+#: приходят метками `magaz-image:<имя>`, которые тоже занимают место (§4.6)
+BODY_MAX_LENGTH_HTML = 20000
+#: Э9: картинки тела — что и сколько принимаем (§4.6)
+IMAGE_MAX_BYTES = 2 * 1024 * 1024
+IMAGES_MAX_PER_NOTIFICATION = 10
+IMAGE_CONTENT_TYPES: tuple[str, ...] = (
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+)
 #: §4.6/§4.8: допустимые значения
 SEVERITIES: tuple[str, ...] = tuple(item.value for item in NotificationSeverity)
 TARGET_TYPES: tuple[str, ...] = tuple(item.value for item in TargetType)
@@ -197,6 +222,32 @@ def _clean_store_ids(value: object) -> list[int]:
     return ids
 
 
+def _clean_body_format(value: object) -> str:
+    """Формат тела: `plain` (по умолчанию) или `html` из редактора (§4.6, Э9)."""
+    try:
+        return richtext.normalize_body_format(value)
+    except ValueError as exc:
+        raise NotificationValidationError(str(exc)) from exc
+
+
+def _clean_body(value: object, *, body_format: str) -> str:
+    """Тело уведомления: у HTML — белый список тегов, у текста — как было (§4.6).
+
+    Санитайз живёт здесь, а не в API: тело уходит в двух направлениях — в SPA
+    (предпросмотр и отчёт) и на кассу (§7.4), поэтому чистить его должен
+    единственный вход — создание уведомления.
+    """
+    is_html = body_format == richtext.BODY_FORMAT_HTML
+    limit = BODY_MAX_LENGTH_HTML if is_html else BODY_MAX_LENGTH
+    text = _clean(value, field="body", max_length=limit)
+    if not is_html:
+        return text
+    cleaned = richtext.sanitize_html(text)
+    if not richtext.html_to_text(cleaned):
+        raise NotificationValidationError("В теле нет текста: одна разметка без содержимого")
+    return cleaned
+
+
 def normalize_params(raw: Mapping[str, object] | None) -> dict[str, object]:
     """Проверить и нормализовать тело создания уведомления (§11.5).
 
@@ -207,6 +258,7 @@ def normalize_params(raw: Mapping[str, object] | None) -> dict[str, object]:
     data = dict(raw or {})
     store_ids = _clean_store_ids(data.get("store_ids"))
     target_type = _clean_target_type(data.get("target_type"))
+    body_format = _clean_body_format(data.get("body_format"))
     cluster = str(data.get("cluster") or "").strip() or None
     if target_type == str(TargetType.STORES) and not store_ids:
         raise NotificationValidationError(
@@ -219,9 +271,13 @@ def normalize_params(raw: Mapping[str, object] | None) -> dict[str, object]:
     deadline = data.get("deadline_at")
     return {
         "title": _clean(data.get("title"), field="title", max_length=TITLE_MAX_LENGTH),
-        "body": _clean(data.get("body"), field="body", max_length=BODY_MAX_LENGTH),
+        "body": _clean_body(data.get("body"), body_format=body_format),
+        "body_format": body_format,
         "severity": _clean_severity(data.get("severity")),
         "requires_ack": bool(data.get("requires_ack")),
+        # Э9: «удалять после прочтения» — по умолчанию нет: прочитанное остаётся
+        # справочником на кассе (§4.6, §7.4)
+        "delete_after_read": bool(data.get("delete_after_read", False)),
         "target_type": target_type,
         "use_msg_exe": bool(data.get("use_msg_exe", True)),
         "repeat_every_min": _clean_repeat(data.get("repeat_every_min")),
@@ -278,8 +334,10 @@ def create_notification(  # noqa: PLR0913 - параметры уведомле�
     *,
     title: str,
     body: str,
+    body_format: str = richtext.BODY_FORMAT_PLAIN,
     severity: str = str(NotificationSeverity.INFO),
     requires_ack: bool = False,
+    delete_after_read: bool = False,
     target_type: str = str(TargetType.ALL),
     stores: Sequence[Store] = (),
     cluster: str | None = None,
@@ -294,11 +352,14 @@ def create_notification(  # noqa: PLR0913 - параметры уведомле�
     так выключенная касса получает уведомление позже, а не теряет его.
     """
     kind = _clean_target_type(target_type)
+    format_kind = _clean_body_format(body_format)
     notification = Notification(
         title=_clean(title, field="title", max_length=TITLE_MAX_LENGTH),
-        body=_clean(body, field="body", max_length=BODY_MAX_LENGTH),
+        body=_clean_body(body, body_format=format_kind),
+        body_format=format_kind,
         severity=_clean_severity(severity),
         requires_ack=bool(requires_ack),
+        delete_after_read=bool(delete_after_read),
         target_type=kind,
         target_value=_target_value(kind, stores, cluster),
         deadline_at=deadline_at,
@@ -327,10 +388,13 @@ def create_notification(  # noqa: PLR0913 - параметры уведомле�
 
 
 def _load_options() -> tuple:
-    """Загрузка целей, магазинов и подтверждений ради отчёта (§11.5)."""
+    """Загрузка целей, магазинов, подтверждений и картинок ради отчёта (§11.5)."""
     return (
         selectinload(Notification.targets).selectinload(NotificationTarget.store),
         selectinload(Notification.targets).selectinload(NotificationTarget.receipts),
+        # Э9: имена картинок нужны и в списке (`NotificationOut.images`), и в
+        # полезной нагрузке для кассы (`push_payload`)
+        selectinload(Notification.images),
     )
 
 
@@ -465,6 +529,49 @@ def pending_count(session: Session, *, now: datetime | None = None) -> int:
     return int(session.scalar(stmt) or 0)
 
 
+def severity_summary(session: Session) -> dict[str, object]:
+    """Счётчики вкладок страницы `/notifications` (§11.5, Э9).
+
+    Админу нужны вкладки «все / info / important / critical» со счётчиками, а не
+    один общий список: уровни считаются прямо в SQL, состояния — через
+    `state()`, потому что «в работе / завершено / отменено» вычисляются по факту
+    (прогресс и дедлайн), а не хранятся колонкой. `unread_receipts` — сколько
+    сессий ещё ждёт «Ознакомлен» по каждому уровню: это то же число, что видит
+    окно кассы в шапке (§7.4).
+    """
+    by_severity = dict.fromkeys(SEVERITIES, 0)
+    for severity, count in session.execute(
+        select(Notification.severity, func.count()).group_by(Notification.severity)
+    ).all():
+        by_severity[str(severity)] = int(count)
+
+    by_state = dict.fromkeys((item for item in STATUS_FILTERS if item != STATUS_ALL), 0)
+    for item in session.scalars(select(Notification).options(*_load_options())).all():
+        kind = state(item)
+        by_state[kind] = by_state.get(kind, 0) + 1
+
+    unread = dict.fromkeys(SEVERITIES, 0)
+    rows = session.execute(
+        select(Notification.severity, func.count())
+        .select_from(NotificationReceipt)
+        .join(NotificationTarget, NotificationTarget.id == NotificationReceipt.target_id)
+        .join(Notification, Notification.id == NotificationTarget.notification_id)
+        .where(NotificationReceipt.status.in_(OPEN_RECEIPT_STATUSES))
+        .where(Notification.is_active.is_(True))
+        .where(NotificationTarget.delivered_at.is_not(None))
+        .group_by(Notification.severity)
+    ).all()
+    for severity, count in rows:
+        unread[str(severity)] = int(count)
+
+    return {
+        "total": sum(by_severity.values()),
+        "by_severity": by_severity,
+        "by_state": by_state,
+        "unread_receipts": unread,
+    }
+
+
 # --- Доставка на кассу и приём подтверждений --------------------------------
 
 
@@ -474,19 +581,132 @@ def push_payload(session: Session, store: Store, notification: Notification) -> 
     Интервал возврата отложенного (`snooze_min`) задаёт **сервер** (П-2):
     касса получает его вместе с уведомлением и не хранит собственных
     настроек расписания.
+
+    Э9: на кассу уезжают формат тела (`body_format`), список картинок
+    (`images`) и признак «удалять после прочтения»: окно кассы рисует разметку
+    само, картинки скачивает один раз в локальный кэш, а прочитанное либо
+    оставляет справочником, либо убирает (§4.6, §7.4).
     """
     return NotifyRequest(
         id=notification.id,
         title=notification.title,
         body=notification.body,
+        body_format=str(notification.body_format or richtext.BODY_FORMAT_PLAIN),
         severity=str(notification.severity),
         requires_ack=bool(notification.requires_ack),
+        delete_after_read=bool(notification.delete_after_read),
+        images=[image.name for image in notification.images],
         deadline_at=to_iso_z(notification.deadline_at),
         repeat_every_min=notification.repeat_every_min,
         use_msg_exe=bool(notification.use_msg_exe),
         snooze_min=snooze_min(session),
         store_id=store.id,
     )
+
+
+# --- Картинки тела уведомления (§4.6, Э9) -----------------------------------
+
+
+def image_directory(base_dir: Path, notification_id: int) -> Path:
+    """Каталог картинок одного уведомления: `base_dir/<id уведомления>`."""
+    return Path(base_dir) / str(int(notification_id))
+
+
+def image_file_path(base_dir: Path, notification_id: int, name: str) -> Path:
+    """Путь к файлу картинки; имя проверяется — выйти из каталога нельзя."""
+    if not richtext.is_safe_image_name(name):
+        raise NotificationNotFoundError(f"Картинка {name!r} не найдена")
+    return image_directory(base_dir, notification_id) / name
+
+
+def detect_image_content_type(data: bytes) -> str | None:
+    """Тип картинки по «магическим» байтам — без PIL и без доверия к имени файла.
+
+    Редактор админки отдаёт картинку как `data:`-URL, поэтому полагаться на
+    присланный `content_type` нельзя: сохраняем только то, что действительно
+    похоже на png/jpeg/gif/webp (§4.6).
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def add_image(
+    session: Session,
+    notification: Notification,
+    *,
+    name: str,
+    data: bytes,
+    base_dir: Path,
+    created_by: str | None = None,
+) -> NotificationImage:
+    """Принять картинку в тело уведомления: проверить, записать файл, учесть в БД.
+
+    Файл лежит отдельно от БД (`base_dir/<id>/<имя>`), в теле — только метка
+    `magaz-image:<имя>` (`shared.richtext`), поэтому тело остаётся компактным и
+    переносимым, а касса скачивает картинки один раз в свой кэш (§7.4).
+    """
+    if not richtext.is_safe_image_name(name):
+        raise NotificationValidationError(
+            "Имя картинки: латинские буквы, цифры, точка, дефис и подчёркивание"
+        )
+    content_type = detect_image_content_type(data)
+    if content_type is None or content_type not in IMAGE_CONTENT_TYPES:
+        raise NotificationValidationError("Картинка должна быть PNG, JPEG, GIF или WebP")
+    if len(data) > IMAGE_MAX_BYTES:
+        raise NotificationValidationError(
+            f"Картинка больше {IMAGE_MAX_BYTES // (1024 * 1024)} МБ"
+        )
+    if len(notification.images) >= IMAGES_MAX_PER_NOTIFICATION:
+        raise NotificationValidationError(
+            f"К одному уведомлению можно приложить не больше "
+            f"{IMAGES_MAX_PER_NOTIFICATION} картинок"
+        )
+    if any(image.name == name for image in notification.images):
+        raise NotificationValidationError(f"Картинка с именем {name} уже есть")
+
+    directory = image_directory(base_dir, notification.id)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_bytes(data)
+
+    image = NotificationImage(
+        notification_id=notification.id,
+        name=name,
+        content_type=content_type,
+        size_bytes=len(data),
+        checksum=hashlib.sha256(data).hexdigest(),
+        created_by=created_by,
+    )
+    session.add(image)
+    session.flush()
+    logger.info(
+        "Картинка %s добавлена к уведомлению id=%s: %s байт, тип %s",
+        name,
+        notification.id,
+        len(data),
+        content_type,
+    )
+    return image
+
+
+def image_payload(image: NotificationImage, data: bytes) -> bytes:
+    """Байты картинки для отдачи потребителю (SPA или касса)."""
+    expected = int(image.size_bytes or 0)
+    if expected and len(data) != expected:
+        logger.warning(
+            "Размер картинки %s уведомления id=%s не совпал: в БД %s, в файле %s",
+            image.name,
+            image.notification_id,
+            expected,
+            len(data),
+        )
+    return data
 
 
 def mark_delivered(

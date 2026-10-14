@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 from typing import Annotated
 
@@ -27,9 +28,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from server.core.dependencies import get_client_ip, get_db, require_active_admin
-from server.db.models import AdminUser, Notification
+from server.config import API_PREFIX
+from server.core.context import AppContext
+from server.core.dependencies import (
+    get_client_ip,
+    get_context,
+    get_db,
+    require_active_admin,
+)
+from server.db.models import AdminUser, Notification, NotificationImage
 from server.services import audit_service, command_service, notification_service
+from shared import richtext
 from shared.enums import CommandKind, NotificationSeverity, TargetType
 from shared.timeutil import to_iso_z
 
@@ -45,14 +54,24 @@ HTTP_422 = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
 #: Имя файла выгрузки отчёта (§11.5): администратор получает понятное имя
 CSV_FILENAME_TEMPLATE = "notification-{id}.csv"
 
+#: Адрес картинки тела для SPA (Э9): тот же путь отдаёт `GET .../images/{name}`
+ADMIN_IMAGE_URL_TEMPLATE = API_PREFIX + "/admin/notifications/{notification_id}/images/{name}"
+
+#: Префикс `data:`-URL из редактора: `data:image/png;base64,...`
+DATA_URL_PREFIX = "data:"
+
 
 class NotificationCreateIn(BaseModel):
     """Тело `POST /notifications` (§11.5, §5.2.2)."""
 
     title: str
     body: str
+    #: Э9: `plain` — как было, `html` — разметка из редактора (санитайз на сервере)
+    body_format: str = richtext.BODY_FORMAT_PLAIN
     severity: str = str(NotificationSeverity.INFO)
     requires_ack: bool = False
+    #: Э9: «удалять после прочтения» — по умолчанию нет (остаётся справочником)
+    delete_after_read: bool = False
     target_type: str = str(TargetType.ALL)
     store_ids: list[int] = Field(default_factory=list)
     cluster: str | None = None
@@ -67,6 +86,10 @@ class NotificationOut(BaseModel):
     id: int
     title: str
     body: str
+    #: Э9: формат тела, признак «удалять после прочтения» и картинки тела
+    body_format: str = richtext.BODY_FORMAT_PLAIN
+    delete_after_read: bool = False
+    images: list[str] = Field(default_factory=list)
     severity: str
     requires_ack: bool
     target_type: str
@@ -88,6 +111,9 @@ class NotificationOut(BaseModel):
             id=notification.id,
             title=notification.title,
             body=notification.body,
+            body_format=str(notification.body_format or richtext.BODY_FORMAT_PLAIN),
+            delete_after_read=bool(notification.delete_after_read),
+            images=[image.name for image in notification.images],
             severity=str(notification.severity),
             requires_ack=bool(notification.requires_ack),
             target_type=str(notification.target_type),
@@ -114,8 +140,43 @@ class NotificationListOut(BaseModel):
     items: list[NotificationOut]
     total: int
     counts: dict[str, int]
+    #: Э9: вкладки «все / info / important / critical» со счётчиками (§11.5)
+    severity_counts: dict[str, int] = Field(default_factory=dict)
+    #: Э9: сколько сессий ждёт «Ознакомлен» по каждому уровню — те же числа,
+    #: что видит шапка окна кассы (§7.4)
+    unread_by_severity: dict[str, int] = Field(default_factory=dict)
     pending_receipts: int
     snooze_min: int
+
+
+class NotificationSummaryOut(BaseModel):
+    """Счётчики вкладок страницы `/notifications` (§11.5, Э9)."""
+
+    total: int
+    by_severity: dict[str, int] = Field(default_factory=dict)
+    by_state: dict[str, int] = Field(default_factory=dict)
+    unread_receipts: dict[str, int] = Field(default_factory=dict)
+
+
+class NotificationImageIn(BaseModel):
+    """Тело `POST /notifications/{id}/images` (§5.2.2, Э9).
+
+    Картинка приходит строкой base64 (редактор отдаёт её как `data:`-URL):
+    `python-multipart` в зависимостях сервера нет (§14.1), поэтому обходимся
+    JSON и не тянем лишний пакет на стенд заказчика.
+    """
+
+    name: str
+    data_base64: str
+
+
+class NotificationImageOut(BaseModel):
+    """Описание картинки: имя, тип, размер и готовый адрес для SPA (§11.5, Э9)."""
+
+    name: str
+    content_type: str
+    size_bytes: int
+    url: str
 
 
 class NotificationCreateOut(BaseModel):
@@ -283,8 +344,10 @@ def create_notification(
         session,
         title=str(params["title"]),
         body=str(params["body"]),
+        body_format=str(params["body_format"]),
         severity=str(params["severity"]),
         requires_ack=bool(params["requires_ack"]),
+        delete_after_read=bool(params["delete_after_read"]),
         target_type=str(params["target_type"]),
         stores=stores,
         cluster=params["cluster"],  # type: ignore[arg-type]
@@ -308,6 +371,8 @@ def create_notification(
             "severity": notification.severity,
             "target_type": notification.target_type,
             "requires_ack": bool(notification.requires_ack),
+            "body_format": str(notification.body_format),
+            "delete_after_read": bool(notification.delete_after_read),
             "stores": len(stores),
         },
         ip_address=get_client_ip(request),
@@ -372,12 +437,37 @@ def list_notifications(  # noqa: PLR0913 - параметры HTTP-точки
         current = notification_service.state(item)
         counts[current] = counts.get(current, 0) + 1
 
+    counters = notification_service.severity_summary(session)
     return NotificationListOut(
         items=[NotificationOut.from_model(item) for item in items],
         total=len(items),
         counts=counts,
+        severity_counts=dict(counters["by_severity"]),  # type: ignore[arg-type]
+        unread_by_severity=dict(counters["unread_receipts"]),  # type: ignore[arg-type]
         pending_receipts=notification_service.pending_count(session),
         snooze_min=notification_service.snooze_min(session),
+    )
+
+
+@router.get(
+    "/notifications/summary",
+    response_model=NotificationSummaryOut,
+    summary="Счётчики вкладок уведомлений",
+)
+def notifications_summary(
+    session: Annotated[Session, Depends(get_db)],
+) -> NotificationSummaryOut:
+    """Сколько уведомлений каждого уровня и сколько сессий ждут «Ознакомлен» (Э9, §11.5).
+
+    Отдельная точка, а не поле списка: вкладкам нужны числа и при пустом фильтре
+    поиска, а окно кассы опрашивает такие счётчики чаще, чем открывает список.
+    """
+    data = notification_service.severity_summary(session)
+    return NotificationSummaryOut(
+        total=int(data["total"]),  # type: ignore[arg-type]
+        by_severity=dict(data["by_severity"]),  # type: ignore[arg-type]
+        by_state=dict(data["by_state"]),  # type: ignore[arg-type]
+        unread_receipts=dict(data["unread_receipts"]),  # type: ignore[arg-type]
     )
 
 
@@ -469,4 +559,113 @@ def cancel_notification(
         state=notification_service.state(notification),
         canceled_jobs=canceled,
         message=f"Рассылка остановлена; незавершённых задач закрыто: {canceled}",
+    )
+
+
+# --- Картинки тела уведомления (Э9, §4.6) -----------------------------------
+
+
+def _image_out(notification_id: int, image: NotificationImage) -> NotificationImageOut:
+    """Описание картинки для SPA: адрес по тому же шаблону, что и отдача файла."""
+    return NotificationImageOut(
+        name=image.name,
+        content_type=image.content_type,
+        size_bytes=int(image.size_bytes or 0),
+        url=ADMIN_IMAGE_URL_TEMPLATE.format(notification_id=notification_id, name=image.name),
+    )
+
+
+def _decode_image(data_base64: str) -> bytes:
+    """Разобрать base64 или `data:`-URL из редактора; мусор — это `422`."""
+    text = str(data_base64 or "").strip()
+    if text.startswith(DATA_URL_PREFIX):
+        _, _, text = text.partition(",")
+    try:
+        return base64.b64decode(text, validate=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTP_422, detail="Картинка пришла не в base64") from exc
+
+
+@router.post(
+    "/notifications/{notification_id}/images",
+    response_model=NotificationImageOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Добавить картинку в тело уведомления",
+)
+def upload_notification_image(
+    notification_id: int,
+    payload: NotificationImageIn,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    context: Annotated[AppContext, Depends(get_context)],
+    session: Annotated[Session, Depends(get_db)],
+    request: Request,
+) -> NotificationImageOut:
+    """Принять картинку из редактора и положить файл рядом с БД (Э9, §4.6).
+
+    Тело уведомления остаётся текстом: в нём стоит метка `magaz-image:<имя>`, а
+    адрес подставляет потребитель — SPA берёт этот эндпоинт, касса скачивает
+    картинку через агента в свой кэш (§7.4).
+    """
+    notification = _get(session, notification_id)
+    data = _decode_image(payload.data_base64)
+    try:
+        image = notification_service.add_image(
+            session,
+            notification,
+            name=payload.name,
+            data=data,
+            base_dir=context.settings.notification_images_dir,
+            created_by=admin.username,
+        )
+    except notification_service.NotificationValidationError as exc:
+        raise HTTPException(status_code=HTTP_422, detail=str(exc)) from exc
+
+    audit_service.record(
+        session,
+        action="notification_image_add",
+        actor=admin.username,
+        entity="notification",
+        entity_id=notification.id,
+        details={"name": image.name, "bytes": image.size_bytes},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    return _image_out(notification.id, image)
+
+
+@router.get(
+    "/notifications/{notification_id}/images/{name}",
+    summary="Картинка тела уведомления",
+)
+def get_notification_image(
+    notification_id: int,
+    name: str,
+    context: Annotated[AppContext, Depends(get_context)],
+    session: Annotated[Session, Depends(get_db)],
+) -> Response:
+    """Отдать файл картинки SPA (Э9).
+
+    Имя проверяется (`shared.richtext.is_safe_image_name`): выйти из каталога
+    уведомления нельзя, а картинки, которой нет в БД, не существует и на диске —
+    файл не отдаётся по одному лишь совпадению имени.
+    """
+    notification = _get(session, notification_id)
+    image = next((item for item in notification.images if item.name == name), None)
+    if image is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Картинка {name!r} у уведомления id={notification_id} не найдена",
+        )
+    path = notification_service.image_file_path(
+        context.settings.notification_images_dir, notification.id, name
+    )
+    if not path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Файл картинки не найден: восстановите его из резервной копии",
+        )
+    return Response(
+        content=notification_service.image_payload(image, path.read_bytes()),
+        media_type=image.content_type,
+        headers={"Cache-Control": "private, max-age=3600"},
     )

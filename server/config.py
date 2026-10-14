@@ -26,6 +26,9 @@ DATA_DIR = SERVER_ROOT / "data"
 LOG_DIR = DATA_DIR / "logs"
 MIGRATIONS_DIR = SERVER_ROOT / "migrations"
 FRONTEND_DIST_DIR = REPO_ROOT / "frontend" / "dist"
+#: Картинки уведомлений (§4.6, Э9): в теле они адресуются меткой
+#: `magaz-image:<имя>`, а сам файл лежит здесь — рядом с БД и ключами
+NOTIFICATION_IMAGES_DIR = DATA_DIR / "notification-images"
 
 # Файлы секретов (§8.3): ключ шифрования паролей 1С — отдельный от ключа cookie
 SECRETS_KEY_PATH = DATA_DIR / "secrets.key"
@@ -114,6 +117,11 @@ class Settings(BaseSettings):
     #: Уведомления пользователям (проксируются в `commands.params` без пароля)
     command_log_excerpt_limit: int = 200 * 1024
 
+    #: --- Картинки уведомлений (Э9, §4.6) ---
+    #: Каталог файлов: в теле картинка адресуется меткой `magaz-image:<имя>`,
+    #: значит файл должен переживать перезапуск и попадать в резервную копию
+    notification_images_dir: Path = NOTIFICATION_IMAGES_DIR
+
     def model_post_init(self, __context: object) -> None:  # noqa: D105 - pydantic hook
         if not self.database_url:
             self.database_url = default_database_url()
@@ -126,6 +134,7 @@ class Settings(BaseSettings):
         """Создать рабочие каталоги сервера (вызывается из `lifespan`)."""
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
+        self.notification_images_dir.mkdir(parents=True, exist_ok=True)
         if self.is_sqlite:
             db_path = self.database_url.replace("sqlite:///", "", 1)
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
