@@ -79,6 +79,36 @@ class TestSanitizeHtml:
         assert sanitize_html(body) == f'<img src="{image_src("a.png")}" height="12" />'
 
 
+class TestAllowedImages:
+    """Метка картинки, для которой файла нет, до потребителя не доезжает (§4.6, Э9)."""
+
+    def test_known_image_survives(self) -> None:
+        body = f'<p>Смотри</p><img src="{image_src("shema.png")}">'
+
+        assert image_src("shema.png") in sanitize_html(body, allowed_images={"shema.png"})
+
+    def test_unknown_image_is_dropped(self) -> None:
+        body = (
+            "<p>Смотри</p>"
+            f'<img src="{image_src("est.png")}">'
+            f'<img src="{image_src("net.png")}">'
+        )
+
+        cleaned = sanitize_html(body, allowed_images={"est.png"})
+
+        assert "est.png" in cleaned
+        assert "net.png" not in cleaned
+        assert "Смотри" in cleaned
+
+    def test_empty_set_drops_every_image(self) -> None:
+        assert sanitize_html(f'<img src="{image_src("a.png")}">', allowed_images=set()) == ""
+
+    def test_without_the_check_images_stay(self) -> None:
+        """Первый проход санитайза идёт до сохранения картинок — проверять нечего."""
+        assert image_src("a.png") in sanitize_html(f'<img src="{image_src("a.png")}">')
+
+
+
 class TestHtmlToText:
     """Текстовая версия: то, что уходит в `msg.exe`, логи и аудит (§4.4)."""
 

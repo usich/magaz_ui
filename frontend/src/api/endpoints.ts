@@ -281,5 +281,13 @@ export const notificationsApi = {
    */
   reportCsvUrl: (id: number) =>
     `${API_BASE}/admin/notifications/${id}/report?format=csv`,
+
+  /**
+   * Э9: адрес картинки тела уведомления — тот же путь отдаёт `GET .../images/{name}`.
+   * В теле уведомления стоит метка `magaz-image:<имя>` (§4.6), поэтому адрес
+   * собирается здесь, а не хранится в тексте: касса подставит свой кэш (§7.4).
+   */
+  imageUrl: (id: number, name: string) =>
+    `${API_BASE}/admin/notifications/${id}/images/${encodeURIComponent(name)}`,
 }
 

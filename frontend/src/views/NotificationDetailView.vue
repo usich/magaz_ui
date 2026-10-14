@@ -18,6 +18,7 @@ import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
 import type { NotificationReceiptRow, NotificationStoreReport } from '@/api/types'
+import NotificationBody from '@/components/NotificationBody.vue'
 import {
   RECEIPT_LABELS,
   SEVERITY_LABELS,
@@ -80,10 +81,18 @@ function formatTime(value: string | null): string {
         <h2 class="text-xl font-semibold" data-test="notification-title">
           {{ item?.title ?? 'Отчёт по уведомлению' }}
         </h2>
-        <p class="magaz-muted text-sm">{{ item?.body }}</p>
+        <NotificationBody
+          v-if="item"
+          class="mt-2 max-w-3xl"
+          :body="item.body"
+          :body-format="item.body_format"
+          :notification-id="item.id"
+        />
         <div v-if="item" class="magaz-muted text-xs">
           {{ SEVERITY_LABELS[item.severity] ?? item.severity }} · {{ targetTypeLabel(item) }} ·
           создано {{ formatTime(item.created_at) }} автором {{ item.created_by ?? '—' }}
+          <span v-if="item.images.length"> · картинок {{ item.images.length }}</span>
+          <span v-if="item.delete_after_read"> · удаляется после прочтения на кассе</span>
         </div>
       </div>
       <div class="flex flex-wrap items-center gap-2">

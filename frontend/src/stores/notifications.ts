@@ -17,9 +17,11 @@ import type {
   NotificationCreatePayload,
   NotificationCreateResponse,
   NotificationFilters,
+  NotificationImageUpload,
   NotificationItem,
   NotificationList,
   NotificationReport,
+  NotificationSeverity,
 } from '@/api/types'
 
 /** Подписи уровней важности (§4.6). */
@@ -86,6 +88,95 @@ export function stateLabel(value: string | null): string {
   return STATE_LABELS[value] ?? value
 }
 
+// --- Форматированный текст и картинки (Э9, §4.6) ----------------------------
+
+/** Метка картинки в теле: `magaz-image:<имя>` — адрес подставляет потребитель. */
+export const IMAGE_SRC_PREFIX = 'magaz-image:'
+
+/** Лимиты сервера (§4.6): 2 МБ на картинку и 10 картинок на уведомление. */
+export const IMAGE_MAX_BYTES = 2 * 1024 * 1024
+export const IMAGES_MAX_PER_NOTIFICATION = 10
+export const IMAGE_CONTENT_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
+
+/**
+ * Черновик картинки: файл выбран в редакторе, но на сервер ещё не ушёл (Э9).
+ *
+ * Картинка уезжает вместе с уведомлением (§7.4), поэтому до сохранения она живёт
+ * здесь: в теле стоит метка `magaz-image:<имя>`, а `dataUrl` нужен редактору и
+ * предпросмотру, чтобы картинка была видна до создания уведомления.
+ */
+export interface NotificationImageDraft {
+  name: string
+  contentType: string
+  dataUrl: string
+  sizeBytes: number
+  /** Имя файла с машины администратора — для списка приложенных картинок. */
+  sourceName: string
+}
+
+/** Имя картинки из метки `magaz-image:<имя>`; `null` — это не наша картинка. */
+export function imageNameFromSrc(src: string | null | undefined): string | null {
+  if (!src || !src.toLowerCase().startsWith(IMAGE_SRC_PREFIX)) return null
+  const name = src.slice(IMAGE_SRC_PREFIX.length).trim()
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ? name : null
+}
+
+/** Имя файла для сервера: латиница, цифры, точка, дефис — как в `shared.richtext`. */
+export function makeImageName(sourceName: string): string {
+  const extension = (sourceName.split('.').pop() ?? '').toLowerCase()
+  const safe = extension === 'jpeg' ? 'jpg' : extension
+  const allowed = ['png', 'jpg', 'gif', 'webp']
+  return `img-${Math.random().toString(16).slice(2, 10)}.${allowed.includes(safe) ? safe : 'png'}`
+}
+
+/** Почему картинку нельзя приложить; `null` — можно (проверки сервера дублирует UI). */
+export function imageFileError(file: { type: string; size: number }): string | null {
+  if (!IMAGE_CONTENT_TYPES.includes(file.type)) {
+    return 'Поддерживаются PNG, JPEG, GIF и WebP'
+  }
+  if (file.size > IMAGE_MAX_BYTES) {
+    return `Картинка больше ${IMAGE_MAX_BYTES / (1024 * 1024)} МБ`
+  }
+  return null
+}
+
+/** Картинка для `POST /notifications`: имена уже стоят в теле метками (§7.4). */
+export function imageUpload(draft: NotificationImageDraft): NotificationImageUpload {
+  return { name: draft.name, data_base64: draft.dataUrl }
+}
+
+/**
+ * Текстовая версия тела: в списке и отчёте показываем текст, а не разметку (Э9).
+ *
+ * Повторяет `shared.richtext.html_to_text` в объёме, который нужен экрану: абзацы
+ * и списки — отдельными строками, картинка — подписью `alt`.
+ */
+export function htmlToText(value: string): string {
+  const parsed = new DOMParser().parseFromString(value, 'text/html')
+  parsed.querySelectorAll('script, style').forEach((node) => node.remove())
+  parsed.querySelectorAll('br').forEach((node) => node.replaceWith('\n'))
+  parsed.querySelectorAll('li').forEach((node) => node.prepend('• '))
+  parsed
+    .querySelectorAll('p, div, h1, h2, h3, h4, li, tr, blockquote, pre')
+    .forEach((node) => node.append('\n'))
+  parsed
+    .querySelectorAll('img')
+    .forEach((node) => node.replaceWith(` [${node.getAttribute('alt') || 'картинка'}] `))
+  const text = parsed.body?.textContent ?? ''
+  return text.replace(/[ \t]+\n/g, '\n').replace(/\n{2,}/g, '\n').trim()
+}
+
+/** Тело для списка и подсказок: у разметки — текст, у простого тела — как есть. */
+export function bodyText(item: NotificationItem): string {
+  return item.body_format === 'html' ? htmlToText(item.body) : item.body
+}
+
+/** Адрес картинки тела: SPA берёт админский эндпоинт, касса — свой кэш (§7.4). */
+export function notificationImageUrl(notificationId: number | null, name: string): string {
+  if (!notificationId) return ''
+  return notificationsApi.imageUrl(notificationId, name)
+}
+
 export const useNotificationsStore = defineStore('notifications', () => {
   const list = ref<NotificationList | null>(null)
   const report = ref<NotificationReport | null>(null)
@@ -115,6 +206,32 @@ export const useNotificationsStore = defineStore('notifications', () => {
   const pendingReceipts = computed(() => list.value?.pending_receipts ?? 0)
   /** Интервал возврата отложенного — настройка сервера (§4.9, П-2). */
   const snoozeMin = computed(() => list.value?.snooze_min ?? 15)
+
+  /**
+   * Счётчики вкладок по важности (Э9, §11.5).
+   *
+   * Числа приходят в том же ответе, что и список, и считаются сервером по **всем**
+   * уведомлениям: фильтр вкладки не должен менять цифры на соседних вкладках.
+   */
+  const severityCounts = computed<Record<string, number>>(() => list.value?.severity_counts ?? {})
+  const unreadBySeverity = computed<Record<string, number>>(
+    () => list.value?.unread_by_severity ?? {},
+  )
+
+  /** Вкладки «все / информация / важно / критично» со счётчиками и «ждут ознакомления». */
+  const severityTabs = computed<
+    { value: NotificationSeverity | 'all'; label: string; count: number; unread: number }[]
+  >(() =>
+    [
+      { value: 'all', label: 'все', count: total.value, unread: 0 },
+      ...SEVERITY_OPTIONS.map((item) => ({
+        value: item,
+        label: SEVERITY_LABELS[item],
+        count: severityCounts.value[item] ?? 0,
+        unread: unreadBySeverity.value[item] ?? 0,
+      })),
+    ],
+  )
 
   /** Перечитать список; при ошибке показанные строки не затираются. */
   async function load(): Promise<void> {
@@ -201,6 +318,9 @@ export const useNotificationsStore = defineStore('notifications', () => {
     items,
     total,
     counts,
+    severityCounts,
+    unreadBySeverity,
+    severityTabs,
     pendingReceipts,
     snoozeMin,
     load,

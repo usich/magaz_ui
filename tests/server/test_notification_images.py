@@ -207,14 +207,25 @@ class TestNotificationImages:
     def test_image_name_and_flags_travel_to_cash_register(
         self, auth_client: TestClient, session: Session, store: Store
     ) -> None:
+        """Касса получает разметку, имена картинок и «удалять после прочтения».
+
+        Картинки уезжают вместе с уведомлением: сервер не отдаёт кассе тело с
+        меткой, для которой файла нет, — доставка и картинки идут одним запросом
+        редактора (§4.6, §7.4).
+        """
         created = create_notification(
             auth_client,
             body_format="html",
             body='<p>Схема зала</p><img src="magaz-image:shema.png">',
             delete_after_read=True,
+            images=[
+                {
+                    "name": "shema.png",
+                    "data_base64": base64.b64encode(PNG_1PX).decode("ascii"),
+                }
+            ],
         )
         notification_id = created["notification"]["id"]
-        upload_image(auth_client, notification_id)
 
         notification = session.get(Notification, notification_id)
         payload = notification_service.push_payload(session, store, notification)
@@ -273,4 +284,160 @@ def test_audit_records_image_upload(auth_client: TestClient) -> None:
 
     assert "notification_image_add" in actions
     assert "audit.png" in details
+
+
+
+class TestImagesOnCreate:
+    """Картинки приезжают вместе с созданием: файлы есть до первой доставки (§7.4).
+
+    Редактор админки отправляет картинки одним запросом с уведомлением. Это не
+    удобство, а требование: диспетчер может отправить задачу `notify` сразу после
+    создания, и касса не должна получить метку `magaz-image:<имя>` без файла.
+    """
+
+    def test_images_are_stored_with_creation(
+        self, auth_client: TestClient, settings: Settings
+    ) -> None:
+        created = create_notification(
+            auth_client,
+            body_format="html",
+            body='<p>Схема зала</p><img src="magaz-image:shema.png">',
+            images=[
+                {
+                    "name": "shema.png",
+                    "data_base64": base64.b64encode(PNG_1PX).decode("ascii"),
+                }
+            ],
+        )
+
+        notification_id = created["notification"]["id"]
+        on_disk = settings.notification_images_dir / str(notification_id) / "shema.png"
+
+        assert created["notification"]["images"] == ["shema.png"]
+        assert "картинок 1" in created["message"]
+        assert on_disk.read_bytes() == PNG_1PX
+        served = auth_client.get(f"{NOTIFICATIONS_URL}/{notification_id}/images/shema.png")
+        assert served.status_code == 200
+        assert served.content == PNG_1PX
+
+    def test_data_url_from_editor_is_accepted(self, auth_client: TestClient) -> None:
+        data_url = "data:image/png;base64," + base64.b64encode(PNG_1PX).decode("ascii")
+        created = create_notification(
+            auth_client,
+            body_format="html",
+            body='<img src="magaz-image:new.png">',
+            images=[{"name": "new.png", "data_base64": data_url}],
+        )
+
+        assert created["notification"]["images"] == ["new.png"]
+
+    def test_marker_without_image_is_dropped(self, auth_client: TestClient) -> None:
+        """Метка без файла нарисовалась бы «сломанной» картинкой — её выбрасываем."""
+        created = create_notification(
+            auth_client,
+            body_format="html",
+            body='<p>Текст</p><img src="magaz-image:est.png"><img src="magaz-image:net.png">',
+            images=[
+                {"name": "est.png", "data_base64": base64.b64encode(PNG_1PX).decode("ascii")}
+            ],
+        )
+        body = created["notification"]["body"]
+
+        assert created["notification"]["images"] == ["est.png"]
+        assert "est.png" in body
+        assert "net.png" not in body
+        assert "Текст" in body
+
+    def test_body_without_images_drops_all_markers(self, auth_client: TestClient) -> None:
+        created = create_notification(
+            auth_client,
+            body_format="html",
+            body='<p>Только текст</p><img src="magaz-image:zabytaya.png">',
+        )
+
+        assert created["notification"]["images"] == []
+        assert "magaz-image" not in created["notification"]["body"]
+
+    def test_broken_base64_is_rejected_on_create(self, auth_client: TestClient) -> None:
+        response = auth_client.post(
+            NOTIFICATIONS_URL,
+            json={
+                "title": "Мусор",
+                "body": "<p>Текст</p>",
+                "body_format": "html",
+                "images": [{"name": "a.png", "data_base64": "не base64"}],
+            },
+        )
+
+        assert response.status_code == 422
+        assert "base64" in response.text
+
+    def test_not_an_image_is_rejected_on_create(self, auth_client: TestClient) -> None:
+        response = auth_client.post(
+            NOTIFICATIONS_URL,
+            json={
+                "title": "Не картинка",
+                "body": "<p>Текст</p>",
+                "body_format": "html",
+                "images": [
+                    {
+                        "name": "a.png",
+                        "data_base64": base64.b64encode(b"<html>").decode("ascii"),
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 422
+        assert "PNG" in response.text
+
+    def test_too_many_images_are_rejected_on_create(self, auth_client: TestClient) -> None:
+        inline = base64.b64encode(PNG_1PX).decode("ascii")
+        response = auth_client.post(
+            NOTIFICATIONS_URL,
+            json={
+                "title": "Много картинок",
+                "body": "<p>Текст</p>",
+                "body_format": "html",
+                "images": [{"name": f"kadr-{index}.png", "data_base64": inline} for index in range(11)],
+            },
+        )
+
+        assert response.status_code == 422
+        assert "картинок" in response.text
+
+    def test_same_name_twice_is_rejected_on_create(self, auth_client: TestClient) -> None:
+        inline = base64.b64encode(PNG_1PX).decode("ascii")
+        response = auth_client.post(
+            NOTIFICATIONS_URL,
+            json={
+                "title": "Дубль",
+                "body": "<p>Текст</p>",
+                "body_format": "html",
+                "images": [
+                    {"name": "a.png", "data_base64": inline},
+                    {"name": "a.png", "data_base64": inline},
+                ],
+            },
+        )
+
+        assert response.status_code == 422
+        assert "уже есть" in response.text
+
+    def test_list_shows_images_and_flags(self, auth_client: TestClient) -> None:
+        create_notification(
+            auth_client,
+            body_format="html",
+            body='<img src="magaz-image:vkhod.png">',
+            delete_after_read=True,
+            images=[
+                {"name": "vkhod.png", "data_base64": base64.b64encode(PNG_1PX).decode("ascii")}
+            ],
+        )
+
+        row = auth_client.get(NOTIFICATIONS_URL).json()["items"][0]
+
+        assert row["images"] == ["vkhod.png"]
+        assert row["body_format"] == "html"
+        assert row["delete_after_read"] is True
 

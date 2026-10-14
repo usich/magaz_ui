@@ -75,6 +75,183 @@ a {
   font-size: 13px;
 }
 
+/* Тело уведомления с разметкой (§4.6, Э9): то, что касса показывает в окне.
+ * Разметку присылает сервер, поэтому класс нужен один на предпросмотр в админке,
+ * отчёт и окно кассы — «одинаково на всех экранах». Картинки не шире контейнера:
+ * схему зала присылают и на 2000 px, а окно кассы — четверть экрана (§7.4). */
+.magaz-richtext {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--magaz-text);
+  word-break: break-word;
+}
+
+.magaz-richtext > :first-child {
+  margin-top: 0;
+}
+
+.magaz-richtext > :last-child {
+  margin-bottom: 0;
+}
+
+.magaz-richtext p,
+.magaz-richtext ul,
+.magaz-richtext ol,
+.magaz-richtext blockquote,
+.magaz-richtext pre,
+.magaz-richtext table {
+  margin: 0 0 0.6rem;
+}
+
+.magaz-richtext h1,
+.magaz-richtext h2,
+.magaz-richtext h3,
+.magaz-richtext h4 {
+  margin: 0 0 0.5rem;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.magaz-richtext h1 {
+  font-size: 1.4em;
+}
+
+.magaz-richtext h2 {
+  font-size: 1.2em;
+}
+
+.magaz-richtext h3,
+.magaz-richtext h4 {
+  font-size: 1.05em;
+}
+
+.magaz-richtext ul,
+.magaz-richtext ol {
+  padding-left: 1.4rem;
+}
+
+.magaz-richtext ul {
+  list-style: disc;
+}
+
+.magaz-richtext ol {
+  list-style: decimal;
+}
+
+.magaz-richtext li {
+  margin: 0.15rem 0;
+}
+
+.magaz-richtext a {
+  color: #0369a1;
+  text-decoration: underline;
+}
+
+.magaz-richtext blockquote {
+  border-left: 3px solid var(--magaz-border);
+  padding-left: 0.75rem;
+  color: var(--magaz-muted);
+}
+
+.magaz-richtext pre {
+  background: #f1f5f9;
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  overflow-x: auto;
+  font-family: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+  font-size: 12px;
+}
+
+.magaz-richtext img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid var(--magaz-border);
+}
+
+.magaz-richtext table {
+  border-collapse: collapse;
+}
+
+.magaz-richtext td,
+.magaz-richtext th {
+  border: 1px solid var(--magaz-border);
+  padding: 4px 8px;
+}
+
+.magaz-richtext-compact {
+  font-size: 13px;
+}
+
+.magaz-richtext-compact p,
+.magaz-richtext-compact ul,
+.magaz-richtext-compact ol {
+  margin-bottom: 0.35rem;
+}
+
+/* Панель редактора уведомления (§11.5, Э9): кнопки форматов — компактные, с
+ * состоянием «нажато»: админ видит, какой формат активен в текущем абзаце. */
+.rte-btn {
+  border-radius: 6px;
+  border: 1px solid transparent;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--magaz-text);
+  background: transparent;
+  cursor: pointer;
+}
+
+.rte-btn:hover:not(:disabled) {
+  border-color: var(--magaz-border);
+  background: #ffffff;
+}
+
+.rte-btn:disabled {
+  cursor: not-allowed;
+  color: var(--magaz-muted);
+}
+
+.rte-btn-active {
+  border-color: var(--magaz-border);
+  background: #e0f2fe;
+  font-weight: 600;
+}
+
+.rte-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 4px;
+  background: var(--magaz-border);
+}
+
+/* Картинка в редакторе: метка `magaz-image:<имя>` показывается самой картинкой,
+ * а крестик убирает её из тела целиком (§4.6, Э9). */
+.magaz-image-node {
+  position: relative;
+  display: inline-block;
+}
+
+.magaz-image-node img {
+  max-width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--magaz-border);
+}
+
+.magaz-image-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1px solid var(--magaz-border);
+  background: rgba(255, 255, 255, 0.9);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
 /* ---------------------------------------------------------------------------
  * Тёмная тема (§11.1, Э8)
  *

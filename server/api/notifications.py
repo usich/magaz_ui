@@ -4,7 +4,10 @@
 
 * `POST /notifications` — создание и рассылка: уведомление адресуется всем,
   кластеру или списку магазинов, а доставку выполняет диспетчер задачами
-  `notify` (§11.4) — выключенная касса получает уведомление позже, а не теряет;
+  `notify` (§11.4) — выключенная касса получает уведомление позже, а не теряет.
+  Э9: тело может быть разметкой (`body_format`), вместе с созданием приезжают
+  картинки тела (`images`, base64 — файлы ложатся до первой доставки) и признак
+  «удалять после прочтения» (`delete_after_read`);
 * `GET /notifications` — список с фильтрами и прогрессом «ознакомлены X из Y»;
 * `GET /notifications/{id}` и `GET /notifications/{id}/report` — отчёт
   «магазины → сессии» и его выгрузка CSV (`?format=csv`);
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -61,6 +65,18 @@ ADMIN_IMAGE_URL_TEMPLATE = API_PREFIX + "/admin/notifications/{notification_id}/
 DATA_URL_PREFIX = "data:"
 
 
+class NotificationImageIn(BaseModel):
+    """Картинка тела уведомления: `POST /notifications/{id}/images` и поле `images` при создании (§5.2.2, Э9).
+
+    Картинка приходит строкой base64 (редактор отдаёт её как `data:`-URL):
+    `python-multipart` в зависимостях сервера нет (§14.1), поэтому обходимся
+    JSON и не тянем лишний пакет на стенд заказчика.
+    """
+
+    name: str
+    data_base64: str
+
+
 class NotificationCreateIn(BaseModel):
     """Тело `POST /notifications` (§11.5, §5.2.2)."""
 
@@ -72,6 +88,9 @@ class NotificationCreateIn(BaseModel):
     requires_ack: bool = False
     #: Э9: «удалять после прочтения» — по умолчанию нет (остаётся справочником)
     delete_after_read: bool = False
+    #: Э9: картинки тела вместе с созданием: файлы должны лежать на сервере до
+    #: первой доставки, иначе касса получит метку без картинки (§4.6, §7.4)
+    images: list[NotificationImageIn] = Field(default_factory=list)
     target_type: str = str(TargetType.ALL)
     store_ids: list[int] = Field(default_factory=list)
     cluster: str | None = None
@@ -156,18 +175,6 @@ class NotificationSummaryOut(BaseModel):
     by_severity: dict[str, int] = Field(default_factory=dict)
     by_state: dict[str, int] = Field(default_factory=dict)
     unread_receipts: dict[str, int] = Field(default_factory=dict)
-
-
-class NotificationImageIn(BaseModel):
-    """Тело `POST /notifications/{id}/images` (§5.2.2, Э9).
-
-    Картинка приходит строкой base64 (редактор отдаёт её как `data:`-URL):
-    `python-multipart` в зависимостях сервера нет (§14.1), поэтому обходимся
-    JSON и не тянем лишний пакет на стенд заказчика.
-    """
-
-    name: str
-    data_base64: str
 
 
 class NotificationImageOut(BaseModel):
@@ -313,6 +320,7 @@ def _create_jobs(session: Session, notification: Notification, *, author: str) -
 def create_notification(
     payload: NotificationCreateIn,
     admin: Annotated[AdminUser, Depends(require_active_admin)],
+    context: Annotated[AppContext, Depends(get_context)],
     session: Annotated[Session, Depends(get_db)],
     request: Request,
 ) -> NotificationCreateOut:
@@ -357,6 +365,18 @@ def create_notification(
         created_by=admin.username,
     )
     jobs = _create_jobs(session, notification, author=admin.username)
+    images = _store_images(
+        session,
+        notification,
+        payload.images,
+        base_dir=context.settings.notification_images_dir,
+    )
+    if str(notification.body_format) == richtext.BODY_FORMAT_HTML:
+        # Метка картинки без файла нарисовалась бы на кассе «сломанной»:
+        # оставляем в теле только те картинки, которые реально сохранены (§7.4)
+        notification.body = notification_service.keep_known_images(
+            notification.body, [image.name for image in images]
+        )
     out = NotificationOut.from_model(notification)
     requested = {int(item) for item in payload.store_ids}
     skipped = sorted(requested - {store.id for store in stores}) if requested else []
@@ -373,17 +393,19 @@ def create_notification(
             "requires_ack": bool(notification.requires_ack),
             "body_format": str(notification.body_format),
             "delete_after_read": bool(notification.delete_after_read),
+            "images": len(images),
             "stores": len(stores),
         },
         ip_address=get_client_ip(request),
     )
     session.commit()
     logger.info(
-        "Уведомление id=%s создано администратором %s: магазинов %s, задач %s",
+        "Уведомление id=%s создано администратором %s: магазинов %s, задач %s, картинок %s",
         notification.id,
         admin.username,
         len(stores),
         jobs,
+        len(images),
     )
     return NotificationCreateOut(
         notification=out,
@@ -392,7 +414,7 @@ def create_notification(
         skipped_store_ids=skipped,
         message=(
             f"Уведомление создано и поставлено в рассылку: магазинов {len(stores)}, "
-            f"задач {jobs}"
+            f"задач {jobs}" + (f", картинок {len(images)}" if images else "")
         ),
     )
 
@@ -584,6 +606,31 @@ def _decode_image(data_base64: str) -> bytes:
         return base64.b64decode(text, validate=True)
     except ValueError as exc:
         raise HTTPException(status_code=HTTP_422, detail="Картинка пришла не в base64") from exc
+
+
+def _store_images(
+    session: Session,
+    notification: Notification,
+    images: list[NotificationImageIn],
+    *,
+    base_dir: Path,
+) -> list[NotificationImage]:
+    """Сохранить картинки, приехавшие вместе с созданием уведомления (§11.5, Э9).
+
+    Файлы ложатся **до** первой доставки: уведомление уходит на кассу уже с
+    готовыми картинками, и метка `magaz-image:<имя>` в теле всегда имеет файл
+    (§4.6, §7.4). Мусор в base64, не-картинка и превышение лимитов — это `422`,
+    а не «уведомление без картинок».
+    """
+    if not images:
+        return []
+    items = [(item.name.strip(), _decode_image(item.data_base64)) for item in images]
+    try:
+        return notification_service.add_images(
+            session, notification, items=items, base_dir=base_dir
+        )
+    except notification_service.NotificationValidationError as exc:
+        raise HTTPException(status_code=HTTP_422, detail=str(exc)) from exc
 
 
 @router.post(

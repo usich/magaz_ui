@@ -27,6 +27,9 @@ function makeNotification(overrides: Record<string, unknown> = {}): Record<strin
     id: 3,
     title: 'Смена закрывается в 22:00',
     body: 'Сохраните смену и отключите кассу',
+    body_format: 'plain',
+    delete_after_read: false,
+    images: [],
     severity: 'important',
     requires_ack: true,
     target_type: 'all',
@@ -60,6 +63,9 @@ function makeList(items: Record<string, unknown>[]): Record<string, unknown> {
     items,
     total: items.length,
     counts: { active: items.length, done: 0, canceled: 0 },
+    // Э9: счётчики вкладок сервер считает по всем уведомлениям, а не по фильтру
+    severity_counts: { info: 1, important: items.length, critical: 0 },
+    unread_by_severity: { info: 0, important: 2, critical: 0 },
     pending_receipts: 2,
     snooze_min: 15,
   }
@@ -121,8 +127,14 @@ const stubs = {
     props: ['visible', 'header'],
     template: `<section v-if="visible" data-test="dialog"><h3>{{ header }}</h3><slot /><slot name="footer" /></section>`,
   },
+  // Редактор с TipTap в jsdom не поднимаем: его контракт проверяет
+  // `notification-editor.spec.ts`, а здесь важна логика страницы и формы (§11.5).
+  RichTextEditor: {
+    props: ['modelValue', 'drafts'],
+    emits: ['update:modelValue', 'update:drafts'],
+    template: '<div>{{ modelValue }}</div>',
+  },
 }
-
 async function mountNotifications(
   fetchMock: ReturnType<typeof vi.fn>,
   path = '/notifications',
@@ -245,6 +257,66 @@ describe('страница «Уведомления»', () => {
 
     expect(wrapper.find('[data-test="notifications-empty"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="notifications-empty"]').text()).toContain('диспетчер')
+  })
+
+  it('вкладки важности показывают счётчики и «ждут ознакомления» (Э9, §11.5)', async () => {
+    fetchMock.mockImplementation(apiMock(makeList([makeNotification()])))
+
+    const { wrapper } = await mountNotifications(fetchMock)
+
+    expect(wrapper.find('[data-test="notifications-tab-all"]').text()).toContain('(1)')
+    const important = wrapper.find('[data-test="notifications-tab-important"]').text()
+    expect(important).toContain('важно')
+    expect(important).toContain('(1)')
+    expect(important).toContain('ждут ознакомления 2')
+    expect(wrapper.find('[data-test="notifications-tab-critical"]').text()).toContain('(0)')
+  })
+
+  it('вкладка важности меняет фильтр и перечитывает список (Э9)', async () => {
+    fetchMock.mockImplementation(apiMock(makeList([makeNotification()])))
+
+    const { wrapper } = await mountNotifications(fetchMock)
+    await wrapper.find('[data-test="notifications-tab-critical"]').trigger('click')
+    await flushPromises()
+
+    const lastCall = fetchMock.mock.calls.at(-1) as [string]
+    expect(lastCall[0]).toContain('severity=critical')
+  })
+
+  it('строка списка показывает текст разметки и признаки Э9 (§11.5)', async () => {
+    fetchMock.mockImplementation(
+      apiMock(
+        makeList([
+          makeNotification({
+            body: '<p>Смена <b>закрывается</b></p><ul><li>Сохраните смену</li></ul>',
+            body_format: 'html',
+            images: ['shema.png'],
+            delete_after_read: true,
+          }),
+        ]),
+      ),
+    )
+
+    const { wrapper } = await mountNotifications(fetchMock)
+    const row = wrapper.find('[data-test="notification-row-3"]')
+    const rich = wrapper.find('[data-test="notification-rich-3"]')
+
+    expect(row.text()).toContain('Смена закрывается')
+    expect(row.text()).not.toContain('<b>')
+    expect(rich.text()).toContain('картинок 1')
+    expect(rich.text()).toContain('удаляется после прочтения')
+  })
+
+  it('форма даёт редактор, предпросмотр и «удалять после прочтения» (Э9)', async () => {
+    fetchMock.mockImplementation(apiMock(makeList([])))
+
+    const { wrapper } = await mountNotifications(fetchMock)
+    await wrapper.find('[data-test="notifications-create"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="notify-form-editor"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="notify-form-delete-after-read"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="notify-form-preview"]').exists()).toBe(true)
   })
 })
 

@@ -19,13 +19,13 @@ import Message from 'primevue/message'
 import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
-import type { NotificationFilters, NotificationItem } from '@/api/types'
+import type { NotificationFilters, NotificationItem, NotificationSeverity } from '@/api/types'
 import NotificationFormDialog from '@/components/NotificationFormDialog.vue'
 import {
   SEVERITY_LABELS,
-  SEVERITY_OPTIONS,
   STATE_LABELS,
   STATE_OPTIONS,
+  bodyText,
   severityTone,
   targetTypeLabel,
   useNotificationsStore,
@@ -59,6 +59,13 @@ onMounted(async () => {
   if (!stores.items.length) await stores.load()
   await notifications.load()
 })
+
+/** Вкладка важности: меняет фильтр списка и перечитывает выборку (§11.5, Э9). */
+async function selectSeverity(value: NotificationSeverity | 'all'): Promise<void> {
+  if (notifications.severity === value) return
+  notifications.severity = value
+  await notifications.load()
+}
 
 async function cancel(item: NotificationItem): Promise<void> {
   if (!(await notifications.cancel(item.id))) {
@@ -129,6 +136,28 @@ function formatTime(value: string | null): string {
       </div>
     </header>
 
+    <!-- Вкладки по важности (Э9, §11.5): счётчики по всем уведомлениям, а не по фильтру
+         — нажатие вкладки меняет только выборку, цифры на соседних вкладках не «плывут». -->
+    <nav class="flex flex-wrap gap-2" data-test="notifications-tabs">
+      <button
+        v-for="tab in notifications.severityTabs"
+        :key="tab.value"
+        type="button"
+        class="rounded-lg border px-3 py-2 text-sm"
+        :class="
+          notifications.severity === tab.value
+            ? 'border-sky-500 bg-sky-50 font-medium text-sky-800'
+            : 'border-slate-200 bg-white hover:border-slate-300'
+        "
+        :data-test="`notifications-tab-${tab.value}`"
+        @click="selectSeverity(tab.value)"
+      >
+        {{ tab.label }}
+        <span class="magaz-muted">({{ tab.count }})</span>
+        <span v-if="tab.unread" class="magaz-muted text-xs">· ждут ознакомления {{ tab.unread }}</span>
+      </button>
+    </nav>
+
     <Message
       v-if="notifications.errorMessage"
       severity="error"
@@ -181,17 +210,6 @@ function formatTime(value: string | null): string {
         </option>
       </select>
       <select
-        v-model="notifications.severity"
-        class="rounded-lg border border-slate-300 px-3 py-2 text-sm"
-        data-test="notifications-severity-filter"
-        @change="notifications.load()"
-      >
-        <option value="all">Все уровни</option>
-        <option v-for="item in SEVERITY_OPTIONS" :key="item" :value="item">
-          {{ SEVERITY_LABELS[item] }}
-        </option>
-      </select>
-      <select
         v-model="notifications.storeId"
         class="rounded-lg border border-slate-300 px-3 py-2 text-sm"
         data-test="notifications-store-filter"
@@ -230,7 +248,16 @@ function formatTime(value: string | null): string {
               >
                 {{ row.title }}
               </RouterLink>
-              <div class="magaz-muted text-xs">{{ row.body }}</div>
+              <div class="magaz-muted text-xs">{{ bodyText(row) }}</div>
+              <div
+                v-if="row.body_format === 'html' || row.images.length || row.delete_after_read"
+                class="magaz-muted text-[11px]"
+                :data-test="`notification-rich-${row.id}`"
+              >
+                <span v-if="row.body_format === 'html'">с разметкой</span>
+                <span v-if="row.images.length"> · картинок {{ row.images.length }}</span>
+                <span v-if="row.delete_after_read"> · удаляется после прочтения</span>
+              </div>
             </td>
             <td>
               <Tag

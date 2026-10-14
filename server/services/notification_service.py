@@ -29,7 +29,7 @@ import hashlib
 import io
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -76,6 +76,7 @@ __all__ = [
     "NotificationNotFoundError",
     "NotificationValidationError",
     "add_image",
+    "add_images",
     "apply_receipts",
     "cancel_notification",
     "create_notification",
@@ -84,6 +85,7 @@ __all__ = [
     "image_directory",
     "image_file_path",
     "image_payload",
+    "keep_known_images",
     "list_notifications",
     "mark_delivered",
     "normalize_params",
@@ -637,6 +639,17 @@ def detect_image_content_type(data: bytes) -> str | None:
     return None
 
 
+def _images_of(session: Session, notification: Notification) -> list[NotificationImage]:
+    """Картинки уведомления «как в БД»: видны и строки этой же транзакции (§11.5).
+
+    Редактор присылает картинки вместе с созданием уведомления, и без перечитки
+    связи лимит «10 картинок» и проверка имени не сработали бы: в памяти список
+    остаётся пустым, пока транзакция не закрыта.
+    """
+    session.refresh(notification, ["images"])
+    return list(notification.images)
+
+
 def add_image(
     session: Session,
     notification: Notification,
@@ -663,12 +676,13 @@ def add_image(
         raise NotificationValidationError(
             f"Картинка больше {IMAGE_MAX_BYTES // (1024 * 1024)} МБ"
         )
-    if len(notification.images) >= IMAGES_MAX_PER_NOTIFICATION:
+    existing = _images_of(session, notification)
+    if len(existing) >= IMAGES_MAX_PER_NOTIFICATION:
         raise NotificationValidationError(
             f"К одному уведомлению можно приложить не больше "
             f"{IMAGES_MAX_PER_NOTIFICATION} картинок"
         )
-    if any(image.name == name for image in notification.images):
+    if any(image.name == name for image in existing):
         raise NotificationValidationError(f"Картинка с именем {name} уже есть")
 
     directory = image_directory(base_dir, notification.id)
@@ -676,13 +690,16 @@ def add_image(
     (directory / name).write_bytes(data)
 
     image = NotificationImage(
-        notification_id=notification.id,
         name=name,
         content_type=content_type,
         size_bytes=len(data),
         checksum=hashlib.sha256(data).hexdigest(),
         created_by=created_by,
     )
+    # Связь проставляется через коллекцию, а не только внешним ключом: иначе
+    # `notification.images` в этом же запросе остаётся старым (пустым), и в ответе
+    # создания уведомление выглядело бы «без картинок» (§11.5, §7.4)
+    notification.images.append(image)
     session.add(image)
     session.flush()
     logger.info(
@@ -707,6 +724,49 @@ def image_payload(image: NotificationImage, data: bytes) -> bytes:
             len(data),
         )
     return data
+
+
+def add_images(
+    session: Session,
+    notification: Notification,
+    *,
+    items: Sequence[tuple[str, bytes]],
+    base_dir: Path,
+    created_by: str | None = None,
+) -> list[NotificationImage]:
+    """Приложить к уведомлению сразу несколько картинок (§4.6, Э9).
+
+    Редактор админки отправляет картинки вместе с созданием уведомления: файлы
+    должны лежать на сервере **до** первой доставки, иначе касса получит метку
+    `magaz-image:<имя>` без файла и нарисует «сломанное изображение» (§7.4).
+    """
+    if len(items) > IMAGES_MAX_PER_NOTIFICATION:
+        raise NotificationValidationError(
+            f"К одному уведомлению можно приложить не больше "
+            f"{IMAGES_MAX_PER_NOTIFICATION} картинок"
+        )
+    stored: list[NotificationImage] = []
+    for name, data in items:
+        stored.append(
+            add_image(
+                session,
+                notification,
+                name=name,
+                data=data,
+                base_dir=base_dir,
+                created_by=created_by,
+            )
+        )
+    return stored
+
+
+def keep_known_images(body: str, names: Iterable[str]) -> str:
+    """Убрать из тела метки картинок, которых нет на сервере (§4.6, Э9).
+
+    Тело уже прошло белый список, но метка без файла доехала бы до кассы битой
+    картинкой: лучше уведомление без картинки, чем со «сломанной» (§7.4).
+    """
+    return richtext.sanitize_html(body, allowed_images=set(names))
 
 
 def mark_delivered(

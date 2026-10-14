@@ -16,6 +16,9 @@
   подставляет потребитель: SPA — `/api/v1/admin/notifications/...`, касса — свой
   локальный кэш. Внешних адресов в теле быть не может: касса не ходит в интернет,
   а картинка должна быть видна и без сети (§7.4);
+* метка без файла до потребителя не доезжает: при сохранении уведомления
+  `sanitize_html(..., allowed_images=…)` выбрасывает `img`, для которых картинку
+  не приложили, — лучше без картинки, чем с битой (§4.6, §7.4);
 * `style` сохраняется частично: только безопасные свойства (`color`,
   `background-color`, `text-align`, `font-weight`, `text-decoration`), поэтому
   «важный текст красным» из редактора доезжает, а `position:fixed` — нет.
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import html
 import re
+from collections.abc import Collection
 from html.parser import HTMLParser
 
 __all__ = [
@@ -144,9 +148,20 @@ def plain_text(body: str, body_format: str = BODY_FORMAT_PLAIN) -> str:
     return body
 
 
-def sanitize_html(value: str, *, allowed_tags: frozenset[str] | None = None) -> str:
-    """Очистить HTML по белому списку тегов и атрибутов (§4.6, Э9)."""
-    parser = _Sanitizer(allowed_tags or ALLOWED_TAGS)
+def sanitize_html(
+    value: str,
+    *,
+    allowed_tags: frozenset[str] | None = None,
+    allowed_images: Collection[str] | None = None,
+) -> str:
+    """Очистить HTML по белому списку тегов и атрибутов (§4.6, Э9).
+
+    `allowed_images` — имена картинок, которые действительно лежат на сервере:
+    метка `magaz-image:<имя>` без файла нарисовалась бы на кассе битой картинкой,
+    поэтому такие `img` выбрасываются вместе с тегом. `None` — проверять нечего
+    (первый проход, до сохранения картинок).
+    """
+    parser = _Sanitizer(allowed_tags or ALLOWED_TAGS, allowed_images=allowed_images)
     parser.feed(str(value or ""))
     parser.close()
     return "".join(parser.parts).strip()
@@ -168,9 +183,16 @@ def html_to_text(value: str) -> str:
 class _Sanitizer(HTMLParser):
     """Пересобрать разметку только из разрешённых тегов и атрибутов."""
 
-    def __init__(self, allowed_tags: frozenset[str]) -> None:
+    def __init__(
+        self,
+        allowed_tags: frozenset[str],
+        *,
+        allowed_images: Collection[str] | None = None,
+    ) -> None:
         super().__init__(convert_charrefs=True)
         self.allowed_tags = allowed_tags
+        #: `None` — картинки ещё не сохранены, проверять нечего
+        self.allowed_images = None if allowed_images is None else set(allowed_images)
         self.parts: list[str] = []
         self._dropped_depth = 0
 
@@ -204,12 +226,12 @@ class _Sanitizer(HTMLParser):
             cleaned.append(f'{key}="{html.escape(raw, quote=True)}"')
         return (" " + " ".join(cleaned)) if cleaned else ""
 
-    def _has_src(self, attrs: list[tuple[str, str | None]]) -> bool:
-        """У картинки обязателен свой `src`: без него рисовать нечего."""
-        return any(
-            str(name or "").strip().lower() == "src" and image_name_from_src(value) is not None
-            for name, value in attrs
-        )
+    def _image_name(self, attrs: list[tuple[str, str | None]]) -> str | None:
+        """Имя картинки из `src`-метки; без своего `src` рисовать нечего."""
+        for name, value in attrs:
+            if str(name or "").strip().lower() == "src":
+                return image_name_from_src(value)
+        return None
 
     # --- Разбор разметки ----------------------------------------------------
 
@@ -220,8 +242,13 @@ class _Sanitizer(HTMLParser):
             return
         if self._dropped_depth or tag not in self.allowed_tags:
             return
-        if tag == "img" and not self._has_src(attrs):
-            return
+        if tag == "img":
+            name = self._image_name(attrs)
+            if name is None:
+                return
+            # Метка без файла — битая картинка на кассе (§4.6, Э9)
+            if self.allowed_images is not None and name not in self.allowed_images:
+                return
         attributes = self._clean_attributes(tag, attrs)
         suffix = " />" if tag in VOID_TAGS else ">"
         self.parts.append(f"<{tag}{attributes}{suffix}")

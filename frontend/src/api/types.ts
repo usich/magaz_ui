@@ -430,6 +430,9 @@ export type NotificationTargetType = 'all' | 'stores' | 'cluster'
 /** Статус рассылки в списке `/notifications` (§11.5). */
 export type NotificationState = 'active' | 'done' | 'canceled'
 
+/** Э9: формат тела уведомления — простой текст или разметка из редактора (§4.6). */
+export type NotificationBodyFormat = 'plain' | 'html'
+
 /** Статус ознакомления по сессии Windows (§4.8, П-2). */
 export type ReceiptStatus = 'pending' | 'shown' | 'acknowledged' | 'snoozed' | 'expired'
 
@@ -451,6 +454,12 @@ export interface NotificationItem {
   id: number
   title: string
   body: string
+  /** Э9: `plain` — простой текст, `html` — разметка из редактора (§4.6). */
+  body_format: NotificationBodyFormat
+  /** Э9: `true` — прочитанное исчезает из окна кассы, `false` — остаётся справочником. */
+  delete_after_read: boolean
+  /** Э9: имена картинок тела; готовый адрес строит потребитель (§7.4). */
+  images: string[]
   severity: NotificationSeverity
   requires_ack: boolean
   target_type: NotificationTargetType
@@ -471,10 +480,22 @@ export interface NotificationList {
   total: number
   /** Счётчики по статусам: в работе / завершено / отменено (§11.5). */
   counts: Record<string, number>
+  /** Э9: сколько уведомлений каждого уровня — вкладки «info / важно / критично». */
+  severity_counts: Record<string, number>
+  /** Э9: сколько сессий ещё не нажали «Ознакомлен» по каждому уровню. */
+  unread_by_severity: Record<string, number>
   /** Плитка главной «Ждут ознакомления» (§11.1). */
   pending_receipts: number
   /** Интервал возврата отложенного — `notification_snooze_min` (§4.9, П-2). */
   snooze_min: number
+}
+
+/** Счётчики вкладок уведомлений: `GET /admin/notifications/summary` (Э9, §11.5). */
+export interface NotificationSummary {
+  total: number
+  by_severity: Record<string, number>
+  by_state: Record<string, number>
+  unread_receipts: Record<string, number>
 }
 
 export interface NotificationFilters {
@@ -485,9 +506,23 @@ export interface NotificationFilters {
   limit?: number
 }
 
+/** Картинка тела при создании уведомления (Э9): редактор отдаёт `data:`-URL. */
+export interface NotificationImageUpload {
+  /** Имя файла — то, что попадёт в метку `magaz-image:<имя>` в теле (§4.6). */
+  name: string
+  /** Картинка строкой base64 или готовым `data:`-URL. */
+  data_base64: string
+}
+
 export interface NotificationCreatePayload {
   title: string
   body: string
+  /** Э9: `html` — тело пришло из редактора, сервер пропустит его по белому списку. */
+  body_format?: NotificationBodyFormat
+  /** Э9: «удалять после прочтения» — по умолчанию нет (остаётся справочником). */
+  delete_after_read?: boolean
+  /** Э9: картинки тела — уезжают вместе с уведомлением, до первой доставки (§7.4). */
+  images?: NotificationImageUpload[]
   severity: NotificationSeverity
   requires_ack: boolean
   target_type: NotificationTargetType
