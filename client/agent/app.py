@@ -13,16 +13,20 @@
 
 Плюс точки мониторинга Э2 (`GET /health`, `GET /version`), в которых `busy`
 теперь заполняется исполнителем операций, а `interrupted_operation` доносит до
-сервера операцию, прерванную перезагрузкой кассы (§7.3), и `POST /credentials`
-(Э4, П-1) — приём учётных данных 1С от сервера.
+сервера операцию, прерванную перезагрузкой кассы (§7.3), `POST /credentials`
+(Э4, П-1) — приём учётных данных 1С от сервера, и `POST /devices/config` +
+`POST /devices/check-now` (Э4Б, Д-1) — список оборудования подсети и
+внеочередная проверка по кнопке «Проверить сейчас».
 
 Авторизация: `X-Agent-Token` из конфига магазина плюс, если задан
 `allowed_server_ips`, проверка IP источника (§5.1, §8.1). Повторный запуск
 1С-операции, пока идёт предыдущая, отвечает `409 Conflict` (I-13, Q23); лог
 обнуляется до постановки задачи в очередь (I-3). Пароль 1С приходит только
 push-ом, шифруется Fernet-ом с ключом под DPAPI машины и в логи не попадает
-(П-1, I-7). Уведомления (`/notify`, `/notifications/*`) и `/devices/*`
-подключаются на этапах Э4Б–Э5.
+(П-1, I-7). Опрос оборудования подсети ведёт фоновая задача `DeviceMonitor`
+(§7.6): `icmp` через `ping.exe` (argv, без shell) либо TCP-connect, результат
+батчем уходит на сервер. Уведомления (`/notify`, `/notifications/*`)
+подключаются на этапе Э5.
 """
 
 from __future__ import annotations
@@ -33,11 +37,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from client.agent import credentials, downloader, messenger
+from client.agent import credentials, devices, downloader, messenger
 from client.agent.config import AgentConfig, describe_os
 from client.agent.executor import OperationBusyError, OperationRunner
 from client.agent.models import AgentVersionResponse
@@ -54,6 +59,9 @@ from shared.schemas import (
     CheckFilesParams,
     CheckFilesResponse,
     CredentialsPush,
+    DeviceCheckRequest,
+    DeviceCheckResult,
+    DevicesConfigPush,
     DownloadParams,
     HealthResponse,
     JobStateResponse,
@@ -121,12 +129,19 @@ def create_agent_app(
     provider: ProcessProvider | None = None,
     runner: OperationRunner | None = None,
     state_path: Path | None = None,
+    devices_monitor: bool | None = None,
+    devices_transport: Any = None,  # noqa: ANN401 - httpx.AsyncBaseTransport в тестах
+    devices_startup_delay_sec: float = 5.0,
 ) -> FastAPI:
     """Собрать приложение агента по его конфигу (§7.2).
 
     `started_at` передаётся явно в тестах, чтобы `uptime_sec` был предсказуем;
     `paths`, `provider`, `runner` — точки подмены для проверок (§7.5, §13):
     реальная 1С, `msg.exe` и `taskkill` в тестах не запускаются.
+
+    Э4Б: `devices_monitor` включает фоновый опрос оборудования подсети (§7.6).
+    По умолчанию он поднимается, если в конфиге задан адрес сервера; `False`
+    нужен тестам и локальной отладке без сети.
     """
     started = started_at or utcnow()
     one_c_paths = paths or OneCPaths(
@@ -143,10 +158,32 @@ def create_agent_app(
         config.one_c_profile,
         config_path=config_path,
     )
+    #: Д-1: список оборудования подсети — копия на диске переживает перезапуск
+    devices_store = devices.DevicesStore.load(
+        config.devices_path,
+        interval_sec=config.device_check_interval_sec,
+        timeout_ms=config.device_ping_timeout_ms,
+    )
+    if devices_store.has_snapshot:
+        # Принятый ранее список — источник истины для `/health`: иначе после
+        # перезапуска службы агент докладывал бы версию из agent-config.json (§7.6)
+        config.devices_version = devices_store.version
+    device_monitor = devices.DeviceMonitor(
+        devices_store,
+        checker=devices.DeviceChecker(
+            provider=process_provider, timeout_ms=config.device_ping_timeout_ms
+        ),
+        sender=devices.DeviceStatusSender(config, transport=devices_transport),
+        store_id=config.store_id,
+        startup_delay_sec=devices_startup_delay_sec,
+    )
+    monitor_enabled = (
+        bool(config.server_url) if devices_monitor is None else bool(devices_monitor)
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        """Старт: помечаем прерванную операцию; остановка: гасим воркер (§7.3)."""
+        """Старт: помечаем прерванную операцию; остановка: гасим воркеры (§7.3)."""
         interrupted = operations.mark_interrupted()
         logger.info(
             "MagazAgent запущен: магазин %s, рабочая папка %s, прерванная операция: %s",
@@ -154,9 +191,18 @@ def create_agent_app(
             one_c_paths.work_dir,
             interrupted.operation if interrupted else "нет",
         )
+        if monitor_enabled:
+            device_monitor.start()
+            logger.info(
+                "Опрос оборудования подсети включён: устройств %s (активных %s), интервал %s с",
+                len(devices_store.config.devices),
+                len(devices_store.active()),
+                device_monitor.interval_sec,
+            )
         try:
             yield
         finally:
+            await device_monitor.stop()
             await operations.shutdown()
 
     app = FastAPI(
@@ -288,6 +334,44 @@ def create_agent_app(
             "credentials_version": profile.credentials_version,
             "password_set": bool(profile.password_enc),
         }
+
+    @app.post(
+        "/devices/config",
+        dependencies=[Depends(require_agent_token)],
+        summary="Приём списка оборудования подсети от сервера (Д-1)",
+        tags=["devices"],
+    )
+    def push_devices_config(payload: DevicesConfigPush) -> dict[str, object]:
+        """Сохранить список оборудования и расписание опроса (§5.1.2, §7.6).
+
+        Копия ложится в `devices.json` рядом с конфигом: опрос продолжается,
+        когда сервер недоступен. Версия из push-а сразу видна в `/health` —
+        сервер перестаёт считать список оборудования расходящимся.
+        """
+        stored = devices_store.apply_push(payload)
+        config.devices_version = stored.devices_version
+        return {
+            "stored": True,
+            "devices_version": stored.devices_version,
+            "devices": len(stored.devices),
+            "active": len(stored.active()),
+            "check_interval_sec": stored.check_interval_sec,
+        }
+
+    @app.post(
+        "/devices/check-now",
+        response_model=list[DeviceCheckResult],
+        dependencies=[Depends(require_agent_token)],
+        summary="Внеочередная проверка оборудования (Д-1)",
+        tags=["devices"],
+    )
+    async def check_devices_now(payload: DeviceCheckRequest) -> list[DeviceCheckResult]:
+        """Проверить указанные IP и сразу вернуть результат (§5.1.2).
+
+        Кнопка «Проверить сейчас» в дашборде: адреса берёт сервер из
+        `store_devices` и записывает ответ сам — подсеть агент не сканирует (§7.6).
+        """
+        return await device_monitor.check_now(payload.devices)
 
     @app.post(
         "/run-merge",
@@ -483,4 +567,6 @@ def create_agent_app(
     app.state.agent_paths = one_c_paths
     app.state.agent_provider = process_provider
     app.state.agent_runner = operations
+    #: Д-1: расписание опроса оборудования (диагностика и тесты)
+    app.state.agent_devices = device_monitor
     return app

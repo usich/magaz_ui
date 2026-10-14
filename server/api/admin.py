@@ -21,12 +21,20 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from server.api import operations as operations_api
+from server.api import devices as devices_api
 from server.api import stores as stores_api
 from server.config import API_PREFIX
 from server.core.context import AppContext
 from server.core.dependencies import get_client_ip, get_context, get_db, require_active_admin
 from server.db.models import AdminUser, AuditLog, Store
-from server.services import admin_service, audit_service, command_service, settings_service, store_service
+from server.services import (
+    admin_service,
+    audit_service,
+    command_service,
+    device_service,
+    settings_service,
+    store_service,
+)
 from shared.timeutil import to_iso_z
 
 logger = logging.getLogger(__name__)
@@ -137,6 +145,9 @@ router.include_router(stores_api.router)
 #: Операции (Э4): одиночные и массовые действия, история задач, матрица файлов
 #: (§5.2.2, §11.3, §11.4, §11.6)
 router.include_router(operations_api.router)
+#: Оборудование подсети (Э4Б, Д-1): CRUD, «проверить сейчас», сводная таблица
+#: (§5.2.2, §11.7)
+router.include_router(devices_api.router)
 
 
 # --- Вход/выход (§4.2, §8.1) ------------------------------------------------
@@ -236,6 +247,11 @@ def system_info_payload(session: Session, context: AppContext) -> dict[str, Any]
     stores_online, stores_offline = store_service.count_by_status(
         session, online_window_sec=online_window
     )
+    # Э4Б (Д-1): плитка «Устройства онлайн/всего» — окно своё, не «магазинное»
+    device_window = settings_service.get_int(session, "device_online_window_sec")
+    devices_online, devices_total = device_service.count_devices(
+        session, window_sec=device_window
+    )
     return {
         "app_name": context.settings.app_name,
         "app_version": context.settings.app_version,
@@ -263,6 +279,10 @@ def system_info_payload(session: Session, context: AppContext) -> dict[str, Any]
             "audit_events": _count(session, AuditLog),
             # Э4: плитка «Задач в работе» на главной (§11.1) — queued/sent/running
             "jobs_active": command_service.count_active(session),
+            # Э4Б: плитка «Устройства онлайн/всего» и её окно (§11.1, §11.7, Д-1)
+            "devices_total": devices_total,
+            "devices_online": devices_online,
+            "devices_window_sec": device_window,
         },
         "settings_keys": len(settings_service.DEFAULT_SETTINGS),
     }

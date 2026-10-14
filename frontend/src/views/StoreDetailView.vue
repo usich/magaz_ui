@@ -19,6 +19,7 @@ import { useToast } from 'primevue/usetoast'
 import { ApiError } from '@/api/client'
 import type { StoreHealth } from '@/api/types'
 import OperationPanel from '@/components/OperationPanel.vue'
+import StoreDevicesPanel from '@/components/StoreDevicesPanel.vue'
 import { JOB_KIND_LABELS, JOB_STATUS_LABELS, jobStatusSeverity, useJobsStore } from '@/stores/jobs'
 import { useStoresStore } from '@/stores/stores'
 
@@ -299,8 +300,8 @@ function formatTime(value: string | null | undefined): string {
         <span class="magaz-mono">POST /credentials</span> (П-1, этап Э4).
       </p>
       <p v-if="health.devices_push_required" class="mt-1 text-xs text-amber-700">
-        Версия списка оборудования на агенте отличается: сервер дослает список
-        <span class="magaz-mono">POST /devices/config</span> (Д-1, этап Э4Б).
+        Версия списка оборудования на агенте отличается: диспетчер дослает список
+        <span class="magaz-mono">POST /devices/config</span> при следующей сверке (Д-1).
       </p>
     </section>
 
@@ -349,6 +350,8 @@ function formatTime(value: string | null | undefined): string {
         </div>
       </div>
     </section>
+
+    <StoreDevicesPanel v-if="store" :store-id="storeId" />
 
     <OperationPanel
       :store-ids="[storeId]"

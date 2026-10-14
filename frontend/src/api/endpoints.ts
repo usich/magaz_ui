@@ -8,6 +8,12 @@ import type {
   AuditEntry,
   BulkActionPayload,
   BulkActionResponse,
+  DeviceCheckResponse,
+  DeviceCreatePayload,
+  DeviceItem,
+  DeviceListFilters,
+  DeviceUpdatePayload,
+  DevicesMatrix,
   FileMatrix,
   FileMatrixFilters,
   JobDetail,
@@ -152,5 +158,52 @@ export const filesApi = {
     if (filters.includeInactive) query.set('include_inactive', 'true')
     const suffix = query.toString() ? `?${query}` : ''
     return api.get<FileMatrix>(`/admin/files/matrix${suffix}`)
+  },
+}
+
+/**
+ * Оборудование подсети (§11.7, Д-1, Э4Б).
+ *
+ * Подсеть опрашивает касса, поэтому «Проверить сейчас» — это запрос сервера к
+ * агенту (`POST /devices/check-now`), а не скан сети с сервера (§7.6).
+ * Сводная таблица `/devices` берётся из `/admin/devices/matrix`: строки
+ * «магазин × устройство» и те же счётчики, что в плитке главной.
+ */
+export const devicesApi = {
+  /** `GET /admin/stores/{id}/devices` — список оборудования магазина (карточка, §11.2). */
+  list: (storeId: number, includeInactive = true) => {
+    const suffix = includeInactive ? '?include_inactive=true' : ''
+    return api.get<DeviceItem[]>(`/admin/stores/${storeId}/devices${suffix}`)
+  },
+
+  /** `POST /admin/stores/{id}/devices` — «Добавить устройство» (§11.7). */
+  create: (storeId: number, payload: DeviceCreatePayload) =>
+    api.post<DeviceItem>(`/admin/stores/${storeId}/devices`, payload),
+
+  /** `PUT /admin/stores/{id}/devices/{device_id}` — правка карточки устройства. */
+  update: (storeId: number, deviceId: number, payload: DeviceUpdatePayload) =>
+    api.put<DeviceItem>(`/admin/stores/${storeId}/devices/${deviceId}`, payload),
+
+  /** `DELETE /admin/stores/{id}/devices/{device_id}` — мягкое «Отключить из опроса». */
+  deactivate: (storeId: number, deviceId: number) =>
+    api.delete<DeviceItem>(`/admin/stores/${storeId}/devices/${deviceId}`),
+
+  /** `POST /admin/stores/{id}/devices/check` — «Проверить сейчас» (пусто — все устройства). */
+  check: (storeId: number, deviceIds: number[] = []) =>
+    api.post<DeviceCheckResponse>(`/admin/stores/${storeId}/devices/check`, {
+      device_ids: deviceIds,
+    }),
+
+  /** `GET /admin/devices/matrix` — сводная таблица `магазин × устройство` (§11.7). */
+  matrix: (filters: DeviceListFilters = {}) => {
+    const query = new URLSearchParams()
+    if (filters.storeId) query.set('store_id', String(filters.storeId))
+    if (filters.cluster?.trim()) query.set('cluster', filters.cluster.trim())
+    if (filters.deviceType?.trim()) query.set('device_type', filters.deviceType.trim())
+    if (filters.status && filters.status !== 'all') query.set('status', filters.status)
+    if (filters.search?.trim()) query.set('search', filters.search.trim())
+    if (filters.includeInactive === false) query.set('include_inactive', 'false')
+    const suffix = query.toString() ? `?${query}` : ''
+    return api.get<DevicesMatrix>(`/admin/devices/matrix${suffix}`)
   },
 }

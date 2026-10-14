@@ -21,9 +21,9 @@ from sqlalchemy.orm import Session
 from server.config import API_PREFIX
 from server.core.dependencies import get_admin_store, get_db
 from server.db.models import Command, Store
-from server.services import command_service
+from server.services import command_service, device_service
 from shared.enums import CommandStatus
-from shared.schemas import AgentHealthReport, CommandResultReport
+from shared.schemas import AgentHealthReport, CommandResultReport, DeviceStatusBatch
 from shared.timeutil import to_iso_z, utcnow
 
 logger = logging.getLogger(__name__)
@@ -159,4 +159,48 @@ def agent_command_result(
         command_id=command.id,
         status=target,
         message="Результат задачи принят",
+    )
+
+
+class DeviceStatusAck(BaseModel):
+    """Ответ на батч опроса оборудования: что сервер записал (§5.2.2, Д-1)."""
+
+    ok: bool = True
+    store_id: int
+    updated: int = 0
+    ignored: int = 0
+    agent_ok: bool = True
+
+
+@router.post(
+    "/devices/status",
+    response_model=DeviceStatusAck,
+    summary="Батч результатов опроса оборудования",
+)
+def agent_devices_status(
+    payload: DeviceStatusBatch,
+    store: Annotated[Store, Depends(get_admin_store)],
+    session: Annotated[Session, Depends(get_db)],
+) -> DeviceStatusAck:
+    """Принять результаты опроса оборудования от кассы (§5.2.2, §4.11).
+
+    `store_id` в теле не является доверенным (источник истины — магазин по
+    токену, как в самодокладе), а адреса, которых нет в `store_devices`
+    магазина, игнорируются: агент опрашивает только явно заведённые
+    устройства, и батч не должен «протаскивать» чужие адреса (запрет sweep, §7.6).
+    """
+    if payload.store_id != store.id:
+        logger.warning(
+            "Агент магазина id=%s прислал чужой store_id=%s в батче опроса оборудования",
+            store.id,
+            payload.store_id,
+        )
+
+    summary = device_service.apply_status_batch(session, store, payload)
+    session.flush()
+    return DeviceStatusAck(
+        store_id=store.id,
+        updated=summary["updated"],
+        ignored=summary["ignored"],
+        agent_ok=payload.agent_ok,
     )

@@ -22,6 +22,17 @@ const counts = computed(() => system.counts)
 const info = computed(() => system.info)
 const onlineWindow = computed(() => counts.value?.online_window_sec ?? 45)
 
+/** Э4Б: плитка «Устройства онлайн / всего» — те же числа, что на `/devices` (§11.7). */
+const devicesValue = computed(() => {
+  const total = counts.value?.devices_total ?? 0
+  const online = counts.value?.devices_online ?? 0
+  return `${online} / ${total}`
+})
+const devicesHint = computed(() => {
+  const window = counts.value?.devices_window_sec ?? 180
+  return `окно ${window} с · офлайн и без данных — по клику`
+})
+
 onMounted(() => stores.startPolling())
 onUnmounted(() => stores.stopPolling())
 
@@ -63,7 +74,19 @@ function formatTime(value: string | null): string {
         icon="pi pi-times-circle"
         hint="нет ответа агента"
       />
-      <StatusTile label="Устройства онлайн" value="—" icon="pi pi-wifi" hint="этап Э4Б (Д-1)" />
+      <RouterLink
+        :to="{ name: 'devices', query: { status: 'offline' } }"
+        class="block"
+        data-test="tile-devices"
+        title="Оборудование подсети: что офлайн и что без данных"
+      >
+        <StatusTile
+          label="Устройства онлайн"
+          :value="devicesValue"
+          icon="pi pi-wifi"
+          :hint="devicesHint"
+        />
+      </RouterLink>
       <StatusTile label="Ждут ознакомления" value="—" icon="pi pi-bell" hint="этап Э5" />
       <StatusTile
         label="Задач в работе"
@@ -200,16 +223,16 @@ function formatTime(value: string | null): string {
         <h2 class="font-semibold">Что появится дальше</h2>
         <ul class="mt-4 space-y-3 text-sm text-slate-700">
           <li class="flex gap-2">
-            <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э4</span>
-            <span>Операции 1С: скачивание, проверка файлов, слияние, обновление БД, журнал задач.</span>
-          </li>
-          <li class="flex gap-2">
-            <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э4Б</span>
-            <span>Оборудование подсети магазинов: камеры, свитчи, принтеры со статусами.</span>
-          </li>
-          <li class="flex gap-2">
             <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э5</span>
             <span>Уведомления пользователям: уровни важности, «Ознакомлен»/«Отложить», отчёты.</span>
+          </li>
+          <li class="flex gap-2">
+            <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э6</span>
+            <span>Сборка и развёртывание: управление администраторами в настройках, пакеты обновления.</span>
+          </li>
+          <li class="flex gap-2">
+            <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э7</span>
+            <span>Приёмка на стенде: живой прогон 1С, msg.exe и службы под LocalSystem.</span>
           </li>
         </ul>
       </div>

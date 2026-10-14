@@ -55,7 +55,7 @@ from server.core.client_http import (
 from server.core.security import SecretBox
 from server.db.models import Command, FileCheck, Store
 from server.db.session import DatabaseManager
-from server.services import command_service, settings_service
+from server.services import command_service, device_service, settings_service
 from shared.enums import CommandKind, CommandStatus, JobLogLevel
 from shared.schemas import CheckFilesResponse, CredentialsPush
 from shared.timeutil import utcnow
@@ -187,6 +187,7 @@ class DispatchReport:
     retried: int = 0
     waiting: int = 0
     credentials_pushed: int = 0
+    devices_pushed: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -229,7 +230,7 @@ class CommandDispatcher:
         self._backoff: dict[int, datetime] = {}
         #: command_id → последнее сообщение опроса (чтобы не дублировать журнал)
         self._progress: dict[int, str] = {}
-        #: store_id → когда последний раз сверяли версию учётных данных (П-1)
+        #: store_id → когда последний раз сверяли версии на кассе (П-1, Д-1)
         self._credentials_checked: dict[int, datetime] = {}
         self.last_report: DispatchReport | None = None
 
@@ -342,7 +343,7 @@ class CommandDispatcher:
                     logger.exception("Неожиданный сбой обработки задачи id=%s", command.id)
                     report.errors.append(f"Задача {command.id}: внутренняя ошибка")
             self._prune(seen)
-            await self._sync_credentials(session, report)
+            await self._sync_pushes(session, report)
             session.commit()
         finally:
             session.close()
@@ -776,20 +777,23 @@ class CommandDispatcher:
         report.retried += 1
         report.waiting += 1
 
-    # --- П-1: доставка учётных данных 1С ------------------------------------
+    # --- П-1/Д-1: push учётных данных 1С и списка оборудования ---------------
 
-    async def _sync_credentials(
+    async def _sync_pushes(
         self,
         session: Any,  # noqa: ANN401 - Session
         report: DispatchReport,
     ) -> None:
-        """Дослать учётные данные 1С, если версия на кассе разошлась (§8.3, П-1).
+        """Дослать то, что на кассе разошлось: пароль 1С (П-1) и устройства (Д-1).
 
-        Агент докладывает свою `credentials_version` в `/health`; расхождение
-        означает переустановку агента, потерю конфига или ручную смену пароля —
-        во всех случаях сервер сам «лечит» кассу push-ом `POST /credentials`.
-        Проверка версий для каждого магазина выполняется не чаще
-        `credentials_push_interval_sec`, чтобы не удваивать трафик мониторинга.
+        Один `GET /health` отвечает на оба вопроса — агент докладывает
+        `credentials_version` и `devices_version`, — поэтому проверка общая и
+        выполняется не чаще `credentials_push_interval_sec`: трафик мониторинга
+        не удваивается (§7.6).
+
+        Расхождение означает переустановку агента, потерю конфига или изменение
+        на сервере (смена пароля, правка списка оборудования) — во всех случаях
+        сервер сам «лечит» кассу push-ом `POST /credentials` / `POST /devices/config`.
         """
         interval = max(1, self._setting(session, CREDENTIALS_INTERVAL_SETTING))
         window = self._setting(session, ONLINE_WINDOW_SETTING)
@@ -806,33 +810,51 @@ class CommandDispatcher:
                 continue
             self._credentials_checked[store.id] = now
 
+            credentials_pushed = False
+            devices_pushed = 0
             try:
                 async with self._client(store) as client:
                     health = await client.get_health()
-                    if health.credentials_version == store.credentials_version:
-                        continue
-                    await client.push_credentials(
-                        CredentialsPush(
-                            user_name=store.user_name_1c,
-                            password=self._decrypt_password(store),
-                            credentials_version=store.credentials_version,
+                    if health.credentials_version != store.credentials_version:
+                        await client.push_credentials(
+                            CredentialsPush(
+                                user_name=store.user_name_1c,
+                                password=self._decrypt_password(store),
+                                credentials_version=store.credentials_version,
+                            )
                         )
-                    )
+                        credentials_pushed = True
+                    if health.devices_version != store.devices_version:
+                        payload = device_service.push_payload(session, store)
+                        await client.push_devices_config(payload)
+                        devices_pushed = len(payload.devices)
             except AgentError as exc:
                 logger.debug(
-                    "Магазин id=%s: учётные данные не доставлены (%s)", store.id, exc.message
+                    "Магазин id=%s: push отложен до следующей сверки (%s)",
+                    store.id,
+                    exc.message,
                 )
                 continue
             except Exception:  # noqa: BLE001 - одна касса не роняет цикл
-                logger.exception("Магазин id=%s: сбой push учётных данных", store.id)
+                logger.exception("Магазин id=%s: сбой push учётных данных/устройств", store.id)
                 continue
 
-            report.credentials_pushed += 1
-            logger.info(
-                "Магазин id=%s: учётные данные 1С доставлены агенту (версия %s)",
-                store.id,
-                store.credentials_version,
-            )
+            if credentials_pushed:
+                report.credentials_pushed += 1
+                logger.info(
+                    "Магазин id=%s: учётные данные 1С доставлены агенту (версия %s)",
+                    store.id,
+                    store.credentials_version,
+                )
+            if devices_pushed:
+                report.devices_pushed += 1
+                logger.info(
+                    "Магазин id=%s: список оборудования доставлен агенту "
+                    "(версия %s, устройств %s)",
+                    store.id,
+                    store.devices_version,
+                    devices_pushed,
+                )
 
         for store_id in list(self._credentials_checked):
             if store_id not in alive:

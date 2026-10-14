@@ -52,4 +52,13 @@ Desktop.ini
 *.err.log
 *.pid
 .playwright-mcp/
+# Вывод прогонов pytest / vitest / vue-tsc при фоновом запуске (см. memory bank, «Ловушки»)
+pytest-*.txt
+pytest-*.err
+pytest-*.code
+vitest-*.txt
+vitest-*.err
+tsc-run.txt
+tsc-run.err
+collect.txt
 

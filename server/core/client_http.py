@@ -27,6 +27,9 @@ from server.config import Settings
 from shared.schemas import (
     CheckFilesResponse,
     CredentialsPush,
+    DeviceCheckRequest,
+    DeviceCheckResult,
+    DevicesConfigPush,
     HealthResponse,
     MergeParams,
     UpdateParams,
@@ -60,6 +63,9 @@ DOWNLOAD_FILE_PATH = "/download-file"
 SEND_MESSAGE_PATH = "/send-message"
 #: §5.1.2: push учётных данных 1С (П-1)
 CREDENTIALS_PATH = "/credentials"
+#: §5.1.2: список оборудования подсети (Д-1) и внеочередная проверка (кнопка)
+DEVICES_CONFIG_PATH = "/devices/config"
+DEVICES_CHECK_NOW_PATH = "/devices/check-now"
 
 #: Тип задачи → путь опроса его состояния (`/check-*`, Приложение B)
 JOB_STATE_PATHS: dict[str, str] = {
@@ -335,5 +341,46 @@ class AgentClient:
     async def _accepted(self, path: str, payload: Any) -> dict[str, Any]:  # noqa: ANN401
         """Общий разбор ответа `/run-*`: `202` + JSON-подтверждение."""
         body = await self.request_json("POST", path, json_body=payload)
+        return body if isinstance(body, dict) else {}
+
+    async def push_devices_config(self, payload: DevicesConfigPush) -> dict[str, Any]:
+        """`POST /devices/config` — доставить список оборудования на кассу (Д-1).
+
+        Вместе со списком едет расписание опроса из настроек сервера (§4.9, Д-9),
+        поэтому интервал меняется в UI без правки конфига на каждой кассе.
+        """
+        body = await self.request_json(
+            "POST", DEVICES_CONFIG_PATH, json_body=payload.model_dump(mode="json")
+        )
+        if not isinstance(body, dict):
+            raise AgentProtocolError(
+                f"Агент магазина id={self.target.store_id} вернул не объект в /devices/config"
+            )
+        return body
+
+    async def check_devices_now(
+        self, payload: DeviceCheckRequest
+    ) -> list[DeviceCheckResult]:
+        """`POST /devices/check-now` — внеочередная проверка устройств (Д-1).
+
+        Адреса передаёт сервер (только из `store_devices`), ответ синхронный:
+        агент опрашивает подсеть и сразу возвращает статусы и задержки.
+        """
+        body = await self.request_json(
+            "POST", DEVICES_CHECK_NOW_PATH, json_body=payload.model_dump(mode="json")
+        )
+        if not isinstance(body, list):
+            raise AgentProtocolError(
+                f"Агент магазина id={self.target.store_id} вернул не список в /devices/check-now"
+            )
+        try:
+            return [DeviceCheckResult.model_validate(item) for item in body]
+        except ValidationError as exc:
+            raise AgentProtocolError(
+                "Агент магазина id="
+                f"{self.target.store_id} вернул неожиданный /devices/check-now "
+                f"({exc.error_count()} ошибок)"
+            ) from exc
+
         return body if isinstance(body, dict) else {}
 

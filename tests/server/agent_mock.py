@@ -137,6 +137,8 @@ class ScriptedAgent:
         download_polls_before_file: int = 1,
         credentials_version: int = 1,
         devices_version: int = 1,
+        device_status: str = "online",
+        device_latency_ms: int = 12,
         merge_message: str = "Merge process started in the background.",
         update_message: str = "Update DB process started in the background.",
     ) -> None:
@@ -159,6 +161,11 @@ class ScriptedAgent:
         self.checks = 0
         self.operation: str | None = None
         self.credentials_pushes: list[dict[str, object]] = []
+        #: Д-1: принятые push-и списка оборудования и внеочередные проверки
+        self.devices_pushes: list[dict[str, object]] = []
+        self.devices_checks: list[list[dict[str, object]]] = []
+        self.device_status = device_status
+        self.device_latency_ms = device_latency_ms
 
     # --- Диагностика для тестов --------------------------------------------
 
@@ -202,6 +209,28 @@ class ScriptedAgent:
             self.credentials_version = int((body or {}).get("credentials_version") or 1)
             return httpx.Response(
                 200, json={"stored": True, "credentials_version": self.credentials_version}
+            )
+        if path == "/devices/config":
+            self.devices_pushes.append(body or {})
+            self.devices_version = int((body or {}).get("devices_version") or 1)
+            return httpx.Response(
+                200, json={"stored": True, "devices_version": self.devices_version}
+            )
+        if path == "/devices/check-now":
+            devices = list((body or {}).get("devices") or [])
+            self.devices_checks.append(devices)
+            online = self.device_status == "online"
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "ip": item.get("ip"),
+                        "status": self.device_status,
+                        "latency_ms": self.device_latency_ms if online else None,
+                        "error": None if online else "нет ответа",
+                    }
+                    for item in devices
+                ],
             )
         if path == "/check-files":
             if self.download_requested:

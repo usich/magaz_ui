@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .enums import CheckType, DeviceStatus, DeviceType, NotificationSeverity, ReceiptStatus
 
@@ -27,6 +27,7 @@ __all__ = [
     "CredentialsPush",
     "DeviceCheckRequest",
     "DeviceCheckResult",
+    "DeviceCheckSpec",
     "DeviceSpec",
     "DeviceStatusBatch",
     "DevicesConfigPush",
@@ -277,14 +278,12 @@ class DeviceSpec(BaseModel):
     port: int | None = None
     is_active: bool = True
 
-    @field_validator("check_type")
-    @classmethod
-    def validate_port(cls, value: CheckType, info) -> CheckType:  # noqa: ANN001 - pydantic API
-        if value is CheckType.TCP:
-            port = info.data.get("port")
-            if port is None:
-                raise ValueError("Для check_type=tcp обязателен port")
-        return value
+    @model_validator(mode="after")
+    def validate_port(self) -> "DeviceSpec":
+        """Порт обязателен при `check_type=tcp` (проверка после разбора полей)."""
+        if self.check_type is CheckType.TCP and self.port is None:
+            raise ValueError("Для check_type=tcp обязателен port")
+        return self
 
     @field_validator("name", "ip")
     @classmethod
@@ -294,17 +293,51 @@ class DeviceSpec(BaseModel):
         return value.strip()
 
 
+class DeviceCheckSpec(BaseModel):
+    """Устройство для внеочередной проверки (`POST /devices/check-now`, §5.1.2).
+
+    Имя здесь не нужно: сервер проверяет адреса, которые уже заведены в
+    `store_devices`, а результат сопоставляется по IP (Д-1).
+    """
+
+    ip: str
+    check_type: CheckType = CheckType.ICMP
+    port: int | None = None
+
+    @model_validator(mode="after")
+    def validate_port(self) -> "DeviceCheckSpec":
+        """Порт обязателен при `check_type=tcp` (проверка после разбора полей)."""
+        if self.check_type is CheckType.TCP and self.port is None:
+            raise ValueError("Для check_type=tcp обязателен port")
+        return self
+
+    @field_validator("ip")
+    @classmethod
+    def not_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Значение не может быть пустым")
+        return value.strip()
+
+
 class DevicesConfigPush(BaseModel):
-    """`POST /devices/config` — push списка оборудования сервер → агент (Д-1, §5.1.2)."""
+    """`POST /devices/config` — push списка оборудования сервер → агент (Д-1, §5.1.2).
+
+    **Д-9:** вместе со списком приходит расписание опроса — интервал и таймаут
+    проверок берутся из настроек сервера (§4.9), поэтому меняются в UI, а не
+    правкой `agent-config.json` на каждой кассе.
+    """
 
     devices_version: int
     devices: list[DeviceSpec] = Field(default_factory=list)
+    #: Д-9: интервал опроса и таймаут одной проверки; `None` — оставить как было
+    check_interval_sec: int | None = None
+    ping_timeout_ms: int | None = None
 
 
 class DeviceCheckRequest(BaseModel):
     """`POST /devices/check-now` — внеочередная проверка указанных IP (§5.1.2)."""
 
-    devices: list[DeviceSpec] = Field(default_factory=list)
+    devices: list[DeviceCheckSpec] = Field(default_factory=list)
 
 
 class DeviceCheckResult(BaseModel):

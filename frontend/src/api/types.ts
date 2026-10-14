@@ -34,6 +34,11 @@ export interface SystemCounts {
   audit_events: number
   /** Э4: задачи в работе (queued/sent/running) — плитка «Задач в работе» */
   jobs_active: number
+  /** Э4Б: устройств в списке магазинов — плитка «Устройства онлайн/всего» (Д-1) */
+  devices_total: number
+  devices_online: number
+  /** Э4Б: окно «устройство онлайн» — своё, не `online_window_sec` (§4.11) */
+  devices_window_sec: number
 }
 
 export interface SystemInfo {
@@ -244,6 +249,108 @@ export interface FileMatrixFilters {
   filename?: string
   cluster?: string
   includeInactive?: boolean
+}
+
+/** Способ проверки устройства (§4.11, Д-1): ping либо TCP-connect. */
+export type DeviceCheckType = 'icmp' | 'tcp'
+
+/** Статус устройства: `unknown` — «нет данных с кассы», а не «нет связи» (§4.11). */
+export type DeviceStatusValue = 'online' | 'offline' | 'unknown'
+
+/** Фильтр статуса на странице `/devices` (§11.7). */
+export type DeviceStatusFilter = 'all' | DeviceStatusValue
+
+/**
+ * Строка оборудования подсети (§4.11, §11.7, Д-1).
+ *
+ * `is_online` и `store_is_online` сервер считает на лету по окнам
+ * `device_online_window_sec` и `online_window_sec` — они не хранятся в БД.
+ */
+export interface DeviceItem {
+  id: number
+  store_id: number
+  store_name: string | null
+  cluster_name: string | null
+  store_is_active: boolean
+  store_is_online: boolean
+  name: string
+  ip_address: string
+  device_type: string | null
+  check_type: DeviceCheckType
+  check_port: number | null
+  is_active: boolean
+  last_status: DeviceStatusValue | null
+  last_seen_at: string | null
+  last_latency_ms: number | null
+  last_error: string | null
+  comment: string | null
+  is_online: boolean
+}
+
+/** Фильтры таблицы `/devices` (§11.7): магазин, кластер, тип, статус, поиск. */
+export interface DeviceListFilters {
+  storeId?: number | null
+  cluster?: string
+  deviceType?: string
+  status?: DeviceStatusFilter
+  search?: string
+  includeInactive?: boolean
+}
+
+/** Ответ `GET /admin/devices/matrix`: строки и счётчики страницы `/devices`. */
+export interface DevicesMatrix {
+  rows: DeviceItem[]
+  total: number
+  online: number
+  offline: number
+  unknown: number
+  stores: number
+  window_sec: number
+}
+
+/** Результат проверки одного адреса (ответ кассы на `/devices/check-now`). */
+export interface DeviceCheckResult {
+  ip: string
+  status: DeviceStatusValue
+  latency_ms: number | null
+  error: string | null
+}
+
+/** Ответ «Проверить сейчас» (§11.7): что вернула касса и что записано в БД. */
+export interface DeviceCheckResponse {
+  store_id: number
+  checked_at: string
+  agent_ok: boolean
+  message: string
+  checked: number
+  updated: number
+  ignored: number
+  results: DeviceCheckResult[]
+}
+
+/** Тело `POST /stores/{id}/devices` — «Добавить устройство» (§11.7). */
+export interface DeviceCreatePayload {
+  name: string
+  ip_address: string
+  device_type?: string | null
+  check_type?: DeviceCheckType
+  check_port?: number | null
+  comment?: string | null
+}
+
+/**
+ * Тело `PUT /stores/{id}/devices/{device_id}`: передаются только изменяемые поля;
+ * `clear_check_port` снимает TCP-порт (например, при возврате к `icmp`).
+ */
+export interface DeviceUpdatePayload {
+  name?: string
+  ip_address?: string
+  device_type?: string | null
+  check_type?: DeviceCheckType
+  check_port?: number | null
+  clear_check_port?: boolean
+  is_active?: boolean
+  comment?: string | null
 }
 
 /** Действия сервера над магазином (§5.2.2, §11.4). */

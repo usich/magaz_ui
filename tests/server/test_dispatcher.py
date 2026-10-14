@@ -25,7 +25,7 @@ from server.core.dispatcher import CommandDispatcher, build_1c_payload
 from server.core.security import SecretBox
 from server.db.models import Command, FileCheck, JobLog, Store
 from server.db.session import DatabaseManager
-from server.services import command_service, settings_service
+from server.services import command_service, device_service, settings_service
 from shared.enums import CommandKind, CommandStatus
 from shared.timeutil import utcnow
 from tests.server.agent_mock import (
@@ -82,6 +82,7 @@ def make_store(
     online: bool = True,
     password: str | None = None,
     credentials_version: int = 1,
+    devices_version: int = 1,
     secret_box: SecretBox | None = None,
     is_active: bool = True,
 ) -> Store:
@@ -96,6 +97,7 @@ def make_store(
         # Токен агента — только ASCII: он уходит в заголовок `X-Agent-Token` (§8.1)
         agent_token=f"token-{uuid4().hex[:12]}",
         credentials_version=credentials_version,
+        devices_version=devices_version,
         password_enc=(secret_box.encrypt(password) if password and secret_box else None),
         last_seen_at=utcnow() if online else None,
         is_active=is_active,
@@ -567,6 +569,94 @@ class TestCredentialsPush:
 
         assert report.credentials_pushed == 0
         assert agent.credentials_pushes == []
+
+
+class TestDevicesPush:
+    """Д-1/§7.6: сервер сам досылает список оборудования по расхождению версий."""
+
+    async def test_list_is_pushed_when_versions_differ(
+        self,
+        manager: DatabaseManager,
+        settings: Settings,
+        session: Session,
+        secret_box: SecretBox,
+    ) -> None:
+        seed_settings(session)
+        store = make_store(session, online=True)
+        device_service.create_device(session, store, name="камера вход", ip_address="10.10.1.21")
+        device_service.create_device(
+            session,
+            store,
+            name="камера двор",
+            ip_address="10.10.1.40",
+            check_type="tcp",
+            check_port=554,
+        )
+        disabled = device_service.create_device(
+            session, store, name="отключённая", ip_address="10.10.1.99"
+        )
+        device_service.deactivate_device(session, store, disabled)
+        session.commit()
+        agent = ScriptedAgent(devices_version=1, credentials_version=store.credentials_version)
+        dispatcher = build_dispatcher(
+            manager, settings, transport=agent.transport, secret_box=secret_box
+        )
+
+        report = await dispatcher.process_once()
+
+        assert report.devices_pushed == 1
+        pushed = agent.devices_pushes[0]
+        assert pushed["devices_version"] == store.devices_version
+        assert [item["ip"] for item in pushed["devices"]] == ["10.10.1.21", "10.10.1.40"], (
+            "отключённое устройство агенту не нужно (§11.7)"
+        )
+        assert pushed["devices"][1]["check_type"] == "tcp"
+        assert pushed["devices"][1]["port"] == 554
+        assert pushed["check_interval_sec"] == 60, "расписание — из настроек §4.9 (Д-9)"
+        assert pushed["ping_timeout_ms"] == 1000
+        assert agent.devices_version == store.devices_version, "касса приняла новую версию"
+        assert agent.paths().count("/health") == 1, "один /health отвечает про П-1 и Д-1"
+
+        again = await dispatcher.process_once()
+        assert again.devices_pushed == 0
+        assert len(agent.devices_pushes) == 1, "сверка не чаще credentials_push_interval_sec"
+
+    async def test_nothing_is_pushed_when_versions_match(
+        self,
+        manager: DatabaseManager,
+        settings: Settings,
+        session: Session,
+    ) -> None:
+        seed_settings(session)
+        store = make_store(session, online=True, devices_version=3)
+        agent = ScriptedAgent(devices_version=3)
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+
+        report = await dispatcher.process_once()
+
+        assert report.devices_pushed == 0
+        assert agent.devices_pushes == []
+        assert store.devices_version == 3, "версию на сервере push не меняет"
+
+    async def test_offline_store_is_not_pushed(
+        self,
+        manager: DatabaseManager,
+        settings: Settings,
+        session: Session,
+    ) -> None:
+        """Офлайн-касса — не ошибка: список уедет, когда магазин появится (§3.2)."""
+        seed_settings(session)
+        store = make_store(session, online=False, devices_version=2)
+        device_service.create_device(session, store, name="свитч", ip_address="10.10.1.30")
+        session.commit()
+        agent = ScriptedAgent(devices_version=1)
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+
+        report = await dispatcher.process_once()
+
+        assert report.devices_pushed == 0
+        assert agent.devices_pushes == []
+
 
 
 class TestDownloadScenario:

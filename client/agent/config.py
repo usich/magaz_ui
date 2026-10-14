@@ -24,10 +24,13 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "AGENT_CONFIG_FILE_NAME",
+    "AGENT_DEVICES_FILE_NAME",
     "AGENT_STATE_FILE_NAME",
     "CONFIG_PATH_ENV",
     "DEFAULT_AGENT_PORT",
     "DEFAULT_BASE_1C_PATH",
+    "DEFAULT_DEVICE_CHECK_INTERVAL_SEC",
+    "DEFAULT_DEVICE_PING_TIMEOUT_MS",
     "DEFAULT_FILE_NAME",
     "DEFAULT_LOG_DIR",
     "DEFAULT_WORK_DIR",
@@ -48,10 +51,17 @@ DEFAULT_BASE_1C_PATH = "C:/Program Files (x86)/1cv8"
 DEFAULT_FILE_NAME = "update"
 DEFAULT_LOG_DIR = Path(r"C:\ProgramData\MagazAgent\logs")
 
+#: Д-1: значения по умолчанию расписания опроса оборудования (§4.9, §7.6).
+#: Обычно их присылает сервер вместе со списком (Д-9), здесь — «до первого push-а».
+DEFAULT_DEVICE_CHECK_INTERVAL_SEC = 60
+DEFAULT_DEVICE_PING_TIMEOUT_MS = 1000
+
 #: Имя файла конфига и переменные окружения для нестандартных развёртываний
 AGENT_CONFIG_FILE_NAME = "agent-config.json"
 #: Файл состояния текущей 1С-операции (§7.3): лежит рядом с конфигом
 AGENT_STATE_FILE_NAME = "agent-state.json"
+#: Копия списка оборудования подсети (§7.6): опрос идёт и без сервера
+AGENT_DEVICES_FILE_NAME = "devices.json"
 CONFIG_PATH_ENV = "MAGAZ_AGENT_CONFIG"
 LOG_DIR_ENV = "MAGAZ_AGENT_LOG_DIR"
 
@@ -89,6 +99,11 @@ class AgentConfig(BaseModel):
 
     #: Д-2/Д-4: версия списка оборудования подсети, которой живёт агент (§7.6)
     devices_version: int = 1
+    #: Д-1: расписание опроса оборудования подсети (§4.9). Актуальные значения
+    #: приходят push-ом вместе со списком (Д-9); здесь — «до первого push-а»
+    #: и для локальной отладки `--console` (§7.5)
+    device_check_interval_sec: int = DEFAULT_DEVICE_CHECK_INTERVAL_SEC
+    device_ping_timeout_ms: int = DEFAULT_DEVICE_PING_TIMEOUT_MS
     #: Д-4: адреса сервера, с которых принимаются запросы (вторая линия §5.1).
     #: Пусто — проверка источника выключена (так работают локальные прогоны).
     allowed_server_ips: list[str] = Field(default_factory=list)
@@ -113,6 +128,11 @@ class AgentConfig(BaseModel):
     def state_path(self) -> Path:
         """`agent-state.json` рядом с рабочей папкой агента (§7.3)."""
         return self.work_path / AGENT_STATE_FILE_NAME
+
+    @property
+    def devices_path(self) -> Path:
+        """Копия списка оборудования подсети: `C:\\MagazAgent\\devices.json` (§7.6)."""
+        return self.work_path / AGENT_DEVICES_FILE_NAME
 
 
 def get_application_root() -> Path:
