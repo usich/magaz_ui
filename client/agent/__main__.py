@@ -5,16 +5,19 @@
     python -m client.agent --console                          # отладка в терминале
     python -m client.agent run --config C:\\MagazAgent\\agent-config.json
     python -m client.agent info                                # что прочитано из конфига
+    python -m client.agent install                              # служба Windows (Э6)
+    python -m client.agent start | stop | remove                # управление службой
 
-Команды службы (`install`/`remove`/`start`/`stop`/`debug`) появятся на этапе Э6
-вместе с pywin32-обёрткой, PyInstaller-спеком и `install_agent.bat` (§12) —
-до этого CLI честно сообщает, что команда ещё не реализована.
+Команды службы работают через `client/agent/service.py` (`pywin32`) и на
+сборочной машине регистрируются скриптом `deploy\\install_agent.bat` (§14.2).
+Без `pywin32` CLI печатает подсказку и возвращает код 3 — молча ничего не делает.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 from client.agent.app import create_agent_app
@@ -25,11 +28,12 @@ from client.agent.config import (
     load_config,
 )
 from client.agent.logging_setup import configure_logging
+from client.agent.service import run_service_command, service_available
 from shared.version import APP_VERSION
 
 logger = logging.getLogger(__name__)
 
-#: Команды, которые появляются на Э6 (управление службой Windows)
+#: Команды управления службой Windows (§7.1, Э6)
 SERVICE_COMMANDS = ("install", "remove", "start", "stop", "debug")
 MASK = "***"
 
@@ -57,6 +61,16 @@ def _build_parser() -> argparse.ArgumentParser:
     ):
         sub.add_parser(name, help=help_text)
     return parser
+
+
+def _cmd_service(command: str, argv: list[str] | None = None) -> int:
+    """Управление службой Windows; `--console` остаётся способом отладки (§7.5)."""
+    if not service_available():
+        print(
+            f"Команда {command!r} недоступна: это не Windows или не установлен pywin32 "
+            "(см. docs\\INSTALL.md). Для отладки используйте --console."
+        )
+    return run_service_command(command, argv)
 
 
 def _mask(value: str | None) -> str:
@@ -118,11 +132,7 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command or "run"
 
     if command in SERVICE_COMMANDS:
-        print(
-            f"Команда {command!r} появится на этапе Э6 (§12): "
-            "pywin32-служба + install_agent.bat"
-        )
-        return 3
+        return _cmd_service(command, [sys.argv[0], *sys.argv[2:]])
 
     try:
         config = load_config(args.config)

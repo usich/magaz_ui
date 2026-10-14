@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -20,10 +19,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from server.api import admins as admins_api
 from server.api import devices as devices_api
 from server.api import notifications as notifications_api
 from server.api import operations as operations_api
 from server.api import stores as stores_api
+from server.api.admins import AdminOut
 from server.config import API_PREFIX
 from server.core.context import AppContext
 from server.core.dependencies import get_client_ip, get_context, get_db, require_active_admin
@@ -57,22 +58,8 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class AdminOut(BaseModel):
-    """Администратор в API (хеш пароля наружу не уходит никогда)."""
-
-    id: int
-    username: str
-    is_active: bool
-    last_login_at: datetime | None = None
-
-    @classmethod
-    def from_model(cls, admin: AdminUser) -> "AdminOut":
-        return cls(
-            id=admin.id,
-            username=admin.username,
-            is_active=admin.is_active,
-            last_login_at=admin.last_login_at,
-        )
+#: `AdminOut` живёт в `server/api/admins.py` (Д-8): одна схема на вход и на
+#: управление администраторами — хеш пароля наружу не уходит ни в одном ответе.
 
 
 class SettingOut(BaseModel):
@@ -153,6 +140,9 @@ router.include_router(devices_api.router)
 #: Уведомления (Э5, ФН3): создание и рассылка, список, отчёт «X из Y» и CSV,
 #: отмена (§5.2.2, §11.5)
 router.include_router(notifications_api.router)
+#: Администраторы (Э6, Д-8): список, создание, смена пароля, блокировка,
+#: удаление (§5.2.2, §11.6)
+router.include_router(admins_api.router)
 
 
 # --- Вход/выход (§4.2, §8.1) ------------------------------------------------

@@ -12,6 +12,21 @@ export interface LoginPayload {
   password: string
 }
 
+/** Тело `POST /admin/admins` (Д-8, Э6): логин и пароль нового администратора. */
+export interface AdminCreatePayload {
+  username: string
+  password: string
+}
+
+/**
+ * Тело `PUT /admin/admins/{id}` (Д-8, Э6): смена пароля и/или блокировка.
+ * Оба поля необязательны, но хотя бы одно обязательно — сервер отвечает `422`.
+ */
+export interface AdminUpdatePayload {
+  password?: string
+  is_active?: boolean
+}
+
 export interface DatabaseInfo {
   kind: string
   schema_version: string | null

@@ -4,6 +4,8 @@ import { API_BASE, api } from './client'
 import type {
   ActionPayload,
   ActionResponse,
+  AdminCreatePayload,
+  AdminUpdatePayload,
   AdminUser,
   AuditEntry,
   BulkActionPayload,
@@ -79,6 +81,26 @@ export const auditApi = {
     const suffix = query.toString() ? `?${query}` : ''
     return api.get<AuditEntry[]>(`/admin/audit${suffix}`)
   },
+}
+
+/**
+ * Администраторы дашборда (`/api/v1/admin/admins`, Д-8, Э6).
+ *
+ * Хеш пароля не приходит ни в одном ответе: сервер отдаёт только `AdminUser`.
+ * Запреты («себя» и «последнего действующего» трогать нельзя) живут на сервере
+ * и приходят как `403`/`409` — UI показывает текст из ответа как есть.
+ */
+export const adminsApi = {
+  list: () => api.get<AdminUser[]>('/admin/admins'),
+
+  create: (payload: AdminCreatePayload) => api.post<AdminUser>('/admin/admins', payload),
+
+  /** Смена пароля и/или блокировка (`{is_active: false}`) — §11.6. */
+  update: (id: number, payload: AdminUpdatePayload) =>
+    api.put<AdminUser>(`/admin/admins/${id}`, payload),
+
+  /** Удаление учётной записи; история действий остаётся в аудите. */
+  remove: (id: number) => api.delete<{ ok: boolean }>(`/admin/admins/${id}`),
 }
 
 /**
