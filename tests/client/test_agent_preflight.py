@@ -338,7 +338,10 @@ class TestFullReportAndCli:
 
         printed = capsys.readouterr().out
         assert '"ok": true' in printed
-        assert "Версия MagazAgent" in printed
+        assert printed.isascii()  # JSON приложим к протоколу в любой кодировке
+
+        payload = json.loads(printed)  # экранированная кириллица читается обратно
+        assert any(item["check"] == "Версия MagazAgent" for item in payload["checks"])
 
     def test_cli_can_skip_server_check(
         self, tmp_path: Path, log_dir: Path, capsys: pytest.CaptureFixture[str]  # noqa: ARG002

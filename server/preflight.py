@@ -332,10 +332,12 @@ def render_preflight(report: PreflightReport, *, as_json: bool = False) -> str:
     """Вывод отчёта: обычный текст для консоли или JSON для протокола.
 
     Текстовый вывод проходит через `console_safe`: отчёт печатают и в `cmd` на
-    кассе, где кодировка cp1251 (§14.2).
+    кассе, где кодировка cp1251 (§14.2). JSON наоборот выводится **ASCII-экранированным**
+    (`\\uXXXX`): при `preflight --json > file` перенаправленный `stdout` на русском
+    Windows пишет cp1251, и такой файл не прочитает ни один потребитель, ждущий UTF-8.
     """
     if as_json:
-        return json.dumps(report.as_dict(), ensure_ascii=False, indent=2)
+        return json.dumps(report.as_dict(), indent=2)
     return console_safe(report.render())
 
 

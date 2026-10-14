@@ -272,10 +272,15 @@ class TestRunPreflight:
         import json
 
         report = run_preflight(settings.model_copy(update={"port": 0}), db_manager)
-        payload = json.loads(render_preflight(report, as_json=True))
+        printed = render_preflight(report, as_json=True)
+        # ASCII-экранирование: файл протокола должен читаться независимо от кодировки
+        # перенаправленного `stdout` (на русском Windows это cp1251)
+        assert printed.isascii()
+        payload = json.loads(printed)
         assert payload["title"].startswith("Предполётная проверка сервера")
         assert payload["counts"]["fail"] >= 1
         assert len(payload["checks"]) == len(EXPECTED_CHECK_NAMES)
+        assert payload["checks"][0]["check"] == EXPECTED_CHECK_NAMES[0]
 
     def test_text_rendering_lists_hints(
         self,
@@ -323,7 +328,9 @@ class TestServerCli:
 
         code = server_cli.main(["preflight", "--json"])
 
-        payload = json.loads(capsys.readouterr().out)
+        printed = capsys.readouterr().out
+        assert printed.isascii()  # JSON для протокола — без зависимости от cp1251
+        payload = json.loads(printed)
         assert code == 1  # нет администратора и собранного интерфейса
         assert payload["ok"] is False
         assert len(payload["checks"]) == len(EXPECTED_CHECK_NAMES)
