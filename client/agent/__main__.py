@@ -39,22 +39,58 @@ SERVICE_COMMANDS = ("install", "remove", "start", "stop", "debug")
 MASK = "***"
 
 
+def _add_common_options(parser: argparse.ArgumentParser, *, after_subcommand: bool) -> None:
+    """Общие ключи агента — одни и те же до подкоманды и после неё (§7.1).
+
+    Живой прогон Э7 показал дефект: `python -m client.agent run --config <файл>`
+    падал с «unrecognized arguments», потому что ключи жили только на верхнем
+    парсере, а в примерах документации и в инструкции для кассы написано именно
+    «после подкоманды». `argument_default=SUPPRESS` у копии для подкоманды не даёт
+    ей перезаписать значение, уже разобранное верхним уровнем.
+    """
+
+    def default(value: object) -> object:
+        return argparse.SUPPRESS if after_subcommand else value
+
+    parser.add_argument(
+        "--config", default=default(None), help=f"путь к {AGENT_CONFIG_FILE_NAME} (§7.2)"
+    )
+    parser.add_argument(
+        "--console", action="store_true", default=default(False), help="отладка: лог в терминал"
+    )
+    parser.add_argument(
+        "--log-level", default=default("INFO"), help="уровень логирования (INFO)"
+    )
+    parser.add_argument(
+        "--host", default=default("0.0.0.0"), help="адрес прослушивания (0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=default(None), help="порт (по умолчанию — из конфига, 8383)"
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
+    commons = argparse.ArgumentParser(add_help=False)
+    _add_common_options(commons, after_subcommand=False)
     parser = argparse.ArgumentParser(
-        prog="python -m client.agent", description="Агент Magaz UI (касса)"
+        prog="python -m client.agent",
+        description="Агент Magaz UI (касса)",
+        parents=[commons],
     )
     parser.add_argument("--version", action="version", version=f"MagazAgent {APP_VERSION}")
-    parser.add_argument("--config", help=f"путь к {AGENT_CONFIG_FILE_NAME} (§7.2)")
-    parser.add_argument("--console", action="store_true", help="отладка: лог в терминал")
-    parser.add_argument("--log-level", default="INFO", help="уровень логирования (INFO)")
-    parser.add_argument("--host", default="0.0.0.0", help="адрес прослушивания (0.0.0.0)")
-    parser.add_argument("--port", type=int, help="порт (по умолчанию — из конфига, 8383)")
 
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("run", help="запустить агент (uvicorn)")
-    sub.add_parser("info", help="показать, что прочитано из конфига")
+    # `--config` и прочие ключи принимаются и после подкоманды: так их пишут в
+    # примерах и в инструкции для кассы, поэтому копия тех же ключей есть у каждой
+    uses_common = argparse.ArgumentParser(add_help=False)
+    _add_common_options(uses_common, after_subcommand=True)
 
-    preflight = sub.add_parser("preflight", help="проверить готовность кассы к приёмке (Э7)")
+    sub.add_parser("run", parents=[uses_common], help="запустить агент (uvicorn)")
+    sub.add_parser("info", parents=[uses_common], help="показать, что прочитано из конфига")
+
+    preflight = sub.add_parser(
+        "preflight", parents=[uses_common], help="проверить готовность кассы к приёмке (Э7)"
+    )
     preflight.add_argument("--json", action="store_true", help="отчёт в JSON — для протокола")
     preflight.add_argument(
         "--no-server", action="store_true", help="не проверять доступность сервера"
@@ -66,7 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ("stop", "остановить службу (Э6)"),
         ("debug", "отладка службы (Э6)"),
     ):
-        sub.add_parser(name, help=help_text)
+        sub.add_parser(name, parents=[uses_common], help=help_text)
     return parser
 
 

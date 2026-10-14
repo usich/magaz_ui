@@ -15,7 +15,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 import httpx
 import pytest
@@ -520,3 +523,72 @@ class TestTrayCli:
         assert args.agent_url.startswith("http://127.0.0.1")
         assert args.interval == tray_main.DEFAULT_INTERVAL_SEC
         assert args.console is False
+
+
+#: Прокси, которого нет: если httpx послушает окружение, запрос к кассе уйдёт сюда
+BROKEN_PROXY = "http://127.0.0.1:9"
+
+
+class _StubAgent(BaseHTTPRequestHandler):
+    """Мини-служба агента: отвечает «уведомлений нет» (как `stub_agent` у сервера)."""
+
+    def do_GET(self) -> None:  # noqa: N802 - имя задано базовым классом
+        payload = json.dumps({"notifications": []}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args: object) -> None:
+        """Молча: вывод тестов не засоряем."""
+
+
+@pytest.fixture()
+def stub_agent_url() -> Iterator[str]:
+    """Адрес живой мини-службы на `127.0.0.1` со свободным портом."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _StubAgent)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class TestProxyIsIgnored:
+    """Трей ходит на `127.0.0.1` в обход системного прокси.
+
+    Живой прогон Э7: на машине с системным прокси httpx отвечал `503` от прокси, и
+    уведомления до кассы не доходили (служба при этом была жива). Это та же ловушка,
+    что закрыта в `AgentClient`, — `trust_env=False` обязателен и здесь. Проверка
+    идёт против настоящей службы на сокете: с `httpx.MockTransport` прокси не
+    участвует и дефект не воспроизводится.
+    """
+
+    def test_client_is_created_without_env_proxy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict = {}
+        real_client = httpx.Client
+
+        def fake_client(*args: object, **kwargs: object) -> httpx.Client:
+            captured.update(kwargs)
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr("client.tray.api.httpx.Client", fake_client)
+
+        TrayAgentClient()
+
+        assert captured["trust_env"] is False
+        assert str(captured["base_url"]).startswith("http://127.0.0.1")
+
+    def test_request_goes_directly_to_agent(
+        self, stub_agent_url: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HTTP_PROXY", BROKEN_PROXY)
+        monkeypatch.setenv("HTTPS_PROXY", BROKEN_PROXY)
+        monkeypatch.setenv("ALL_PROXY", BROKEN_PROXY)
+
+        client = TrayAgentClient(base_url=stub_agent_url, timeout_sec=3.0)
+
+        assert client.pending(SessionRef(session_id="1", session_user="dev")) == []

@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from client.agent import service
+from client.agent import __main__ as agent_cli
 from client.agent.__main__ import main as agent_main
 
 #: Корень репозитория — ищем в нём `deploy\` со скриптами и специями
@@ -139,3 +140,53 @@ class TestDeployContract:
         for expected in ("magaz-agent.exe", "MagazTrayAgent.exe", "install_agent.bat", "agent-config.json"):
             assert expected in note, f"в памятке нет {expected}"
         assert "tray.log" in note, "в памятке должно быть, где искать логи трея"
+
+
+class TestAgentCliOptions:
+    """Общие ключи CLI агента работают и до, и после подкоманды (§7.1).
+
+    Живой прогон Э7 показал дефект: `python -m client.agent run --config <файл>`
+    падал с «unrecognized arguments: --config ...». Именно так записаны примеры в
+    документации и инструкция для кассы, поэтому ключи должны приниматься в обоих
+    положениях, а значения из верхнего уровня — не затираться подкомандой.
+    """
+
+    def test_options_after_subcommand(self) -> None:
+        args = agent_cli._build_parser().parse_args(
+            ["run", "--config", "C:/MagazAgent/agent-config.json", "--console", "--host", "127.0.0.1"]
+        )
+
+        assert args.command == "run"
+        assert args.config == "C:/MagazAgent/agent-config.json"
+        assert args.console is True
+        assert args.host == "127.0.0.1"
+        assert args.log_level == "INFO"
+
+    def test_options_before_subcommand(self) -> None:
+        args = agent_cli._build_parser().parse_args(["--config", "x.json", "info"])
+
+        assert args.command == "info"
+        assert args.config == "x.json"
+        assert args.console is False
+        assert args.host == "0.0.0.0"
+
+    def test_subcommand_does_not_reset_earlier_values(self) -> None:
+        """Иначе значение из верхнего уровня затиралось бы значением по умолчанию."""
+        args = agent_cli._build_parser().parse_args(["--port", "9000", "run", "--host", "127.0.0.1"])
+
+        assert args.port == 9000
+        assert args.host == "127.0.0.1"
+
+    def test_plain_command_keeps_defaults(self) -> None:
+        args = agent_cli._build_parser().parse_args(["preflight", "--no-server"])
+
+        assert args.command == "preflight"
+        assert args.no_server is True
+        assert args.config is None
+        assert args.port is None
+
+    def test_service_commands_accept_common_options(self) -> None:
+        args = agent_cli._build_parser().parse_args(["install", "--config", "x.json"])
+
+        assert args.command == "install"
+        assert args.config == "x.json"

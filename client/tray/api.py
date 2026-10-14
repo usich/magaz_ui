@@ -45,7 +45,15 @@ class TrayAgentClient:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._client = httpx.Client(
-            base_url=self.base_url, timeout=timeout_sec, transport=transport
+            base_url=self.base_url,
+            timeout=timeout_sec,
+            transport=transport,
+            # Прокси не должен вмешиваться: трей ходит только на 127.0.0.1, а httpx
+            # по умолчанию берёт прокси из окружения и настроек ОС. Живой прогон Э7
+            # показал, что на машине с системным прокси локальный запрос получал
+            # `503` от прокси и уведомления до кассы не доходили — та же ловушка,
+            # что закрыта в `AgentClient` (см. `TestProxyIsIgnored`)
+            trust_env=False,
         )
 
     # --- Чтение -------------------------------------------------------------
