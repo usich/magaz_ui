@@ -1,8 +1,8 @@
 /**
- * Тесты страницы «Магазины» (Э2, §11.2).
+ * Тесты страницы «Магазины» (Э2/Э8, §11.2).
  *
  * PrimeVue-компоненты подменяются лёгкими заглушками: проверяем логику страницы
- * (список, фильтры, создание магазина и блок конфига агента), а не тему
+ * (список, фильтры, создание и правка магазина, блок конфига агента), а не тему
  * оформления. Сеть — `fetch`-мок.
  */
 
@@ -129,7 +129,7 @@ describe('страница «Магазины»', () => {
     wrapper.unmount()
   })
 
-  it('создание магазина отправляет данные и показывает блок конфига агента', async () => {
+  it('создание магазина отправляет данные и открывает конфиг агента', async () => {
     const created = {
       ...makeStore({ id: 7, name: 'Магазин №7' }),
       agent_config: {
@@ -142,9 +142,11 @@ describe('страница «Магазины»', () => {
         notes: ['Пароль 1С в конфиг не вписывается'],
       },
     }
-    fetchMock.mockImplementation(async (_url: string, init: RequestInit) =>
-      init?.method === 'POST' ? jsonResponse(created) : jsonResponse([makeStore()]),
-    )
+    // После создания диалог конфига читает `GET /stores/{id}/agent-config` (§11.2)
+    fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      if (url.endsWith('/agent-config')) return jsonResponse(created.agent_config)
+      return init?.method === 'POST' ? jsonResponse(created) : jsonResponse([makeStore()])
+    })
 
     const wrapper = await mountStores(fetchMock)
     await wrapper.find('[data-test="add-store"]').trigger('click')
@@ -204,6 +206,77 @@ describe('страница «Магазины»', () => {
 
     expect(wrapper.find('[data-test="new-token"]').text()).toContain('rotated-token')
     expect(wrapper.text()).toContain('перенастройте агент')
+    wrapper.unmount()
+  })
+
+  it('правка отправляет все реквизиты, а пароль — отдельным запросом (Э8)', async () => {
+    const calls: { url: string; method: string; body: unknown }[] = []
+    fetchMock.mockImplementation(async (url: string, init: RequestInit = {}) => {
+      calls.push({ url, method: init.method ?? 'GET', body: init.body })
+      if (url.endsWith('/credentials')) {
+        return jsonResponse(makeStore({ password_set: true }))
+      }
+      if (init.method === 'PUT') {
+        return jsonResponse(makeStore({ name: 'Магазин №5 (новый)', is_active: false }))
+      }
+      return jsonResponse([makeStore()])
+    })
+
+    const wrapper = await mountStores(fetchMock)
+    const editButton = wrapper.findAll('button').find((item) => item.text() === 'Правка')
+    await editButton?.trigger('click')
+
+    await wrapper.find('[data-test="form-name"]').setValue('Магазин №5 (новый)')
+    await wrapper.find('[data-test="form-password"]').setValue('Секрет1С')
+    await wrapper.find('[data-test="form-active"]').setValue(false)
+    await wrapper.find('[data-test="save-store"]').trigger('click')
+    await flushPromises()
+
+    const put = calls.find((call) => call.method === 'PUT')
+    expect(put, 'реквизиты уходят одним PUT /stores/{id}').toBeTruthy()
+    const payload = JSON.parse(String(put?.body)) as Record<string, unknown>
+    expect(payload.name).toBe('Магазин №5 (новый)')
+    expect(payload.user_name_1c).toBe('Администратор')
+    expect(payload.is_active).toBe(false)
+    expect(payload.password, 'П-1: пароль идёт не через PUT /stores/{id}').toBeUndefined()
+
+    const credentials = calls.find((call) => call.url.endsWith('/credentials'))
+    expect(credentials, 'пароль уходит через PUT /stores/{id}/credentials').toBeTruthy()
+    expect(JSON.parse(String(credentials?.body))).toEqual({ password: 'Секрет1С' })
+    wrapper.unmount()
+  })
+
+  it('кнопка «Конфиг» показывает agent-config.json магазина и скачивает файл (Э8)', async () => {
+    const agentConfig = {
+      store_id: 1,
+      server_url: 'http://10.10.0.1:8080',
+      port: 8383,
+      agent_token: 'store-token',
+      config_path: 'C:\\MagazAgent\\agent-config.json',
+      config_json: { store_id: 1, agent_token: 'store-token', port: 8383 },
+      notes: ['Файл положить рядом с exe агента'],
+    }
+    fetchMock.mockImplementation(async (url: string) =>
+      url.endsWith('/agent-config') ? jsonResponse(agentConfig) : jsonResponse([makeStore()]),
+    )
+    const createObjectURL = vi.fn((_blob: Blob) => 'blob:config')
+    Object.defineProperty(URL, 'createObjectURL', { writable: true, value: createObjectURL })
+    Object.defineProperty(URL, 'revokeObjectURL', { writable: true, value: vi.fn() })
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+
+    const wrapper = await mountStores(fetchMock)
+    await wrapper.find('[data-test="open-config"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="agent-config-json"]').text()).toContain('store-token')
+    expect(wrapper.text()).toContain('Файл положить рядом с exe агента')
+
+    await wrapper.find('[data-test="download-config"]').trigger('click')
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    const blob = createObjectURL.mock.calls[0][0]
+    expect(blob).toBeInstanceOf(Blob)
+    expect(await blob.text()).toContain('store-token')
+    expect(anchorClick, 'файл отдаётся через ссылку <a download>').toHaveBeenCalled()
     wrapper.unmount()
   })
 })

@@ -18,8 +18,10 @@ import { useToast } from 'primevue/usetoast'
 
 import { ApiError } from '@/api/client'
 import type { StoreHealth } from '@/api/types'
+import AgentConfigDialog from '@/components/AgentConfigDialog.vue'
 import OperationPanel from '@/components/OperationPanel.vue'
 import StoreDevicesPanel from '@/components/StoreDevicesPanel.vue'
+import StoreFormDialog from '@/components/StoreFormDialog.vue'
 import { JOB_KIND_LABELS, JOB_STATUS_LABELS, jobStatusSeverity, useJobsStore } from '@/stores/jobs'
 import { useStoresStore } from '@/stores/stores'
 
@@ -40,6 +42,10 @@ const isSavingCredentials = ref(false)
 
 const tokenResult = ref<{ store_id: number; agent_token: string; warning: string } | null>(null)
 const isTokenOpen = ref(false)
+
+/** Правка реквизитов и конфиг агента: те же компоненты, что и на странице `/stores` */
+const isFormOpen = ref(false)
+const isConfigOpen = ref(false)
 
 const isBusy = computed(() => Boolean(health.value?.busy.merge || health.value?.busy.update))
 
@@ -127,6 +133,12 @@ async function rotateToken(): Promise<void> {
   }
 }
 
+/** Реквизиты сохранены: карточка берёт их из списка, поэтому перечитываем список. */
+async function handleSaved(): Promise<void> {
+  await stores.load()
+  credentials.user_name_1c = store.value?.user_name_1c ?? credentials.user_name_1c
+}
+
 function formatTime(value: string | null | undefined): string {
   if (!value) return '—'
   const date = new Date(value)
@@ -152,6 +164,22 @@ function formatTime(value: string | null | undefined): string {
       <Tag v-if="store && !store.is_active" value="отключён" severity="secondary" />
 
       <div class="ml-auto flex gap-2">
+        <Button
+          label="Правка"
+          icon="pi pi-pencil"
+          size="small"
+          text
+          data-test="edit-store"
+          @click="isFormOpen = true"
+        />
+        <Button
+          label="Конфиг агента"
+          icon="pi pi-file"
+          size="small"
+          text
+          data-test="open-config"
+          @click="isConfigOpen = true"
+        />
         <Button
           label="Проверить сейчас"
           icon="pi pi-bolt"
@@ -441,5 +469,18 @@ function formatTime(value: string | null | undefined): string {
         <Button label="Готово" size="small" @click="isTokenOpen = false" />
       </template>
     </Dialog>
+
+    <!-- Реквизиты магазина (§11.2) и конфиг агента: те же компоненты, что на /stores -->
+    <StoreFormDialog
+      v-model:visible="isFormOpen"
+      :store="store ?? null"
+      @saved="handleSaved"
+    />
+
+    <AgentConfigDialog
+      v-model:visible="isConfigOpen"
+      :store-id="storeId"
+      :store-name="store?.name ?? null"
+    />
   </div>
 </template>

@@ -10,6 +10,7 @@ import Toast from 'primevue/toast'
 
 import { useAuthStore } from '@/stores/auth'
 import { useSystemStore } from '@/stores/system'
+import { THEME_MODE_LABELS, type ThemeMode, useThemeStore } from '@/stores/theme'
 
 interface NavItem {
   label: string
@@ -31,19 +32,31 @@ const navItems: NavItem[] = [
 
 const auth = useAuthStore()
 const system = useSystemStore()
+const theme = useThemeStore()
 const router = useRouter()
 const route = useRoute()
 
 const serverVersion = computed(() => system.info?.app_version ?? '—')
 const isSpaBuilt = computed(() => system.isSpaBuilt)
 const currentTitle = computed(() => route.meta.title ?? 'Magaz UI')
+const themeModes = Object.entries(THEME_MODE_LABELS) as [ThemeMode, string][]
+
+/** Режим темы для `<select>`: выбор применяется сразу (§11.1, Э8). */
+const themeMode = computed({
+  get: () => theme.mode,
+  set: (value: ThemeMode) => theme.setMode(value),
+})
 
 onMounted(() => {
   system.startPolling()
+  // Тема уже применена в `main.ts`; здесь подписка на настройку ОС остаётся
+  // живой, пока открыта оболочка дашборда
+  theme.initialize()
 })
 
 onUnmounted(() => {
   system.stopPolling()
+  theme.dispose()
 })
 
 async function handleLogout(): Promise<void> {
@@ -111,6 +124,21 @@ async function handleLogout(): Promise<void> {
         </div>
 
         <div class="flex items-center gap-4">
+          <label
+            class="magaz-muted flex items-center gap-2 text-xs"
+            title="Тема оформления дашборда (§11.1)"
+          >
+            <i :class="theme.isDark ? 'pi pi-moon' : 'pi pi-sun'" />
+            <select
+              v-model="themeMode"
+              class="rounded-lg border border-slate-300 px-2 py-1 text-xs"
+              data-test="theme-mode"
+            >
+              <option v-for="[value, label] in themeModes" :key="value" :value="value">
+                {{ label }}
+              </option>
+            </select>
+          </label>
           <span class="text-sm text-slate-600">{{ auth.user?.username ?? '—' }}</span>
           <Button
             label="Выйти"

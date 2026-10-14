@@ -188,6 +188,43 @@ class TestDeactivate:
         assert store.is_active is False
 
 
+class TestReuseAfterDeactivate:
+    """Мягкое удаление освобождает имя и IP магазина (§4.1, §5.2.2).
+
+    «Отключить магазин» — это `is_active=false`, но переиспользовать его имя и IP
+    раньше было нельзя: колонки были UNIQUE по всей таблице, а проверка сервиса
+    сравнивала новую запись со всеми строками, включая отключённые.
+    """
+
+    def test_ip_and_name_free_after_deactivate(self, session: Session, store: Store) -> None:
+        store_service.deactivate_store(session, store)
+        session.commit()
+
+        fresh = make_store(session, name=store.name, ip_address=store.ip_address)
+        session.commit()
+
+        assert fresh.id != store.id, "старая запись остаётся в истории (§5.2.2)"
+        assert fresh.is_active is True
+        assert store.is_active is False
+
+    def test_duplicate_ip_of_active_store_still_rejected(self, session: Session) -> None:
+        make_store(session)
+        with pytest.raises(store_service.StoreValidationError, match="IP"):
+            make_store(session, name="Магазин №9", ip_address="10.10.7.7")
+
+    def test_reactivate_conflicts_with_active_store(self, session: Session, store: Store) -> None:
+        store_service.deactivate_store(session, store)
+        session.commit()
+        replacement = make_store(session, name=store.name, ip_address=store.ip_address)
+        session.commit()
+
+        with pytest.raises(store_service.StoreValidationError, match="уже существует"):
+            store_service.update_store(session, store, is_active=True)
+
+        assert store.is_active is False, "отказ не должен менять запись"
+        assert replacement.is_active is True
+
+
 class TestListing:
     """Фильтры страницы `/stores` (§11.2)."""
 

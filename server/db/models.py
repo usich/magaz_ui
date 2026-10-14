@@ -25,11 +25,13 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
     true,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -73,9 +75,28 @@ class Store(TimestampMixin, Base):
 
     __tablename__ = "stores"
 
+    # Имя и IP уникальны **только среди активных** магазинов (§4.1 + §5.2.2):
+    # «Отключить магазин» — мягкое удаление, и оно освобождает и имя, и IP, чтобы
+    # кассу можно было завести заново (переустановка, смена стенда). Правило
+    # продублировано в `store_service._ensure_unique` — там текст ошибки для UI.
+    __table_args__ = (
+        Index(
+            "uq_stores_name_active",
+            "name",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+        ),
+        Index(
+            "uq_stores_ip_address_active",
+            "ip_address",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+        ),
+    )
+
     id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, index=True)
-    ip_address: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    ip_address: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     agent_port: Mapped[int] = mapped_column(Integer, default=8383, server_default="8383", nullable=False)
 
     # «Имя кластера» из ТЗ = адрес сервера 1С → /S{cluster_name}\{database_name} (Q2)

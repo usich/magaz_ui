@@ -84,6 +84,26 @@ class TestStoreDefaults:
             make_store(session, name="Магазин №2", ip_address="10.10.1.10", agent_token="token-3")
         session.rollback()
 
+    def test_unique_name_and_ip_only_among_active(self, session: Session) -> None:
+        """Отключённый магазин не занимает имя и IP — частичные уникальные индексы.
+
+        §4.1 + §5.2.2: «Отключить магазин» — мягкое удаление, поэтому после него
+        кассу можно завести заново с тем же именем и IP (дефект Э8).
+        """
+        first = make_store(session)
+        first.is_active = False
+        session.commit()
+
+        second = make_store(session, agent_token="token-2")
+        session.commit()
+
+        assert second.id != first.id
+        assert second.is_active is True
+
+        with pytest.raises(IntegrityError):
+            make_store(session, agent_token="token-3")
+        session.rollback()
+
     def test_unique_agent_token(self, session: Session) -> None:
         make_store(session)
         with pytest.raises(IntegrityError):

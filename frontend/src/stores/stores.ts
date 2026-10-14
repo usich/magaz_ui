@@ -13,6 +13,7 @@ import { computed, ref } from 'vue'
 import { ApiError } from '@/api/client'
 import { storesApi } from '@/api/endpoints'
 import type {
+  AgentConfigBlock,
   StoreCreatePayload,
   StoreCreated,
   StoreHealth,
@@ -25,6 +26,12 @@ import type {
 
 /** Период автообновления списка магазинов (§11.1: ~10 с) */
 export const STORES_POLL_INTERVAL_MS = 10_000
+
+/** Порт агента по умолчанию — тот же, что в §4.1 и в шаблоне конфига (§7.2) */
+export const DEFAULT_AGENT_PORT = 8383
+
+/** Имя файла конфига агента (§7.2): его собирает сервер и скачивает дашборд */
+export const AGENT_CONFIG_FILE_NAME = 'agent-config.json'
 
 export const useStoresStore = defineStore('stores', () => {
   const items = ref<StoreItem[]>([])
@@ -107,6 +114,16 @@ export const useStoresStore = defineStore('stores', () => {
     return storesApi.rotateToken(id)
   }
 
+  /**
+   * Конфиг агента магазина (§11.2): тот же блок, что и в ответе на создание.
+   *
+   * Читается по требованию, а не хранится в списке: токен — секрет, и держать
+   * его в общем кэше страницы незачем.
+   */
+  async function loadAgentConfig(id: number): Promise<AgentConfigBlock> {
+    return storesApi.agentConfig(id)
+  }
+
   /** «Проверить сейчас» (Д-3): живой `GET /health` + перечитка карточки. */
   async function checkHealth(id: number): Promise<StoreHealth> {
     const health = await storesApi.check(id)
@@ -160,6 +177,7 @@ export const useStoresStore = defineStore('stores', () => {
     update,
     remove,
     rotateToken,
+    loadAgentConfig,
     checkHealth,
     setCredentials,
     startPolling,

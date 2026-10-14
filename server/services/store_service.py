@@ -12,6 +12,7 @@ import logging
 from datetime import datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from server.core.security import SecretBox, generate_agent_token
@@ -89,7 +90,13 @@ def _ensure_unique(
     ip_address: str | None = None,
     exclude_id: int | None = None,
 ) -> None:
-    """Проверить уникальность имени и IP (§4.1: обе колонки UNIQUE).
+    """Проверить уникальность имени и IP **среди активных** магазинов (§4.1, §5.2.2).
+
+    Отключённый магазин (`is_active=false`) не занимает ни имя, ни IP: «Отключить» —
+    мягкое удаление (§5.2.2), поэтому кассу можно завести заново, не теряя историю
+    задач и уведомлений по старой записи. То же правило закреплено в БД частичными
+    уникальными индексами `uq_stores_name_active` / `uq_stores_ip_address_active`
+    (`server/db/models.py`).
 
     Сравнение имён идёт в Python (`str.casefold`), а не через SQL `lower()`:
     SQLite приводит регистр только для латиницы, поэтому «Магазин №5» и
@@ -97,19 +104,41 @@ def _ensure_unique(
     """
     if name:
         wanted = name.strip().casefold()
-        rows = session.execute(select(Store.id, Store.name)).all()
-        for row_id, row_name in rows:
+        stmt = select(Store.id, Store.name).where(Store.is_active.is_(True))
+        for row_id, row_name in session.execute(stmt).all():
             if row_id == exclude_id:
                 continue
             if (row_name or "").strip().casefold() == wanted:
-                raise StoreValidationError(f"Магазин с именем {name!r} уже существует")
+                raise StoreValidationError(
+                    f"Магазин с именем {name!r} уже существует (занято активным магазином)"
+                )
 
     if ip_address:
-        stmt = select(Store.id).where(Store.ip_address == ip_address)
+        stmt = select(Store.id).where(
+            Store.ip_address == ip_address, Store.is_active.is_(True)
+        )
         if exclude_id is not None:
             stmt = stmt.where(Store.id != exclude_id)
         if session.scalars(stmt).first() is not None:
-            raise StoreValidationError(f"Магазин с IP {ip_address} уже существует")
+            raise StoreValidationError(
+                f"Магазин с IP {ip_address} уже существует (занят активным магазином)"
+            )
+
+
+def _flush_or_conflict(session: Session) -> None:
+    """`flush` с понятной ошибкой, если уникальность всё-таки нарушена в БД.
+
+    Обычный путь закрыт проверками `_ensure_unique`; сюда попадаем при гонке двух
+    администраторов — тогда срабатывает частичный уникальный индекс, и вместо `500`
+    администратор видит тот же понятный текст, что и при обычной проверке.
+    """
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        session.rollback()
+        raise StoreValidationError(
+            "Имя или IP уже заняты активным магазином — обновите список и повторите"
+        ) from exc
 
 
 def get_store(session: Session, store_id: int) -> Store:
@@ -163,7 +192,7 @@ def create_store(
         store.password_enc = secret_box.encrypt(password)
 
     session.add(store)
-    session.flush()
+    _flush_or_conflict(session)
     logger.info("Создан магазин id=%s (%s, %s)", store.id, store.name, store.ip_address)
     return store
 
@@ -208,6 +237,16 @@ def update_store(
     if comment is not None:
         store.comment = comment.strip() or None
     if is_active is not None:
+        if is_active and not store.is_active:
+            # Включение обратно (§5.2.2): пока магазин был отключён, его имя или IP
+            # мог занять другой активный магазин. Проверяем **до** записи, чтобы при
+            # отказе (`422`) запись магазина осталась нетронутой — неактивной.
+            _ensure_unique(
+                session,
+                name=store.name,
+                ip_address=store.ip_address,
+                exclude_id=store.id,
+            )
         store.is_active = bool(is_active)
 
     if user_name_1c is not None:
@@ -216,7 +255,7 @@ def update_store(
             store.user_name_1c = normalized_user
             store.credentials_version += 1
 
-    session.flush()
+    _flush_or_conflict(session)
     return store
 
 
@@ -269,7 +308,12 @@ def rotate_agent_token(session: Session, store: Store) -> str:
 def deactivate_store(
     session: Session, store: Store, *, comment: str | None = None
 ) -> Store:
-    """Мягкое удаление (§5.2.2): `is_active=false` — исключение из мониторинга."""
+    """Мягкое удаление (§5.2.2): `is_active=false` — исключение из мониторинга.
+
+    Имя и IP при этом освобождаются: уникальность считается только среди активных
+    магазинов (§4.1), поэтому кассу можно завести заново — история задач и
+    уведомлений остаётся у этой записи.
+    """
     store.is_active = False
     if comment:
         store.comment = comment.strip() or store.comment

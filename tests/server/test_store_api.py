@@ -58,6 +58,7 @@ class TestStoreApiAuth:
         assert client.post(f"{STORES_URL}/{store.id}/token/rotate").status_code == 401
         assert client.put(f"{STORES_URL}/{store.id}/credentials", json={}).status_code == 401
         assert client.post(f"{STORES_URL}/{store.id}/check").status_code == 401
+        assert client.get(f"{STORES_URL}/{store.id}/agent-config").status_code == 401
 
 
 class TestStoreCrud:
@@ -111,6 +112,66 @@ class TestStoreCrud:
         assert body["cluster_name"] == "srv-1c"
         assert "agent_token" not in body
         assert "password_enc" not in body
+
+    def test_agent_config_available_at_any_time(
+        self, auth_client: TestClient, admin, store  # noqa: ANN001, ARG002
+    ) -> None:
+        """Конфиг агента перечитывается в любой момент, а не только при создании (§11.2).
+
+        Токен здесь отдаётся: это тот же блок, что и в ответе на создание, а роут
+        закрыт сессией администратора (`require_active_admin`).
+        """
+        response = auth_client.get(f"{STORES_URL}/{store.id}/agent-config")
+        config = response.json()
+
+        assert response.status_code == 200
+        assert config["store_id"] == store.id
+        assert config["agent_token"] == store.agent_token
+        assert config["port"] == store.agent_port
+        assert config["config_path"].endswith("agent-config.json")
+        assert config["server_url"].startswith("http")
+        assert config["config_json"]["store_id"] == store.id
+        assert config["config_json"]["store_name"] == store.name
+        assert config["config_json"]["agent_token"] == store.agent_token
+        assert config["config_json"]["one_c_profile"]["user_name"] == store.user_name_1c
+        assert config["config_json"]["one_c_profile"]["password_enc"] is None, "П-1"
+        assert config["notes"], "подсказки по установке остаются в блоке"
+
+    def test_agent_config_of_unknown_store_is_404(
+        self, auth_client: TestClient, admin  # noqa: ANN001, ARG002
+    ) -> None:
+        assert auth_client.get(f"{STORES_URL}/4242/agent-config").status_code == 404
+
+    def test_recreate_after_deactivate_reuses_ip_and_name(
+        self, auth_client: TestClient, admin  # noqa: ANN001, ARG002
+    ) -> None:
+        """Отключённый магазин не занимает имя и IP (§5.2.2, дефект Э8)."""
+        first = auth_client.post(STORES_URL, json=CREATE_PAYLOAD).json()
+        assert auth_client.delete(f"{STORES_URL}/{first['id']}").status_code == 200
+
+        again = auth_client.post(STORES_URL, json=CREATE_PAYLOAD)
+
+        assert again.status_code == 200, again.text
+        body = again.json()
+        assert body["id"] != first["id"], "создаётся новая запись, история прежней цела"
+        assert body["ip_address"] == CREATE_PAYLOAD["ip_address"]
+        assert body["name"] == CREATE_PAYLOAD["name"]
+        assert body["is_active"] is True
+
+    def test_reactivate_with_taken_ip_is_422(
+        self, auth_client: TestClient, admin  # noqa: ANN001, ARG002
+    ) -> None:
+        """Включить обратно магазин, чьи имя/IP занял активный, — понятная `422`."""
+        first = auth_client.post(STORES_URL, json=CREATE_PAYLOAD).json()
+        auth_client.delete(f"{STORES_URL}/{first['id']}")
+        second = auth_client.post(STORES_URL, json=CREATE_PAYLOAD).json()
+
+        response = auth_client.put(f"{STORES_URL}/{first['id']}", json={"is_active": True})
+
+        assert response.status_code == 422
+        assert "уже существует" in response.text
+        assert auth_client.get(f"{STORES_URL}/{first['id']}").json()["is_active"] is False
+        assert auth_client.get(f"{STORES_URL}/{second['id']}").json()["is_active"] is True
 
     def test_update_changes_fields_and_writes_audit(
         self, auth_client: TestClient, admin, store, engine: Engine  # noqa: ANN001

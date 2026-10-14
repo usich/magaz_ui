@@ -115,8 +115,8 @@ DoD (§12): `pytest` проходит; `npm run build` собирает SPA; с�
   синглтон `get_settings()`; импорт модуля без сайд-эффектов (I-10).
 - `server/db/models.py` — все таблицы §4, включая `store_devices` (Д-1) и
   `stores.devices_version` (Д-2), шифруемое поле пароля 1С (`stores.password_enc`).
-- Alembic (`server/migrations/`, `alembic.ini`): ревизия `d9a388454dc8_initial_schema`.
-  Проверка «модели == схема» (`alembic revision --autogenerate` даёт пустую ревизию) —
+- Alembic (`server/migrations/`, `alembic.ini`): ревизии `d9a388454dc8_initial_schema` → `c4f7a1b95e20_stores_unique_active` (head, Э8).
+  Проверка «модели == схема» (`alembic check` / `alembic revision --autogenerate` даёт пустую ревизию) —
   расхождений нет.
 - `server/api/admin.py` — сессии администратора (`/admin/auth/login|logout|me`),
   `/admin/system/info`, CRUD настроек `/admin/settings`, аудит `/admin/audit`;
@@ -939,6 +939,46 @@ MagazAgent.exe preflight --json > preflight-store-5.json   # на кассе
   на чистую Windows, старт после перезагрузки, `magaz-agent.exe --console` как диагностика.
 
 Всё это выполняется по `docs\ACCEPTANCE.md` и фиксируется в его разделах 6–8.
+
+---
+
+## Этап Э8: доработки по замечаниям заказчика (живой стенд) — выполнен
+
+Три замечания с живого стенда: «после удаления магазина IP занят — новый магазин с тем же IP не создать», «конфиг `agent-config.json` показывается только при создании, а нужен и потом, с возможностью скопировать», «нужна тёмная тема админки». Закрыты все три, плюс найден и исправлен дефект формы правки: введённый пароль 1С никуда не отправлялся.
+
+### Что сделано
+
+1. **Отключённый магазин освобождает имя и IP (Д-11).** Причина в модели: `stores.name` и `stores.ip_address` объявлены UNIQUE по всей таблице (§4.1), а «Отключить» — мягкое удаление (`is_active=false`, §5.2.2), поэтому отключённая запись навсегда держала имя и IP. Теперь уникальность считается **только среди активных**: частичные уникальные индексы `uq_stores_name_active` / `uq_stores_ip_address_active` (`WHERE is_active = 1`, миграция `c4f7a1b95e20_stores_unique_active`) плюс проверка `store_service._ensure_unique`. Конфликт с активным магазином — прежний `422`, но с понятным текстом («уже существует (занято активным магазином)»); включение магазина обратно (`PUT {is_active: true}`) сверяется с занятыми именем и IP **до** записи, поэтому при отказе запись остаётся отключённой, а не «наполовину включённой». Гонка двух администраторов тоже не даёт `500`: `IntegrityError` из БД превращается в тот же `422` (`_flush_or_conflict`).
+2. **Конфиг агента читается в любой момент (Д-12).** `GET /api/v1/admin/stores/{id}/agent-config` отдаёт тот же блок, что и ответ на создание (`AgentConfigOut`: `config_json`, `agent_token`, путь, подсказки). В UI появилась кнопка **«Конфиг»** — у строки списка и в карточке магазина: диалог показывает JSON, копирует токен и JSON и **скачивает `agent-config.json`** (Blob → `<a download>`), то есть файл для кассы собирается заново после переустановки или перевыпуска токена. Пароль 1С в конфиг не входит (П-1).
+3. **Правка всех параметров магазина.** Форма «Изменить магазин» — общий компонент `StoreFormDialog` (список и карточка) — правит все колонки §4.1: имя, IP, порт агента, кластер и базу 1С, версию, логин 1С, комментарий, признак «магазин активен»; пароль 1С задаётся/заменяется или очищается отдельно (`PUT /stores/{id}/credentials`, П-1). **Исправлен дефект:** раньше пароль в форме правки вводился, но не отправлялся — теперь уходит на сервер, и это видно по `credentials_version`.
+4. **Тёмная тема (Д-13).** В шапке — переключатель «Светлая тема / Тёмная тема / Как в системе»: выбор хранится в `localStorage` и применяется **до** монтирования SPA (без светлой вспышки), режим «как в системе» следит за `prefers-color-scheme`, тёмная включается классом `.app-dark` на `<html>` — одним классом меняются и токены PrimeVue (`darkModeSelector`), и собственные стили (`frontend/src/style.css`).
+
+### Файлы этапа
+
+| Что | Где |
+|---|---|
+| Уникальность только среди активных | `server/db/models.py` (`Store.__table_args__`), `server/services/store_service.py` (`_ensure_unique`, `_flush_or_conflict`, `update_store`), `server/migrations/versions/c4f7a1b95e20_stores_unique_active.py` |
+| Эндпоинт конфига агента | `server/api/stores.py` (`GET /stores/{id}/agent-config`) |
+| Тема оформления | `frontend/src/stores/theme.ts`, `frontend/src/components/AppShell.vue`, `frontend/src/main.ts`, `frontend/src/style.css` |
+| UI магазинов | `frontend/src/components/StoreFormDialog.vue`, `frontend/src/components/AgentConfigDialog.vue`, `frontend/src/views/StoresView.vue`, `frontend/src/views/StoreDetailView.vue`, `frontend/src/stores/stores.ts`, `frontend/src/api/endpoints.ts` |
+
+### Критерии готовности — факты
+
+| Критерий | Проверка | Факт |
+|---|---|---|
+| Тесты бэкенда | `python -m pytest -q` | **666** тестов, код возврата `0` (server 372, client 212, shared 82); новых +8: `TestReuseAfterDeactivate` (3), эндпоинт конфига и переиспользование IP в `test_store_api.py` (4), `test_unique_name_and_ip_only_among_active` (1) |
+| Тесты фронтенда | `npm run test` | **110** тестов в 16 файлах — все зелёные; новых +7: правка всех параметров и конфиг в `stores-view.spec.ts` (2), `theme.spec.ts` (5) |
+| Типы и сборка SPA | `npm run build` | `vue-tsc --noEmit` без ошибок, `vite build` — успешно |
+| Миграция БД | `alembic upgrade head` → `alembic check` | `d9a388454dc8 → c4f7a1b95e20`, `No new upgrade operations detected` (модели == схема) |
+| Живой прогон: IP отключённого магазина | страница `/stores` на сервере `127.0.0.1:8080` | В демо-БД был отключённый магазин «201» (`192.168.0.211`). Магазин с тем же IP создан заново (id=3) — блок конфига открылся сразу; после его отключения тем же IP создан ещё один (id=4) |
+| Живой прогон: конфликт — только с активным | `POST /api/v1/admin/stores` | Повторное создание активного магазина с тем же именем → `422` «Магазин с именем … уже существует (занято активным магазином)» |
+| Живой прогон: конфиг агента | кнопка «Конфиг» и «Скачать agent-config.json» | Диалог отдал `config_json` (`store_id`, `server_url`, `agent_token`, `port`, `one_c_profile`), браузер скачал файл `agent-config.json` |
+| Живой прогон: правка всех параметров | форма «Изменить магазин» | Поля заполнены из карточки; задан пароль 1С → `credentials_version` 1 → 2, снят признак «магазин активен» → магазин ушёл из активного списка |
+| Живой прогон: тёмная тема | переключатель темы в шапке | `<html class="app-dark">`, `data-theme=dark`, выбор в `localStorage`; фон страницы `#0b1220`, карточки `#131c2e` |
+
+### Что осталось
+
+Работа со стендом заказчика — без изменений: живая 1С (ФН1–ФН3), установка `dist\release\` на кассу и подписи в `docs/ACCEPTANCE.md` (§2–8). Демо-магазины Э8 из dev-БД удалены, отключённый «201» оставлен как был.
 
 
 

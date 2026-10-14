@@ -7,6 +7,7 @@ import type {
   AdminCreatePayload,
   AdminUpdatePayload,
   AdminUser,
+  AgentConfigBlock,
   AuditEntry,
   BulkActionPayload,
   BulkActionResponse,
@@ -140,6 +141,14 @@ export const storesApi = {
 
   /** «Проверить сейчас»: живой `GET /health` агента (Д-3). */
   check: (id: number) => api.post<StoreHealth>(`/admin/stores/${id}/check`),
+
+  /**
+   * `GET /admin/stores/{id}/agent-config` — данные `agent-config.json` (§11.2).
+   *
+   * Тот же блок, что и в ответе на создание, но доступен в любой момент: кассу
+   * переустанавливают, токен перевыпустили — файл можно скачать заново.
+   */
+  agentConfig: (id: number) => api.get<AgentConfigBlock>(`/admin/stores/${id}/agent-config`),
 }
 
 /**

@@ -1,5 +1,6 @@
 /**
- * Точка входа SPA (§6): Pinia → router → PrimeVue (тема Aura) → монтирование.
+ * Точка входа SPA (§6): Pinia → router → PrimeVue (тема Aura) → тема оформления
+ * → монтирование.
  *
  * Обработчик `401` из любого запроса сбрасывает сессию и уводит на `/login`
  * (см. `src/api/client.ts`) — так «протухшая» cookie не оставляет пользователя
@@ -19,6 +20,7 @@ import App from './App.vue'
 import { registerUnauthorizedHandler } from './api/client'
 import { createAppRouter } from './router'
 import { useAuthStore } from './stores/auth'
+import { useThemeStore } from './stores/theme'
 
 const app = createApp(App)
 const pinia = createPinia()
@@ -32,13 +34,18 @@ app.use(PrimeVue, {
   theme: {
     preset: Aura,
     options: {
-      // Класс тёмной темы не используем: дашборд — светлый (см. тона в style.css)
+      // Класс `.app-dark` ставит стор темы (`stores/theme.ts`): светлая тема,
+      // тёмная и «как в системе» переключаются в шапке (§11.1, Э8)
       darkModeSelector: '.app-dark',
       cssLayer: false,
     },
   },
 })
 app.use(ToastService)
+
+// Тему применяем до монтирования: иначе после перезагрузки страницы успевает
+// мелькнуть светлый фон, а PrimeVue уже посчитал тёмные токены
+useThemeStore(pinia).initialize()
 
 const auth = useAuthStore(pinia)
 registerUnauthorizedHandler(() => {

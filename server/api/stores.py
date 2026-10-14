@@ -346,6 +346,28 @@ def get_store_endpoint(
     return StoreOut.from_model(store, online_window_sec=_online_window(session))
 
 
+@router.get(
+    "/{store_id}/agent-config",
+    response_model=AgentConfigOut,
+    summary="Данные agent-config.json магазина",
+)
+def get_store_agent_config_endpoint(
+    store_id: int,
+    request: Request,
+    context: Annotated[AppContext, Depends(get_context)],
+    session: Annotated[Session, Depends(get_db)],
+) -> AgentConfigOut:
+    """Показать конфиг агента уже созданного магазина (§11.2).
+
+    Тот же блок, что и в ответе на создание: его можно перечитать в любой момент —
+    например, когда кассу переустанавливают и `agent-config.json` нужно собрать
+    заново, в том числе после перевыпуска токена. Пароль 1С в конфиг не попадает
+    (П-1): его агент получает push-ом.
+    """
+    store = _get_or_404(session, store_id)
+    return build_agent_config_block(store, server_url=_server_url(request, context))
+
+
 @router.put("/{store_id}", response_model=StoreOut, summary="Изменить магазин")
 def update_store_endpoint(
     store_id: int,

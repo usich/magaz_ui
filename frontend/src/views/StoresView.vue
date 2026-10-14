@@ -1,11 +1,15 @@
 <script setup lang="ts">
 /**
- * Магазины (§11.2, Э2): таблица с фильтрами, CRUD по колонкам ТЗ, выдача и
- * перевыпуск токена агента, учётные данные 1С (П-1) и блок «что вписать в
- * конфиг агента». Статусы «онлайн/офлайн» приходят с сервера, который считает
- * их по окну `online_window_sec` (§3.3).
+ * Магазины (§11.2, Э2/Э8): таблица с фильтрами, CRUD по колонкам ТЗ, правка всех
+ * реквизитов, выдача и перевыпуск токена агента, учётные данные 1С (П-1) и блок
+ * «что вписать в конфиг агента» — его можно открыть и скачать в любой момент, а
+ * не только сразу после создания магазина.
+ *
+ * Статусы «онлайн/офлайн» приходят с сервера, который считает их по окну
+ * `online_window_sec` (§3.3). Форма магазина и диалог конфига — общие компоненты
+ * (`StoreFormDialog`, `AgentConfigDialog`): те же открываются в карточке.
  */
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
 import InputText from 'primevue/inputtext'
@@ -14,34 +18,21 @@ import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
 import { ApiError } from '@/api/client'
-import type { AgentConfigBlock, StoreCreatePayload, StoreItem, StoreUpdatePayload } from '@/api/types'
+import type { StoreItem } from '@/api/types'
+import AgentConfigDialog from '@/components/AgentConfigDialog.vue'
 import OperationPanel from '@/components/OperationPanel.vue'
+import StoreFormDialog from '@/components/StoreFormDialog.vue'
 import { useStoresStore } from '@/stores/stores'
 
 const toast = useToast()
 const stores = useStoresStore()
 
-function emptyForm(): StoreCreatePayload {
-  return {
-    name: '',
-    ip_address: '',
-    cluster_name: '',
-    database_name: '',
-    version_1c: '',
-    user_name_1c: 'Администратор',
-    agent_port: 8383,
-    password: '',
-    comment: '',
-  }
-}
-
-const form = reactive<StoreCreatePayload>(emptyForm())
-const editingId = ref<number | null>(null)
+/** Диалог формы: `formStore === null` — создание, иначе правка реквизитов (§11.2) */
+const formStore = ref<StoreItem | null>(null)
 const isFormOpen = ref(false)
-const isSaving = ref(false)
-const formError = ref('')
 
-const configBlock = ref<AgentConfigBlock | null>(null)
+/** Диалог конфига агента: открывается кнопкой «Конфиг» и сразу после создания */
+const configStore = ref<StoreItem | null>(null)
 const isConfigOpen = ref(false)
 const tokenResult = ref<{ store_id: number; agent_token: string; warning: string } | null>(null)
 const isTokenOpen = ref(false)
@@ -50,22 +41,6 @@ const isTokenOpen = ref(false)
 const isOperationsOpen = ref(false)
 const operationsTarget = ref<'all' | 'cluster'>('all')
 const operationsCluster = ref('')
-
-const dialogTitle = computed(() =>
-  editingId.value === null ? 'Новый магазин' : 'Изменить магазин',
-)
-const isFormValid = computed(
-  () =>
-    Boolean(form.name.trim()) &&
-    Boolean(form.ip_address.trim()) &&
-    Boolean(form.cluster_name.trim()) &&
-    Boolean(form.database_name.trim()) &&
-    Boolean(form.version_1c.trim()) &&
-    Boolean(form.user_name_1c.trim()),
-)
-const configJson = computed(() =>
-  configBlock.value ? JSON.stringify(configBlock.value.config_json, null, 2) : '',
-)
 
 onMounted(() => stores.startPolling())
 onUnmounted(() => stores.stopPolling())
@@ -85,69 +60,34 @@ function notifySuccess(summary: string, detail: string): void {
 }
 
 function openCreate(): void {
-  Object.assign(form, emptyForm())
-  editingId.value = null
-  formError.value = ''
+  formStore.value = null
   isFormOpen.value = true
 }
 
 function openEdit(store: StoreItem): void {
-  Object.assign(form, {
-    name: store.name,
-    ip_address: store.ip_address,
-    cluster_name: store.cluster_name,
-    database_name: store.database_name,
-    version_1c: store.version_1c,
-    user_name_1c: store.user_name_1c,
-    agent_port: store.agent_port,
-    password: '',
-    comment: store.comment ?? '',
-  })
-  editingId.value = store.id
-  formError.value = ''
+  formStore.value = store
   isFormOpen.value = true
 }
 
-async function submit(): Promise<void> {
-  if (!isFormValid.value) {
-    formError.value =
-      'Заполните обязательные поля: имя, IP, кластер, база, версия 1С, пользователь 1С'
+/** Конфиг агента для уже созданного магазина (§11.2, Э8). */
+function openConfig(store: StoreItem): void {
+  configStore.value = store
+  isConfigOpen.value = true
+}
+
+/**
+ * Форма сохранила магазин: после создания сразу показываем `agent-config.json`,
+ * после правки — только уведомление (конфиг открывается кнопкой «Конфиг»).
+ */
+function handleSaved(store: StoreItem, created: boolean): void {
+  formStore.value = null
+  if (created) {
+    configStore.value = store
+    isConfigOpen.value = true
+    notifySuccess('Магазин создан', 'Впишите данные в конфиг агента')
     return
   }
-
-  isSaving.value = true
-  formError.value = ''
-  try {
-    if (editingId.value === null) {
-      const created = await stores.create({ ...form, password: form.password || null })
-      configBlock.value = created.agent_config
-      isConfigOpen.value = true
-      notifySuccess('Магазин создан', 'Впишите данные в конфиг агента')
-    } else {
-      // Пароль 1С меняется только через `PUT /stores/{id}/credentials` (П-1)
-      const payload: StoreUpdatePayload = {
-        name: form.name,
-        ip_address: form.ip_address,
-        cluster_name: form.cluster_name,
-        database_name: form.database_name,
-        version_1c: form.version_1c,
-        user_name_1c: form.user_name_1c,
-        agent_port: form.agent_port,
-        comment: form.comment,
-      }
-      await stores.update(editingId.value, payload)
-      notifySuccess('Магазин сохранён', form.name)
-    }
-    isFormOpen.value = false
-  } catch (error) {
-    formError.value =
-      error instanceof ApiError && error.messages.length > 0
-        ? error.messages.join('; ')
-        : 'Не удалось сохранить магазин'
-    notifyError(error, 'Не удалось сохранить магазин')
-  } finally {
-    isSaving.value = false
-  }
+  notifySuccess('Магазин сохранён', store.name)
 }
 
 async function deactivate(store: StoreItem): Promise<void> {
@@ -316,6 +256,13 @@ function formatTime(value: string | null): string {
                   Карточка
                 </RouterLink>
                 <Button label="Правка" size="small" text @click="openEdit(store)" />
+                <Button
+                  label="Конфиг"
+                  size="small"
+                  text
+                  data-test="open-config"
+                  @click="openConfig(store)"
+                />
                 <Button label="Токен" size="small" text @click="rotateToken(store)" />
                 <Button
                   v-if="store.is_active"
@@ -344,152 +291,15 @@ function formatTime(value: string | null): string {
       сервер и обновляет каждые 15 с, страница только показывает результат.
     </p>
 
-    <Dialog v-model:visible="isFormOpen" :header="dialogTitle" modal :style="{ width: '720px' }">
-      <Message v-if="formError" severity="error" :closable="false" class="mb-3">
-        {{ formError }}
-      </Message>
+    <!-- Форма создания и правки: все реквизиты магазина (§11.2, Э8) -->
+    <StoreFormDialog v-model:visible="isFormOpen" :store="formStore" @saved="handleSaved" />
 
-      <div class="grid gap-3 md:grid-cols-2">
-        <label class="space-y-1">
-          <span class="magaz-muted text-xs">Имя магазина *</span>
-          <InputText
-            v-model="form.name"
-            class="w-full"
-            :pt="{ root: { 'data-test': 'form-name' } }"
-          />
-        </label>
-        <label class="space-y-1">
-          <span class="magaz-muted text-xs">IP кассы в туннеле *</span>
-          <InputText
-            v-model="form.ip_address"
-            class="w-full"
-            placeholder="10.10.5.10"
-            :pt="{ root: { 'data-test': 'form-ip' } }"
-          />
-        </label>
-        <label class="space-y-1">
-          <span class="magaz-muted text-xs">Кластер (сервер 1С) *</span>
-          <InputText
-            v-model="form.cluster_name"
-            class="w-full"
-            :pt="{ root: { 'data-test': 'form-cluster' } }"
-          />
-        </label>
-        <label class="space-y-1">
-          <span class="magaz-muted text-xs">Имя базы 1С *</span>
-          <InputText
-            v-model="form.database_name"
-            class="w-full"
-            :pt="{ root: { 'data-test': 'form-database' } }"
-          />
-        </label>
-        <label class="space-y-1">
-          <span class="magaz-muted text-xs">Версия 1С *</span>
-          <InputText
-            v-model="form.version_1c"
-            class="w-full"
-            placeholder="8.3.24.1548"
-            :pt="{ root: { 'data-test': 'form-version' } }"
-          />
-        </label>
-        <label class="space-y-1">
-          <span class="magaz-muted text-xs">Порт агента</span>
-          <input
-            v-model.number="form.agent_port"
-            type="number"
-            min="1"
-            max="65535"
-            class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
-            data-test="form-port"
-          />
-        </label>
-        <label class="space-y-1">
-          <span class="magaz-muted text-xs">Пользователь 1С *</span>
-          <InputText
-            v-model="form.user_name_1c"
-            class="w-full"
-            :pt="{ root: { 'data-test': 'form-user' } }"
-          />
-        </label>
-        <label class="space-y-1">
-          <span class="magaz-muted text-xs">
-            Пароль 1С {{ editingId === null ? '' : '(оставьте пустым, чтобы не менять)' }}
-          </span>
-          <InputText
-            v-model="form.password"
-            type="password"
-            class="w-full"
-            :pt="{ root: { 'data-test': 'form-password' } }"
-          />
-        </label>
-        <label class="space-y-1 md:col-span-2">
-          <span class="magaz-muted text-xs">Комментарий</span>
-          <InputText
-            v-model="form.comment"
-            class="w-full"
-            :pt="{ root: { 'data-test': 'form-comment' } }"
-          />
-        </label>
-      </div>
-
-      <p class="magaz-muted mt-4 text-xs">
-        Пароль 1С хранится на сервере в шифрованном виде и доставляется агенту отдельно (П-1):
-        в HTML, логах и аудите он не появляется — в таблице виден только признак «задан».
-      </p>
-
-      <template #footer>
-        <Button label="Отмена" text size="small" @click="isFormOpen = false" />
-        <Button
-          label="Сохранить"
-          icon="pi pi-save"
-          size="small"
-          :loading="isSaving"
-          :disabled="!isFormValid"
-          data-test="save-store"
-          @click="submit"
-        />
-      </template>
-    </Dialog>
-
-    <Dialog
+    <!-- Конфиг агента: тот же блок, что показывается сразу после создания -->
+    <AgentConfigDialog
       v-model:visible="isConfigOpen"
-      header="Что вписать в конфиг агента"
-      modal
-      :style="{ width: '760px' }"
-    >
-      <p class="text-sm">
-        Файл: <span class="magaz-mono">{{ configBlock?.config_path }}</span>
-      </p>
-      <p class="magaz-muted mt-1 text-sm">
-        Адрес сервера: <span class="magaz-mono">{{ configBlock?.server_url }}</span>
-      </p>
-      <pre
-        class="magaz-mono mt-3 max-h-72 overflow-auto rounded-lg bg-slate-900 p-3 text-xs text-slate-100"
-        data-test="agent-config-json"
-        >{{ configJson }}</pre
-      >
-      <ul class="magaz-muted mt-3 space-y-1 text-xs">
-        <li v-for="note in configBlock?.notes ?? []" :key="note">• {{ note }}</li>
-      </ul>
-
-      <template #footer>
-        <Button
-          label="Скопировать токен"
-          icon="pi pi-copy"
-          size="small"
-          text
-          @click="copyText(configBlock?.agent_token ?? '')"
-        />
-        <Button
-          label="Скопировать JSON"
-          icon="pi pi-copy"
-          size="small"
-          data-test="copy-config"
-          @click="copyText(configJson)"
-        />
-        <Button label="Готово" size="small" @click="isConfigOpen = false" />
-      </template>
-    </Dialog>
+      :store-id="configStore?.id ?? null"
+      :store-name="configStore?.name ?? null"
+    />
 
     <Dialog
       v-model:visible="isTokenOpen"
