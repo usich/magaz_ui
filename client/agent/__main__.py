@@ -5,6 +5,7 @@
     python -m client.agent --console                          # отладка в терминале
     python -m client.agent run --config C:\\MagazAgent\\agent-config.json
     python -m client.agent info                                # что прочитано из конфига
+    python -m client.agent preflight                            # предполётная проверка (Э7)
     python -m client.agent install                              # служба Windows (Э6)
     python -m client.agent start | stop | remove                # управление службой
 
@@ -52,6 +53,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("run", help="запустить агент (uvicorn)")
     sub.add_parser("info", help="показать, что прочитано из конфига")
+
+    preflight = sub.add_parser("preflight", help="проверить готовность кассы к приёмке (Э7)")
+    preflight.add_argument("--json", action="store_true", help="отчёт в JSON — для протокола")
+    preflight.add_argument(
+        "--no-server", action="store_true", help="не проверять доступность сервера"
+    )
     for name, help_text in (
         ("install", "установить службу Windows (Э6)"),
         ("remove", "удалить службу Windows (Э6)"),
@@ -99,6 +106,19 @@ def _cmd_info(config: AgentConfig, config_path: str | None) -> int:
     return 0
 
 
+def _cmd_preflight(args: argparse.Namespace) -> int:
+    """Предполётная проверка кассы (Э7): отчёт прикладывается к протоколу приёмки.
+
+    Конфиг читается внутри проверки, а не в `main`: если файла нет, отчёт должен
+    объяснить это одной строкой, а не упасть с ошибкой загрузки (§7.2).
+    """
+    from client.agent.preflight import render_preflight, run_preflight
+
+    report = run_preflight(config_path=args.config, check_server=not args.no_server)
+    print(render_preflight(report, as_json=args.json))
+    return report.exit_code
+
+
 def _cmd_run(args: argparse.Namespace, config: AgentConfig, config_path: str | None) -> int:
     """Запустить агент (uvicorn). `--console` включается флагом, а не отдельной командой.
 
@@ -133,6 +153,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if command in SERVICE_COMMANDS:
         return _cmd_service(command, [sys.argv[0], *sys.argv[2:]])
+
+    if command == "preflight":
+        return _cmd_preflight(args)
 
     try:
         config = load_config(args.config)

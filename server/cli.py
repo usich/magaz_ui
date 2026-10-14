@@ -7,6 +7,8 @@
     python -m server.cli reset-password --username admin
     python -m server.cli seed-settings
     python -m server.cli info
+    python -m server.cli preflight            # предполётная проверка перед приёмкой (Э7)
+    python -m server.cli preflight --json     # отчёт для протокола docs/ACCEPTANCE.md
 """
 
 from __future__ import annotations
@@ -45,6 +47,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("seed-settings", help="добавить настройки по умолчанию §4.9")
     sub.add_parser("info", help="показать настройки подключения и версию")
+
+    preflight = sub.add_parser("preflight", help="проверить готовность сервера к приёмке (Э7)")
+    preflight.add_argument("--json", action="store_true", help="отчёт в JSON — приложить к протоколу")
     return parser
 
 
@@ -118,6 +123,20 @@ def _cmd_seed_settings(db: DatabaseManager) -> int:
     return 0
 
 
+def _cmd_preflight(db: DatabaseManager, args: argparse.Namespace) -> int:
+    """Предполётная проверка сервера (Э7): код возврата — из отчёта, не «успех любой ценой».
+
+    Проверка ничего не меняет, поэтому её можно запускать и на уже работающем сервере:
+    она читает БД, файлы и пробует занять порт. Отчёт прикладывается к протоколу
+    приёмки (`docs/ACCEPTANCE.md`, раздел 1).
+    """
+    from server.preflight import render_preflight, run_preflight
+
+    report = run_preflight(get_settings(), db)
+    print(render_preflight(report, as_json=args.json))
+    return report.exit_code
+
+
 def _cmd_info(db: DatabaseManager) -> int:
     from sqlalchemy import inspect
 
@@ -147,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_reset_password(db, args)
         if args.command == "seed-settings":
             return _cmd_seed_settings(db)
+        if args.command == "preflight":
+            return _cmd_preflight(db, args)
         if args.command == "info":
             return _cmd_info(db)
     finally:

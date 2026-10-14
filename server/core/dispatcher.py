@@ -387,7 +387,10 @@ class CommandDispatcher:
         if str(command.status) == str(CommandStatus.QUEUED):
             return False
         limit = self._setting(session, POLL_TIMEOUT_SETTING)
-        return command_service.status_age_sec(command) > float(limit)
+        # Сравнение нестрогое: лимит `0` означает «не ждать вовсе», а часы Windows
+        # имеют разрешение ~15 мс — при строгом `>` задача, отправленная и проверенная
+        # в одном тике, оставалась «running» (и тест таймаута был недетерминированным)
+        return command_service.status_age_sec(command) >= float(limit)
 
     def _store_online(self, session: Any, store: Store) -> bool:  # noqa: ANN401 - Session
         """В сети ли магазин по окну `online_window_sec` (§3.3)."""
