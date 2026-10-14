@@ -36,6 +36,19 @@ const devicesHint = computed(() => {
 /** Э5: интервал возврата отложенного уведомления (§4.9, П-2). */
 const snoozeMin = computed(() => counts.value?.notifications_snooze_min ?? 15)
 
+/**
+ * Д-14: плитка магазинов считает **магазины в работе**.
+ *
+ * «Отключить» на странице магазинов — мягкое удаление (§5.2.2): строка остаётся
+ * в таблице ради истории и отчётов, поэтому `stores_total` (число строк) больше
+ * числа работающих. Плитка берёт `stores_active`, а расхождение показывает
+ * подсказкой — иначе главная «держала» 2 магазина при одном рабочем.
+ */
+const inactiveStores = computed(() => counts.value?.stores_inactive ?? 0)
+const storesHint = computed(() =>
+  inactiveStores.value ? `активных · отключено ${inactiveStores.value}` : 'активных магазинов',
+)
+
 onMounted(() => stores.startPolling())
 onUnmounted(() => stores.stopPolling())
 
@@ -58,10 +71,11 @@ function formatTime(value: string | null): string {
 
     <section class="grid grid-cols-2 gap-4 lg:grid-cols-3 xl:grid-cols-6">
       <StatusTile
-        label="Всего магазинов"
-        :value="counts?.stores_total ?? '—'"
+        label="Магазинов в работе"
+        :value="counts?.stores_active ?? '—'"
         icon="pi pi-building"
-        hint="заведено в дашборде"
+        :hint="storesHint"
+        data-test="tile-stores"
       />
       <StatusTile
         label="Онлайн"
@@ -238,16 +252,15 @@ function formatTime(value: string | null): string {
         <h2 class="font-semibold">Что появится дальше</h2>
         <ul class="mt-4 space-y-3 text-sm text-slate-700">
           <li class="flex gap-2">
-            <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э5</span>
-            <span>Уведомления пользователям: уровни важности, «Ознакомлен»/«Отложить», отчёты.</span>
-          </li>
-          <li class="flex gap-2">
-            <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э6</span>
-            <span>Сборка и развёртывание: управление администраторами в настройках, пакеты обновления.</span>
-          </li>
-          <li class="flex gap-2">
             <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э7</span>
-            <span>Приёмка на стенде: живой прогон 1С, msg.exe и службы под LocalSystem.</span>
+            <span>Приёмка на стенде заказчика: живой 1С, `msg.exe`, службы под LocalSystem.</span>
+          </li>
+          <li class="flex gap-2">
+            <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э9</span>
+            <span>
+              Уведомления 2.0: редактор с форматированием и картинками, окно в углу экрана на
+              кассе, вкладки по важности со счётчиками, удаление после прочтения.
+            </span>
           </li>
         </ul>
       </div>

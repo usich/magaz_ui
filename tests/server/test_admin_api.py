@@ -15,6 +15,7 @@ ME_URL = "/api/v1/admin/auth/me"
 SETTINGS_URL = "/api/v1/admin/settings"
 AUDIT_URL = "/api/v1/admin/audit"
 SYSTEM_INFO_URL = "/api/v1/admin/system/info"
+STORES_URL = "/api/v1/admin/stores"
 HEALTH_URL = "/api/v1/health"
 
 
@@ -189,7 +190,45 @@ class TestSystemInfo:
         assert body["database"]["kind"] == "sqlite"
         assert body["spa"]["built"] is False, "SPA ещё не собрана в тестах"
         assert body["counts"]["stores_total"] == 1
+        assert body["counts"]["stores_active"] == 1, "Д-14: плитка главной считает активные"
+        assert body["counts"]["stores_inactive"] == 0
         assert body["counts"]["admins_total"] == 1
         assert body["counts"]["jobs_active"] == 0, "Э4: плитка «Задач в работе»"
         assert body["settings_keys"] == 14
+
+
+class TestSystemCountersForDisabledStores:
+    """Д-14: отключённый магазин не считается магазином «в работе».
+
+    «Отключить» — мягкое удаление (§5.2.2): строка остаётся в таблице ради
+    истории, отчётов и повторного включения. Поэтому сервер отдаёт оба числа:
+    `stores_total` (строки) и `stores_active` (в работе). Плитка главной берёт
+    второе — иначе после отключения магазина на главной оставалось «2».
+    """
+
+    def test_disabled_store_is_counted_separately(self, auth_client: TestClient, store) -> None:  # noqa: ANN001, ARG002
+        created = auth_client.post(
+            STORES_URL,
+            json={
+                "name": "Магазин №14",
+                "ip_address": "10.10.14.14",
+                "cluster_name": "srv-1c",
+                "database_name": "trade",
+                "version_1c": "8.3.24.1548",
+                "user_name_1c": "Администратор",
+            },
+        )
+        assert created.status_code == 200, created.text
+        store_id = created.json()["id"]
+
+        disabled = auth_client.delete(f"{STORES_URL}/{store_id}")
+        assert disabled.status_code == 200, disabled.text
+        counts = auth_client.get(SYSTEM_INFO_URL).json()["counts"]
+
+        assert counts["stores_total"] == 2, "строка осталась в таблице: история и отчёты"
+        assert counts["stores_active"] == 1, "плитка главной показывает рабочее число"
+        assert counts["stores_inactive"] == 1, "видно, куда делся магазин"
+        assert counts["stores_online"] + counts["stores_offline"] == 1, (
+            "«онлайн» + «офлайн» — это тоже только магазины в работе"
+        )
 

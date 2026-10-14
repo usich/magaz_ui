@@ -234,11 +234,26 @@ def _count(session: Session, model: type) -> int:
     return int(session.scalar(select(func.count()).select_from(model)) or 0)
 
 
+def _count_active_stores(session: Session) -> int:
+    """Сколько магазинов «в работе» — отключённые мягким удалением не считаются (Д-14).
+
+    Плитка главной показывает именно это число: магазин, ушедший из опроса
+    кнопкой «Отключить» (§5.2.2), остаётся в таблице ради истории и отчётов, но
+    рабочим уже не является. Иначе после отключения главная продолжала
+    показывать «Всего магазинов: 2» при одном работающем.
+    """
+    return int(
+        session.scalar(select(func.count()).select_from(Store).where(Store.is_active.is_(True)))
+        or 0
+    )
+
+
 def system_info_payload(session: Session, context: AppContext) -> dict[str, Any]:
     """Состав диагностики для `/system/info` и плиток главной (§11.1)."""
     dist_dir = context.frontend_dist
     index_file = dist_dir / "index.html"
     online_window = settings_service.get_int(session, "online_window_sec")
+    stores_active = _count_active_stores(session)
     stores_online, stores_offline = store_service.count_by_status(
         session, online_window_sec=online_window
     )
@@ -259,13 +274,12 @@ def system_info_payload(session: Session, context: AppContext) -> dict[str, Any]
             "built": index_file.exists(),
         },
         "counts": {
+            # Д-14: «всего» — строки таблицы (история и отчёты), «в работе» — активные.
+            # Плитка главной показывает `stores_active`; расхождение видно как
+            # `stores_inactive`, чтобы администратор понимал, куда делся магазин.
             "stores_total": _count(session, Store),
-            "stores_active": int(
-                session.scalar(
-                    select(func.count()).select_from(Store).where(Store.is_active.is_(True))
-                )
-                or 0
-            ),
+            "stores_active": stores_active,
+            "stores_inactive": _count(session, Store) - stores_active,
             # Э2: «онлайн» считается по окну `online_window_sec`, а не хранится (§3.3)
             "stores_online": stores_online,
             "stores_offline": stores_offline,

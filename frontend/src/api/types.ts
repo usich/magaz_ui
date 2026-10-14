@@ -39,7 +39,10 @@ export interface SpaInfo {
 
 export interface SystemCounts {
   stores_total: number
+  /** Э8 (Д-14): магазины в работе — именно это число показывает плитка главной */
   stores_active: number
+  /** Э8 (Д-14): отключённые магазины (мягкое удаление, §5.2.2) — в работу не входят */
+  stores_inactive: number
   /** Э2: магазины, ответившие за окно `online_window_sec` (§3.3) */
   stores_online: number
   /** Э2: активные магазины без свежего ответа */
