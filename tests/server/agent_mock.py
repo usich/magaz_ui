@@ -166,6 +166,9 @@ class ScriptedAgent:
         self.devices_checks: list[list[dict[str, object]]] = []
         self.device_status = device_status
         self.device_latency_ms = device_latency_ms
+        #: Э5: принятые push-и уведомлений (ФН3) и число «видимых» сессий
+        self.notify_pushes: list[dict[str, object]] = []
+        self.sessions_online = 2
 
     # --- Диагностика для тестов --------------------------------------------
 
@@ -231,6 +234,11 @@ class ScriptedAgent:
                     }
                     for item in devices
                 ],
+            )
+        if path == "/notify":
+            self.notify_pushes.append(body or {})
+            return httpx.Response(
+                200, json={"queued": True, "sessions": int(self.sessions_online)}
             )
         if path == "/check-files":
             if self.download_requested:

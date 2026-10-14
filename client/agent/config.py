@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AGENT_CONFIG_FILE_NAME",
     "AGENT_DEVICES_FILE_NAME",
+    "AGENT_NOTIFICATIONS_FILE_NAME",
     "AGENT_STATE_FILE_NAME",
     "CONFIG_PATH_ENV",
     "DEFAULT_AGENT_PORT",
@@ -62,6 +63,8 @@ AGENT_CONFIG_FILE_NAME = "agent-config.json"
 AGENT_STATE_FILE_NAME = "agent-state.json"
 #: Копия списка оборудования подсети (§7.6): опрос идёт и без сервера
 AGENT_DEVICES_FILE_NAME = "devices.json"
+#: Очередь уведомлений и подтверждений (§7.4, ФН3): переживает перезапуск службы
+AGENT_NOTIFICATIONS_FILE_NAME = "notifications.json"
 CONFIG_PATH_ENV = "MAGAZ_AGENT_CONFIG"
 LOG_DIR_ENV = "MAGAZ_AGENT_LOG_DIR"
 
@@ -133,6 +136,15 @@ class AgentConfig(BaseModel):
     def devices_path(self) -> Path:
         """Копия списка оборудования подсети: `C:\\MagazAgent\\devices.json` (§7.6)."""
         return self.work_path / AGENT_DEVICES_FILE_NAME
+
+    @property
+    def notifications_path(self) -> Path:
+        """Очередь уведомлений: `C:\\MagazAgent\\notifications.json` (§7.4).
+
+        Файл переживает перезапуск службы и недоступность сервера: `ack` и
+        «отложено» не теряются на кассе (П-2).
+        """
+        return self.work_path / AGENT_NOTIFICATIONS_FILE_NAME
 
 
 def get_application_root() -> Path:

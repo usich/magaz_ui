@@ -25,6 +25,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -34,8 +36,13 @@ from sqlalchemy.orm import Session
 
 from server.core.dependencies import get_client_ip, get_db, require_active_admin
 from server.db.models import AdminUser, Command, FileCheck, JobLog, Store
-from server.services import audit_service, command_service, settings_service
-from shared.enums import ActionKind, CommandKind, CommandStatus
+from server.services import (
+    audit_service,
+    command_service,
+    notification_service,
+    settings_service,
+)
+from shared.enums import ActionKind, CommandKind, CommandStatus, TargetType
 from shared.schemas import CheckFilesParams
 from shared.timeutil import to_iso_z, utcnow
 
@@ -54,7 +61,8 @@ router = APIRouter(tags=["admin-operations"], dependencies=[Depends(require_acti
 HTTP_422 = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
 
 #: Действия, которые сервер умеет ставить в очередь на этом этапе (§11.4).
-#: `notify` появится вместе с уведомлениями (Э5): его отказ — честный `422`.
+#: Э5: `notify` — единственное действие, которое рождает ещё и сущность
+#: `notifications`: см. `_create_notification_job()`.
 SUPPORTED_ACTIONS: frozenset[str] = frozenset(
     {
         str(ActionKind.CHECK_FILES),
@@ -62,6 +70,7 @@ SUPPORTED_ACTIONS: frozenset[str] = frozenset(
         str(ActionKind.RUN_MERGE),
         str(ActionKind.RUN_UPDATE_DB),
         str(ActionKind.SEND_MESSAGE),
+        str(ActionKind.NOTIFY),
     }
 )
 
@@ -74,6 +83,7 @@ ACTION_KIND: dict[str, str] = {
     str(ActionKind.RUN_MERGE): str(CommandKind.RUN_MERGE),
     str(ActionKind.RUN_UPDATE_DB): str(CommandKind.RUN_UPDATE_DB),
     str(ActionKind.SEND_MESSAGE): str(CommandKind.SEND_MESSAGE),
+    str(ActionKind.NOTIFY): str(CommandKind.NOTIFY),
 }
 
 
@@ -265,10 +275,9 @@ def _validate_action(action: str, params: dict[str, Any]) -> tuple[str, dict[str
     """
     name = (action or "").strip()
     if name not in ACTION_KIND:
-        hint = " (уведомления появятся на этапе Э5)" if name == str(ActionKind.NOTIFY) else ""
         raise HTTPException(
             status_code=HTTP_422,
-            detail=f"Неизвестное действие {action!r}{hint}",
+            detail=f"Неизвестное действие {action!r}",
         )
 
     raw = dict(params or {})
@@ -315,6 +324,15 @@ def _validate_action(action: str, params: dict[str, Any]) -> tuple[str, dict[str
         extension_name = str(raw.get("extension_name") or "").strip()
         if extension_name:
             clean["extension_name"] = extension_name
+
+    elif name == str(ActionKind.NOTIFY):
+        # Уведомление — не параметр задачи 1С, а отдельная сущность (§11.5):
+        # здесь только проверяем форму, строку `notifications` создаёт вызвавшая
+        # точка через `_create_notification_job()`.
+        try:
+            clean.update(notification_service.normalize_params(raw))
+        except notification_service.NotificationValidationError as exc:
+            raise HTTPException(status_code=HTTP_422, detail=str(exc)) from exc
 
     return ACTION_KIND[name], command_service.sanitize_params(clean)
 
@@ -382,6 +400,52 @@ def _last_messages(session: Session, command_ids: list[int]) -> dict[int, str]:
         .order_by(JobLog.id)
     ).all()
     return {int(command_id): str(message) for command_id, message in rows}
+
+
+def _notify_audit_details(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Параметры уведомления, безопасные для журнала аудита (JSON, §4.10).
+
+    Дедлайн в параметрах — `datetime`, а `audit_logs.details` — JSON-колонка:
+    положить туда объект `datetime` нельзя, поэтому дата переводится в ISO-8601.
+    """
+    safe: dict[str, Any] = {}
+    for key, value in params.items():
+        if isinstance(value, datetime):
+            safe[key] = to_iso_z(value)
+        else:
+            safe[key] = value
+    return safe
+
+
+def _create_notification_job(
+    session: Session,
+    params: dict[str, Any],
+    *,
+    stores: list[Store],
+    author: str,
+) -> tuple[int, dict[str, Any]]:
+    """Создать уведомление под действие `notify` (§11.5) и параметры задачи.
+
+    `notify` — единственное действие, которое рождает не только задачу, но и
+    сущность `notifications`: разослать уведомление можно и из раздела
+    `/notifications`, и из карточки магазина (§11.2, §11.5). Задача рассылки
+    ссылается на уведомление по id, а адресация уже зафиксирована в
+    `notification_targets`, поэтому `target_type` здесь всегда `stores`.
+    """
+    notification = notification_service.create_notification(
+        session,
+        title=str(params.get("title") or ""),
+        body=str(params.get("body") or ""),
+        severity=str(params.get("severity") or "info"),
+        requires_ack=bool(params.get("requires_ack")),
+        target_type=str(TargetType.STORES),
+        stores=stores,
+        deadline_at=params.get("deadline_at"),
+        repeat_every_min=params.get("repeat_every_min"),
+        use_msg_exe=bool(params.get("use_msg_exe", True)),
+        created_by=author,
+    )
+    return notification.id, {"notification_id": notification.id}
 
 
 def _create_job(
@@ -523,6 +587,16 @@ def store_action(  # noqa: PLR0913 - параметры HTTP-точки
         )
 
     kind, params = _validate_action(payload.action, payload.params)
+    # Э5: действие `notify` сначала создаёт уведомление, а уже потом задачу (§11.5)
+    audit_details: dict[str, Any] = {"action": payload.action}
+    if kind == str(CommandKind.NOTIFY):
+        notify_params = _notify_audit_details(params)
+        notification_id, params = _create_notification_job(
+            session, params, stores=[store], author=admin.username
+        )
+        audit_details["notification_id"] = notification_id
+        audit_details["notify"] = notify_params
+
     with command_service.dispatch_guard():
         _guard_update(session, [store], kind=kind)
         command = _create_job(
@@ -550,7 +624,7 @@ def store_action(  # noqa: PLR0913 - параметры HTTP-точки
         entity="store",
         entity_id=store.id,
         details={
-            "action": payload.action,
+            **audit_details,
             "job_id": command.id,
             "params": params,
             "warning": bool(warning),
@@ -610,6 +684,22 @@ def bulk_action(  # noqa: PLR0913 - параметры HTTP-точки
             detail="Не выбрано ни одного магазина (store_ids / cluster / all)",
         )
 
+    # Э5: одно уведомление на всю выборку — адресат уже зафиксирован (§11.5)
+    audit_details: dict[str, Any] = {"action": payload.action}
+    if kind == str(CommandKind.NOTIFY):
+        targets = [item for item in stores if item.is_active]
+        if not targets:
+            raise HTTPException(
+                status_code=HTTP_422,
+                detail="Все выбранные магазины отключены: рассылать некому",
+            )
+        notify_params = _notify_audit_details(params)
+        notification_id, params = _create_notification_job(
+            session, params, stores=targets, author=admin.username
+        )
+        audit_details["notification_id"] = notification_id
+        audit_details["notify"] = notify_params
+
     with command_service.dispatch_guard():
         _guard_update(session, stores, kind=kind)
         results, warning = _dispatch_bulk(
@@ -629,7 +719,7 @@ def bulk_action(  # noqa: PLR0913 - параметры HTTP-точки
         entity="stores",
         entity_id=None,
         details={
-            "action": payload.action,
+            **audit_details,
             "params": params,
             "stores": [item.store_id for item in results],
             "created": created,

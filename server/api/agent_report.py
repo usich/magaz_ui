@@ -5,8 +5,10 @@
 которая выполнилась, пока сервер был недоступен (FR-23). Все точки закрыты
 зависимостью `get_admin_store` — токен `X-Agent-Token` плюс контроль IP (§8.1).
 
-Состав: `POST /health` (Э2, отчёт о расхождении версий П-1/Д-1) и
-`POST /commands/{id}/result` (Э4). Точка `/receipts` — Э5, `/devices/status` — Э4Б.
+Состав: `POST /health` (Э2, отчёт о расхождении версий П-1/Д-1),
+`POST /commands/{id}/result` (Э4), `POST /devices/status` (Э4Б, Д-1) и
+`POST /receipts` (Э5, ФН3) — подтверждения «ознакомлен»/«отложено» вместе с
+составом сессий кассы (§4.8, П-2).
 """
 
 from __future__ import annotations
@@ -21,9 +23,14 @@ from sqlalchemy.orm import Session
 from server.config import API_PREFIX
 from server.core.dependencies import get_admin_store, get_db
 from server.db.models import Command, Store
-from server.services import command_service, device_service
+from server.services import command_service, device_service, notification_service
 from shared.enums import CommandStatus
-from shared.schemas import AgentHealthReport, CommandResultReport, DeviceStatusBatch
+from shared.schemas import (
+    AgentHealthReport,
+    CommandResultReport,
+    DeviceStatusBatch,
+    ReceiptBatch,
+)
 from shared.timeutil import to_iso_z, utcnow
 
 logger = logging.getLogger(__name__)
@@ -203,4 +210,55 @@ def agent_devices_status(
         updated=summary["updated"],
         ignored=summary["ignored"],
         agent_ok=payload.agent_ok,
+    )
+
+
+class ReceiptAck(BaseModel):
+    """Ответ на пакет подтверждений: что сервер записал (§5.2.2, §4.8)."""
+
+    ok: bool = True
+    store_id: int
+    created: int = 0
+    updated: int = 0
+    ignored: int = 0
+    expired: int = 0
+
+
+@router.post(
+    "/receipts",
+    response_model=ReceiptAck,
+    summary="Подтверждения «ознакомлен» и «отложено»",
+)
+def agent_receipts(
+    payload: ReceiptBatch,
+    store: Annotated[Store, Depends(get_admin_store)],
+    session: Annotated[Session, Depends(get_db)],
+) -> ReceiptAck:
+    """Принять пакет подтверждений от кассы (§5.2.2, §7.4, П-2).
+
+    Касса присылает две вещи, и обе нужны отчёту «X из Y» (§4.8):
+
+    * состав сессий Windows — по нему создаются строки `pending`, поэтому
+      «продавец2 — ожидание» виден админу сразу;
+    * что нажимали пользователи: `shown` (тост `info`), `acknowledged`
+      («Ознакомлен»), `snoozed` («Отложить») с `snooze_until`.
+
+    Повторная досылка из буфера безопасна: строки обновляются, а позднее
+    `shown` не откатывает уже поставленное «Ознакомлен» (П-2).
+    """
+    if payload.store_id != store.id:
+        logger.warning(
+            "Агент магазина id=%s прислал чужой store_id=%s в подтверждениях",
+            store.id,
+            payload.store_id,
+        )
+
+    summary = notification_service.apply_receipts(session, store, payload)
+    session.flush()
+    return ReceiptAck(
+        store_id=store.id,
+        created=summary["created"],
+        updated=summary["updated"],
+        ignored=summary["ignored"],
+        expired=summary["expired"],
     )

@@ -32,6 +32,7 @@ from shared.schemas import (
     DevicesConfigPush,
     HealthResponse,
     MergeParams,
+    NotifyRequest,
     UpdateParams,
 )
 
@@ -66,6 +67,8 @@ CREDENTIALS_PATH = "/credentials"
 #: §5.1.2: список оборудования подсети (Д-1) и внеочередная проверка (кнопка)
 DEVICES_CONFIG_PATH = "/devices/config"
 DEVICES_CHECK_NOW_PATH = "/devices/check-now"
+#: §5.1.2: приём уведомления от сервера (ФН3, Э5)
+NOTIFY_PATH = "/notify"
 
 #: Тип задачи → путь опроса его состояния (`/check-*`, Приложение B)
 JOB_STATE_PATHS: dict[str, str] = {
@@ -342,6 +345,23 @@ class AgentClient:
         """Общий разбор ответа `/run-*`: `202` + JSON-подтверждение."""
         body = await self.request_json("POST", path, json_body=payload)
         return body if isinstance(body, dict) else {}
+
+    async def notify(self, payload: NotifyRequest) -> dict[str, Any]:
+        """`POST /notify` — доставить уведомление на кассу (ФН3, §7.4).
+
+        Агент кладёт уведомление в файловую очередь (`notifications.json`),
+        поэтому недоступность сервера не важна: окно появится, когда служба
+        поднимется. В ответе приходит число сессий, которые касса сейчас
+        видит, — оно идёт в `notification_targets.sessions_count` (§4.7).
+        """
+        body = await self.request_json(
+            "POST", NOTIFY_PATH, json_body=payload.model_dump(mode="json")
+        )
+        if not isinstance(body, dict):
+            raise AgentProtocolError(
+                f"Агент магазина id={self.target.store_id} вернул не объект в /notify"
+            )
+        return body
 
     async def push_devices_config(self, payload: DevicesConfigPush) -> dict[str, Any]:
         """`POST /devices/config` — доставить список оборудования на кассу (Д-1).

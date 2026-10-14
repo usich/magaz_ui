@@ -33,6 +33,9 @@ const devicesHint = computed(() => {
   return `окно ${window} с · офлайн и без данных — по клику`
 })
 
+/** Э5: интервал возврата отложенного уведомления (§4.9, П-2). */
+const snoozeMin = computed(() => counts.value?.notifications_snooze_min ?? 15)
+
 onMounted(() => stores.startPolling())
 onUnmounted(() => stores.stopPolling())
 
@@ -87,7 +90,19 @@ function formatTime(value: string | null): string {
           :hint="devicesHint"
         />
       </RouterLink>
-      <StatusTile label="Ждут ознакомления" value="—" icon="pi pi-bell" hint="этап Э5" />
+      <RouterLink
+        :to="{ name: 'notifications', query: { status: 'active' } }"
+        class="block"
+        data-test="tile-notifications"
+        title="Уведомления: кто ещё не нажал «Ознакомлен»"
+      >
+        <StatusTile
+          label="Ждут ознакомления"
+          :value="counts?.notifications_pending ?? '—'"
+          icon="pi pi-bell"
+          :hint="`отложенное возвращается через ${snoozeMin} мин`"
+        />
+      </RouterLink>
       <StatusTile
         label="Задач в работе"
         :value="counts?.jobs_active ?? '—'"

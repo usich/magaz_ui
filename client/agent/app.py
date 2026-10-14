@@ -18,6 +18,13 @@
 `POST /devices/check-now` (Э4Б, Д-1) — список оборудования подсети и
 внеочередная проверка по кнопке «Проверить сейчас».
 
+Э5 (ФН3) добавляет уведомления: `POST /notify` принимает уведомление от сервера
+и кладёт его в файловую очередь (§7.4), а локальные точки `127.0.0.1` —
+`GET /notifications/pending`, `POST /notifications/{id}/shown|ack|snooze` —
+обслуживают TrayAgent пользовательской сессии. Токен агента в сессию
+пользователя не попадает: TrayAgent не ходит в сеть (§7.4). Кнопка «Отложить» —
+П-2/Д-10, интервал возврата задаёт сервер (`notification_snooze_min`, §4.9).
+
 Авторизация: `X-Agent-Token` из конфига магазина плюс, если задан
 `allowed_server_ips`, проверка IP источника (§5.1, §8.1). Повторный запуск
 1С-операции, пока идёт предыдущая, отвечает `409 Conflict` (I-13, Q23); лог
@@ -25,8 +32,8 @@
 push-ом, шифруется Fernet-ом с ключом под DPAPI машины и в логи не попадает
 (П-1, I-7). Опрос оборудования подсети ведёт фоновая задача `DeviceMonitor`
 (§7.6): `icmp` через `ping.exe` (argv, без shell) либо TCP-connect, результат
-батчем уходит на сервер. Уведомления (`/notify`, `/notifications/*`)
-подключаются на этапе Э5.
+батчем уходит на сервер. Уведомления ведёт `NotificationMonitor` (§7.4):
+сессии, дедлайны, дублирующий `msg.exe` и досылка подтверждений.
 """
 
 from __future__ import annotations
@@ -39,10 +46,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 
-from client.agent import credentials, devices, downloader, messenger
+from client.agent import credentials, devices, downloader, messenger, notifications
 from client.agent.config import AgentConfig, describe_os
 from client.agent.executor import OperationBusyError, OperationRunner
 from client.agent.models import AgentVersionResponse
@@ -56,6 +63,7 @@ from client.agent.one_c import (
 )
 from client.agent.processes import DEFAULT_PROVIDER, ProcessProvider
 from shared.schemas import (
+    AckRequest,
     CheckFilesParams,
     CheckFilesResponse,
     CredentialsPush,
@@ -67,6 +75,9 @@ from shared.schemas import (
     JobStateResponse,
     MergeParams,
     MessageParams,
+    NotifyRequest,
+    SessionRef,
+    SnoozeRequest,
     UpdateParams,
 )
 from shared.timeutil import to_iso_z, utcnow
@@ -74,7 +85,11 @@ from shared.version import APP_VERSION
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["create_agent_app"]
+__all__ = ["LOOPBACK_HOSTS", "create_agent_app"]
+
+#: Хосты, которым доступны локальные точки уведомлений (§7.4).
+#: `testclient` — адрес клиента в тестах FastAPI: в бою такого узла не бывает.
+LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 
 
 
@@ -132,6 +147,9 @@ def create_agent_app(
     devices_monitor: bool | None = None,
     devices_transport: Any = None,  # noqa: ANN401 - httpx.AsyncBaseTransport в тестах
     devices_startup_delay_sec: float = 5.0,
+    notifications_monitor: bool | None = None,
+    notifications_transport: Any = None,  # noqa: ANN401 - httpx.AsyncBaseTransport в тестах
+    notifications_startup_delay_sec: float = 5.0,
 ) -> FastAPI:
     """Собрать приложение агента по его конфигу (§7.2).
 
@@ -140,8 +158,10 @@ def create_agent_app(
     реальная 1С, `msg.exe` и `taskkill` в тестах не запускаются.
 
     Э4Б: `devices_monitor` включает фоновый опрос оборудования подсети (§7.6).
-    По умолчанию он поднимается, если в конфиге задан адрес сервера; `False`
-    нужен тестам и локальной отладке без сети.
+    Э5: `notifications_monitor` включает расписание уведомлений (§7.4) —
+    сессии, дедлайны, дублирующий `msg.exe` и досылка подтверждений. Оба
+    расписания по умолчанию поднимаются, если в конфиге задан адрес сервера;
+    `False` нужен тестам и локальной отладке без сети.
     """
     started = started_at or utcnow()
     one_c_paths = paths or OneCPaths(
@@ -180,6 +200,21 @@ def create_agent_app(
     monitor_enabled = (
         bool(config.server_url) if devices_monitor is None else bool(devices_monitor)
     )
+    #: Э5 (ФН3): очередь уведомлений и подтверждений — файл `notifications.json`
+    notifications_queue = notifications.NotificationQueue.load(config.notifications_path)
+    receipt_sender = notifications.ReceiptSender(config, transport=notifications_transport)
+    notification_monitor = notifications.NotificationMonitor(
+        notifications_queue,
+        config=config,
+        sender=receipt_sender,
+        provider=process_provider,
+        startup_delay_sec=notifications_startup_delay_sec,
+    )
+    notifications_enabled = (
+        bool(config.server_url)
+        if notifications_monitor is None
+        else bool(notifications_monitor)
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -199,9 +234,18 @@ def create_agent_app(
                 len(devices_store.active()),
                 device_monitor.interval_sec,
             )
+        if notifications_enabled:
+            notification_monitor.start()
+            logger.info(
+                "Уведомления включены: у очереди %s уведомлений, интервал сверки %s с",
+                len(notifications_queue.notifications),
+                notification_monitor.interval_sec,
+            )
         try:
             yield
         finally:
+            if notifications_enabled:
+                await notification_monitor.stop()
             await device_monitor.stop()
             await operations.shutdown()
 
@@ -271,6 +315,23 @@ def create_agent_app(
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Запрос пришёл не с адреса сервера",
+            )
+
+    def require_loopback(request: Request) -> None:
+        """Локальные точки уведомлений: только `127.0.0.1` (§7.4).
+
+        TrayAgent не имеет токена агента и не должен иметь: он разговаривает со
+        службой по локальному адресу. Поэтому здесь проверяется адрес источника,
+        а не `X-Agent-Token` — так токен не попадает в пользовательскую сессию.
+        """
+        host = source_host(request)
+        if host not in LOOPBACK_HOSTS:
+            logger.warning(
+                "Отклонён запрос к локальным точкам уведомлений с адреса %s", host
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Локальные точки уведомлений доступны только с 127.0.0.1",
             )
 
     # --- §5.1.1: перенос v2 (поведение и коды ответов 1:1) -------------------
@@ -504,6 +565,119 @@ def create_agent_app(
             "killed_1cv8": killed,
         }
 
+    # --- Э5 (ФН3): уведомления (§5.1.2, §7.4) --------------------------------
+
+    @app.post(
+        "/notify",
+        dependencies=[Depends(require_agent_token)],
+        summary="Приём уведомления от сервера",
+        tags=["notifications"],
+    )
+    async def notify(payload: NotifyRequest = Body(...)) -> dict[str, object]:
+        """Положить уведомление в файловую очередь и вернуть число сессий (§5.1.2).
+
+        Показ делает TrayAgent: служба только хранит уведомление, поэтому
+        недоступность сервера после этого запроса ничего не ломает — окно
+        появится, когда пользователь войдёт (§7.4).
+        """
+        result = notifications_queue.accept(payload)
+        # Дублирующий канал `msg.exe` — сразу, не дожидаясь цикла расписания
+        if payload.use_msg_exe and str(payload.severity) in notifications.MSG_SEVERITIES:
+            spawn(notification_monitor.send_msg_duplicates(), name="agent-notify-msg")
+        return result
+
+    @app.get(
+        "/notifications/pending",
+        dependencies=[Depends(require_loopback)],
+        summary="Уведомления для сессии пользователя",
+        tags=["notifications"],
+    )
+    def notifications_pending(
+        session: str = Query(min_length=1, description="Идентификатор сессии Windows"),
+        user: str = Query(min_length=1, description="Логин Windows в сессии"),
+    ) -> dict[str, object]:
+        """Что показать в этой сессии (§5.1.2, §7.4).
+
+        Отдаются только незакрытые уведомления: отложенное вернётся само, когда
+        пройдёт `snooze_until` (П-2), а `info` ждёт явного «Ознакомлен» в трее.
+        Заодно служба запоминает сессию — по ней сервер считает «X из Y» (§4.8).
+        """
+        ref = SessionRef(session_id=session, session_user=user)
+        items = notifications_queue.pending_for(ref)
+        return {"notifications": [item.model_dump(mode="json") for item in items]}
+
+    @app.post(
+        "/notifications/{notification_id}/shown",
+        dependencies=[Depends(require_loopback)],
+        summary="Уведомление показано (тост)",
+        tags=["notifications"],
+    )
+    async def notification_shown(
+        notification_id: int, payload: SessionRef = Body(...)
+    ) -> dict[str, object]:
+        """Отметить «показано» и сразу попробовать дослать подтверждение (§7.4).
+
+        Досылка идёт фоновой задачей: TrayAgent не должен ждать сервер, а при
+        недоступности сети подтверждение останется в очереди на диске.
+        """
+        if not notifications_queue.mark_shown(notification_id, payload):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Уведомление id={notification_id} на кассе не найдено",
+            )
+        spawn(notification_monitor.flush(), name="agent-receipts")
+        return {"ok": True, "status": "shown"}
+
+    @app.post(
+        "/notifications/{notification_id}/ack",
+        dependencies=[Depends(require_loopback)],
+        summary="«Ознакомлен»",
+        tags=["notifications"],
+    )
+    async def notification_ack(
+        notification_id: int, payload: AckRequest = Body(...)
+    ) -> dict[str, object]:
+        """Кнопка «Ознакомлен» (FR-26): фиксируется по сессии Windows.
+
+        Учёт именно по сессии, а не по сотруднику (П-6): справочника нет, и
+        «ознакомлен» ставит тот, кто в этот момент работает за кассой (§11.5).
+        """
+        ref = SessionRef(session_id=payload.session_id, session_user=payload.session_user)
+        if not notifications_queue.acknowledge(
+            notification_id, ref, comment=payload.comment
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Уведомление id={notification_id} на кассе не найдено",
+            )
+        spawn(notification_monitor.flush(), name="agent-receipts")
+        return {"ok": True, "status": "acknowledged"}
+
+    @app.post(
+        "/notifications/{notification_id}/snooze",
+        dependencies=[Depends(require_loopback)],
+        summary="«Отложить»",
+        tags=["notifications"],
+    )
+    async def notification_snooze(
+        notification_id: int, payload: SnoozeRequest = Body(...)
+    ) -> dict[str, object]:
+        """Кнопка «Отложить» (П-2, Д-10).
+
+        Уведомление остаётся **непрочитанным** и скрывается до `snooze_until`:
+        интервал возврата задан настройкой сервера (`notification_snooze_min`)
+        и приехал вместе с уведомлением — на кассе его не правят.
+        """
+        ref = SessionRef(session_id=payload.session_id, session_user=payload.session_user)
+        until = notifications_queue.snooze(notification_id, ref)
+        if until is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Уведомление id={notification_id} на кассе не найдено",
+            )
+        spawn(notification_monitor.flush(), name="agent-receipts")
+        return {"ok": True, "status": "snoozed", "snooze_until": until}
+
     @app.get("/", include_in_schema=False)
     def root() -> dict[str, str]:
         """Перенос v2 1:1: `{"status":"online"}` — без токена (§5.1.1)."""
@@ -522,7 +696,8 @@ def create_agent_app(
         `busy` честно показывает идущую 1С-операцию (Q23), а
         `interrupted_operation` — операцию, прерванную перезагрузкой кассы (§7.3):
         по этому полю сервер и админ видят, что обновление не дожило до конца.
-        Сессии пользователей наполняются на этапе Э5 (TrayAgent).
+        Сессии пользователей берутся из очереди уведомлений: их видит TrayAgent и
+        сообщает службе при опросе `GET /notifications/pending` (§7.4, Q50).
         """
         return HealthResponse(
             store_id=config.store_id or None,
@@ -532,7 +707,7 @@ def create_agent_app(
             base_1c_path=config.base_1c_path,
             os=describe_os(),
             busy=operations.busy_state,
-            sessions=[],
+            sessions=notifications_queue.sessions(),
             credentials_version=config.credentials_version,
             devices_version=config.devices_version,
             interrupted_operation=operations.interrupted_operation,
@@ -569,4 +744,7 @@ def create_agent_app(
     app.state.agent_runner = operations
     #: Д-1: расписание опроса оборудования (диагностика и тесты)
     app.state.agent_devices = device_monitor
+    #: Э5: расписание уведомлений и очередь подтверждений (диагностика и тесты)
+    app.state.agent_notifications = notification_monitor
+    app.state.agent_notification_queue = notifications_queue
     return app

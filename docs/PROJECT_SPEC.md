@@ -2,7 +2,7 @@
 
 | Параметр | Значение |
 |---|---|
-| Версия документа | **1.8** (правки П-1…П-4, добавки Д-1…Д-9; ответы заказчика 13.10.2026 — П-5…П-8; Э4Б: добавка Д-9 — расписание опроса оборудования приходит агенту вместе со списком) |
+| Версия документа | **1.9** (правки П-1…П-4, добавки Д-1…Д-10; ответы заказчика 13.10.2026 — П-5…П-8; Э4Б: добавка Д-9 — расписание опроса оборудования приходит агенту вместе со списком; Э5: добавка Д-10 — кнопка «Отложить» получила локальную точку агента) |
 | Дата | 13.10.2026 |
 | Статус | **Источник истины до старта кодирования.** Код пишется только после вычитки этого документа |
 | Рабочая папка (монорепо) | `c:\Users\ilausicenko\PycharmProjects\magaz UI` |
@@ -295,6 +295,13 @@
 > уходят агенту в теле `POST /devices/config` (`check_interval_sec`, `ping_timeout_ms`) вместе с
 > списком устройств. Меняются из `/settings` без правки конфига на каждой кассе.
 
+> **Д-10.** `notification_snooze_min` тоже серверная настройка, и она уезжает на кассу вместе с
+> уведомлением (`POST /notify`, поле `snooze_min`). Кнопке «Отложить» (П-2) нужна своя локальная
+> точка — `POST /notifications/{id}/snooze` (`127.0.0.1`, тело `{"session_id","session_user"}`):
+> `shown`/`ack` в §5.1.2 были, а «отложить» — нет. Агент сам считает `snooze_until` и присылает
+> `snoozed` вместе с `snooze_count` в пакете подтверждений; отложенное **не** считается
+> ознакомленным (§4.8, §7.4, §11.5).
+
 ### 4.10 `audit_log` — действия администраторов
 
 | Колонка | Тип | Описание |
@@ -357,10 +364,11 @@
 |---|---|---|---|
 | GET | `/health` | Мониторинг и идентификация | `{"status":"online","store_id":12,"agent_version":"1.0.0","uptime_sec":…,"work_dir":"C:\\MagazAgent","base_1c_path":…,"os":"Windows Server 2019","busy":{"merge":false,"update":false},"sessions":[{"user":"user1","sid":"1"}]}` |
 | GET | `/version` | Версия агента и рабочих путей | |
-| GET | `/notifications/pending?session=<sid>` | Список уведомлений для сессии (только `127.0.0.1`) | `{"notifications":[{"id","title","body","severity","requires_ack","repeat_every_min"}]}` |
-| POST | `/notifications/{id}/shown` | «Показано» (Info-тост) — только `127.0.0.1` | `200` |
-| POST | `/notifications/{id}/ack` | Кнопка «Ознакомлен» — только `127.0.0.1`, тело `{"session_id","session_user","comment"?}` | `200` |
-| POST | `/notify` | Приём уведомления от сервера (кладёт в очередь + `msg.exe`) | `200 {"queued":true,"sessions":2}` |
+| GET | `/notifications/pending?session=<sid>&user=<login>` | Список уведомлений для сессии (только `127.0.0.1`); заодно регистрирует сессию для «X из Y» | `{"notifications":[{"id","title","body","severity","requires_ack","repeat_every_min","snooze_until"}]}` |
+| POST | `/notifications/{id}/shown` | «Показано» (Info-тост) — только `127.0.0.1`, тело `{"session_id","session_user"}` | `200 {"ok":true,"status":"shown"}` |
+| POST | `/notifications/{id}/ack` | Кнопка «Ознакомлен» — только `127.0.0.1`, тело `{"session_id","session_user","comment"?}` | `200 {"ok":true,"status":"acknowledged"}` |
+| POST | `/notifications/{id}/snooze` | **Д-10:** кнопка «Отложить» (П-2) — только `127.0.0.1`, тело `{"session_id","session_user"}`; скрывает окно до `snooze_until` = сейчас + `snooze_min` от сервера | `200 {"ok":true,"status":"snoozed","snooze_until":…}` |
+| POST | `/notify` | Приём уведомления от сервера (кладёт в файловую очередь, дублирует `msg.exe` для `important`/`critical`) | `200 {"queued":true,"sessions":2}` |
 | GET | `/jobs/{id}` | Статус задачи на агенте (если сервер работает pull-контуром) | `{"status","logs"}` |
 | GET | `/check-files/last` | Последний снимок проверки (кэш для дашборда) | |
 | POST | `/credentials` | Push учётных данных 1С от сервера (П-1): `{"user_name","password","credentials_version"}` → агент пишет в шифрованный конфиг. Только для сети сервера, `X-Agent-Token` обязателен | `200 {"stored":true,"credentials_version":3}` |
@@ -993,6 +1001,7 @@ magaz UI\
 | Д-7 | §4.9 | В §4.9 не было настроек, ограничивающих ожидание операции и период сверки учётных данных 1С, хотя §8.3 требует «расхождение версий → повторный push», а задача может «зависнуть» навсегда | Добавлены `command_poll_timeout_sec` (по умолчанию `3600`) — предел ожидания операции 1С и `credentials_push_interval_sec` (`300`) — как часто сервер сверяет `credentials_version` кассы | `внесено` | Найдено при реализации Э4: без предела ожидания `commands.status` не переходит в `timeout`, а без периода сверки П-1 превращался бы в опрос `/health` каждые 5 секунд. §4.9, §11.3, §12 Э4 |
 | Д-8 | §5.2.2, §11.6, §12 Э6 | В §11.6 в `/settings` требуется «управление администраторами», но точек API для него в §5.2.2 не было | Добавлены `GET/POST /api/v1/admin/admins` и `PUT/DELETE /api/v1/admin/admins/{id}`: список, создание, смена пароля, блокировка (`is_active=false`). Хеш пароля наружу не отдаётся, действия попадают в аудит. Реализуется вместе со страницей `/settings` на этапе Э6 | `внесено` | Найдено при подготовке Э4Б/Э6. §5.2.2, §11.6, §12 Э6, §13.2 |
 | Д-9 | §4.9, §5.1.2, §7.6, §11.7 | Расписание опроса оборудования (`device_check_interval_sec`, `device_ping_timeout_ms`) описано как серверная настройка §4.9, но в `POST /devices/config` переносились только версия и список — чтобы поменять интервал, пришлось бы править `agent-config.json` на каждой кассе | В тело `POST /devices/config` добавлены `check_interval_sec` и `ping_timeout_ms` (`null` — оставить прежние значения): диспетчер подставляет их из настроек, агент применяет без перезапуска службы | `внесено` | Найдено при реализации Э4Б. §4.9 (врезка), §5.1.2, §7.6, §11.7. Код: `shared/schemas.py::DevicesConfigPush`, `server/core/dispatcher.py::_sync_devices`, `client/agent/devices.py` |
+| Д-10 | §5.1.2, §4.9, §7.4, §11.5 | В §5.1.2 у уведомления есть только `/notifications/pending`, `/shown` и `/ack`, хотя П-2 требует кнопку «Отложить», а интервал возврата (`notification_snooze_min`) — серверная настройка §4.9 | Добавлена локальная точка агента `POST /notifications/{id}/snooze` (только `127.0.0.1`), а `snooze_min` уезжает на кассу в теле `POST /notify`. Агент хранит `snooze_count`/`snooze_until` в `notifications.json`, возвращает окно сам и досылает `snoozed` в пакете `POST /api/v1/agent/receipts`; «отложено» не считается ознакомлением (П-2) | `внесено` | Найдено при реализации Э5. §4.9 (врезка), §5.1.2, §7.4, §9.2 FR-26, §11.5, §13.2. Код: `client/agent/notifications.py`, `client/agent/app.py`, `shared/schemas.py::SnoozeRequest`, `server/services/notification_service.py` |
 
 ### D.2 Поправки — изменения уже написанного
 

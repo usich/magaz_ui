@@ -20,8 +20,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from server.api import operations as operations_api
 from server.api import devices as devices_api
+from server.api import notifications as notifications_api
+from server.api import operations as operations_api
 from server.api import stores as stores_api
 from server.config import API_PREFIX
 from server.core.context import AppContext
@@ -32,6 +33,7 @@ from server.services import (
     audit_service,
     command_service,
     device_service,
+    notification_service,
     settings_service,
     store_service,
 )
@@ -148,6 +150,9 @@ router.include_router(operations_api.router)
 #: Оборудование подсети (Э4Б, Д-1): CRUD, «проверить сейчас», сводная таблица
 #: (§5.2.2, §11.7)
 router.include_router(devices_api.router)
+#: Уведомления (Э5, ФН3): создание и рассылка, список, отчёт «X из Y» и CSV,
+#: отмена (§5.2.2, §11.5)
+router.include_router(notifications_api.router)
 
 
 # --- Вход/выход (§4.2, §8.1) ------------------------------------------------
@@ -283,6 +288,10 @@ def system_info_payload(session: Session, context: AppContext) -> dict[str, Any]
             "devices_total": devices_total,
             "devices_online": devices_online,
             "devices_window_sec": device_window,
+            # Э5: плитка «Ждут ознакомления» — неознакомленные сессии по
+            # доставленным уведомлениям (§11.1, §4.8, П-2)
+            "notifications_pending": notification_service.pending_count(session),
+            "notifications_snooze_min": notification_service.snooze_min(session),
         },
         "settings_keys": len(settings_service.DEFAULT_SETTINGS),
     }

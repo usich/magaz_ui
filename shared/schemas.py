@@ -244,6 +244,35 @@ class AckRequest(BaseModel):
         return value.strip()
 
 
+class SessionRef(BaseModel):
+    """Сессия Windows, от имени которой действует TrayAgent (§5.1.2, П-2).
+
+    Служба и сервер не знают учётной записи сотрудника (П-6: справочника нет):
+    адресат — логин Windows, а «своё окно и свой `receipt`» получает каждая
+    локальная сессия кассы (Q50: 1–2 сессии на ПК).
+    """
+
+    session_id: str
+    session_user: str
+
+    @field_validator("session_id", "session_user")
+    @classmethod
+    def not_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Значение не может быть пустым")
+        return value.strip()
+
+
+class SnoozeRequest(SessionRef):
+    """`POST /notifications/{id}/snooze` — «Отложить» из сессии (П-2, Д-10).
+
+    Интервал возврата задаёт **сервер** (`notification_snooze_min`, §4.9) и
+    присылает его вместе с уведомлением: на кассе настройку не правят.
+    """
+
+    snooze_min: int | None = None
+
+
 # --- П-1: учётные данные 1С -------------------------------------------------
 
 
@@ -376,10 +405,13 @@ class AgentHealthReport(BaseModel):
     sessions: list[AgentSession] = Field(default_factory=list)
 
 
-class ReceiptReport(BaseModel):
-    """`POST /api/v1/agent/receipts` — «ознакомлен»/«показано» напрямую от агента (§5.2.2)."""
+class ReceiptItem(BaseModel):
+    """Одно подтверждение по сессии в пакете от агента (§4.8, П-2).
 
-    store_id: int
+    `status` — то, что видит пользователь: `shown` (тост `info` показан),
+    `acknowledged` («Ознакомлен»), `snoozed` («Отложить»), `expired` (дедлайн).
+    """
+
     notification_id: int
     session_id: str
     session_user: str
@@ -387,6 +419,27 @@ class ReceiptReport(BaseModel):
     comment: str | None = None
     snooze_until: str | None = None
     shown_at: str | None = None
+
+
+class ReceiptReport(ReceiptItem):
+    """`POST /api/v1/agent/receipts` — одиночное подтверждение напрямую от агента (§5.2.2)."""
+
+    store_id: int
+
+
+class ReceiptBatch(BaseModel):
+    """`POST /api/v1/agent/receipts` — пакет подтверждений и состав сессий (§5.2.2).
+
+    Пакет нужен для очереди (§7.4): пока касса не видит сервер, `ack` и
+    «отложено» копятся в `notifications.json` и досылаются целиком при первой
+    связи. Список `sessions` — это то, что TrayAgent реально видит на кассе: по
+    нему сервер создаёт `pending`-строки, поэтому «X из Y» честно показывает
+    «продавец2 — ожидание» (§4.8).
+    """
+
+    store_id: int
+    receipts: list[ReceiptItem] = Field(default_factory=list)
+    sessions: list[AgentSession] = Field(default_factory=list)
 
 
 class CommandResultReport(BaseModel):

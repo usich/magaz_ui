@@ -39,6 +39,10 @@ export interface SystemCounts {
   devices_online: number
   /** Э4Б: окно «устройство онлайн» — своё, не `online_window_sec` (§4.11) */
   devices_window_sec: number
+  /** Э5: сессии, которые ещё не нажали «Ознакомлен» — плитка «Ждут ознакомления» (§4.8, П-2) */
+  notifications_pending: number
+  /** Э5: интервал возврата отложенного уведомления — `notification_snooze_min` (§4.9) */
+  notifications_snooze_min: number
 }
 
 export interface SystemInfo {
@@ -396,3 +400,135 @@ export interface BulkActionResponse {
   jobs: BulkActionJob[]
   warning: string | null
 }
+
+// --- Уведомления (§4.6–4.8, §11.5, Э5) ---------------------------------------
+
+/** Уровни важности уведомления (§4.6): `info`/`important`/`critical`. */
+export type NotificationSeverity = 'info' | 'important' | 'critical'
+
+/** Адресация уведомления: все магазины / список / кластер (§4.6). */
+export type NotificationTargetType = 'all' | 'stores' | 'cluster'
+
+/** Статус рассылки в списке `/notifications` (§11.5). */
+export type NotificationState = 'active' | 'done' | 'canceled'
+
+/** Статус ознакомления по сессии Windows (§4.8, П-2). */
+export type ReceiptStatus = 'pending' | 'shown' | 'acknowledged' | 'snoozed' | 'expired'
+
+/** Прогресс «ознакомлены X из Y» — считается сервером по факту (§4.8). */
+export interface NotificationTotals {
+  stores: number
+  stores_delivered: number
+  sessions: number
+  receipts: number
+  acknowledged: number
+  shown: number
+  snoozed: number
+  expired: number
+  pending: number
+  percent: number
+}
+
+export interface NotificationItem {
+  id: number
+  title: string
+  body: string
+  severity: NotificationSeverity
+  requires_ack: boolean
+  target_type: NotificationTargetType
+  target_value: string | null
+  deadline_at: string | null
+  repeat_every_min: number | null
+  use_msg_exe: boolean
+  is_active: boolean
+  state: NotificationState
+  created_by: string | null
+  created_at: string | null
+  store_names: string[]
+  totals: NotificationTotals
+}
+
+export interface NotificationList {
+  items: NotificationItem[]
+  total: number
+  /** Счётчики по статусам: в работе / завершено / отменено (§11.5). */
+  counts: Record<string, number>
+  /** Плитка главной «Ждут ознакомления» (§11.1). */
+  pending_receipts: number
+  /** Интервал возврата отложенного — `notification_snooze_min` (§4.9, П-2). */
+  snooze_min: number
+}
+
+export interface NotificationFilters {
+  status?: NotificationState | 'all'
+  severity?: NotificationSeverity | 'all'
+  search?: string
+  storeId?: number | null
+  limit?: number
+}
+
+export interface NotificationCreatePayload {
+  title: string
+  body: string
+  severity: NotificationSeverity
+  requires_ack: boolean
+  target_type: NotificationTargetType
+  store_ids?: number[]
+  cluster?: string | null
+  deadline_at?: string | null
+  repeat_every_min?: number | null
+  use_msg_exe: boolean
+}
+
+export interface NotificationCreateResponse {
+  notification: NotificationItem
+  stores: number
+  jobs: number
+  /** Магазины, которым уведомление не ушло: отключены (§11.5). */
+  skipped_store_ids: number[]
+  message: string
+}
+
+/** Строка сессии в отчёте по уведомлению (§11.5). */
+export interface NotificationReceiptRow {
+  session_user: string
+  session_id: string
+  status: ReceiptStatus
+  shown_at: string | null
+  acknowledged_at: string | null
+  ack_comment: string | null
+  snooze_count: number
+  snooze_until: string | null
+  is_acknowledged: boolean
+  is_overdue: boolean
+}
+
+export interface NotificationStoreReport {
+  store_id: number
+  store_name: string | null
+  cluster_name: string | null
+  store_is_active: boolean
+  delivered_at: string | null
+  sessions_count: number
+  total: number
+  acknowledged: number
+  receipts: NotificationReceiptRow[]
+}
+
+export interface NotificationReport {
+  notification: NotificationItem
+  state: NotificationState
+  deadline_at: string | null
+  created_at: string | null
+  totals: NotificationTotals
+  snooze_min: number
+  stores: NotificationStoreReport[]
+}
+
+export interface CancelNotificationResponse {
+  notification_id: number
+  state: NotificationState
+  canceled_jobs: number
+  message: string
+}
+

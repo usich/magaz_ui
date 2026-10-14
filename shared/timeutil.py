@@ -8,7 +8,7 @@ DATETIME как строку без часового пояса, и смешив
 
 from datetime import datetime, timezone
 
-__all__ = ["utcnow", "to_iso_z"]
+__all__ = ["parse_iso_z", "utcnow", "to_iso_z"]
 
 
 def utcnow() -> datetime:
@@ -21,3 +21,27 @@ def to_iso_z(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.replace(microsecond=0).isoformat() + "Z"
+
+
+def parse_iso_z(value: str | None) -> datetime | None:
+    """Разобрать ISO-8601 (с `Z` или смещением) в метку БД: UTC, naive (§6).
+
+    Нужна для полей, которые приходят строками: дедлайн уведомления из UI и
+    `snooze_until` из очереди агента. Битое значение — `None`, а не исключение:
+    неверный формат одной отметки не должен ронять приём отчёта (§7.4).
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    parsed = None
+    for candidate in (text, text.replace("Z", "+00:00"), text.replace("Z", "")):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed

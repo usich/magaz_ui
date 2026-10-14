@@ -1,6 +1,6 @@
 /** Точки API: вход администратора (§5.2.2), системная информация, настройки, аудит. */
 
-import { api } from './client'
+import { API_BASE, api } from './client'
 import type {
   ActionPayload,
   ActionResponse,
@@ -8,6 +8,7 @@ import type {
   AuditEntry,
   BulkActionPayload,
   BulkActionResponse,
+  CancelNotificationResponse,
   DeviceCheckResponse,
   DeviceCreatePayload,
   DeviceItem,
@@ -20,6 +21,11 @@ import type {
   JobFilters,
   JobsPage,
   LoginPayload,
+  NotificationCreatePayload,
+  NotificationCreateResponse,
+  NotificationFilters,
+  NotificationList,
+  NotificationReport,
   ServerHealth,
   SettingItem,
   StoreCreatePayload,
@@ -207,3 +213,42 @@ export const devicesApi = {
     return api.get<DevicesMatrix>(`/admin/devices/matrix${suffix}`)
   },
 }
+
+/**
+ * Уведомления пользователям (§11.5, ФН3, Э5).
+ *
+ * Создание и рассылка — один запрос: сервер фиксирует адресацию и ставит задачи
+ * `notify`, а доставку выполняет диспетчер (§11.4). Отчёт «X из Y» и CSV
+ * читаются отдельно, поэтому список не «утяжеляется» сессиями.
+ */
+export const notificationsApi = {
+  list: (filters: NotificationFilters = {}) => {
+    const query = new URLSearchParams()
+    if (filters.status && filters.status !== 'all') query.set('status', filters.status)
+    if (filters.severity && filters.severity !== 'all') query.set('severity', filters.severity)
+    if (filters.search?.trim()) query.set('search', filters.search.trim())
+    if (filters.storeId) query.set('store_id', String(filters.storeId))
+    if (filters.limit !== undefined) query.set('limit', String(filters.limit))
+    const suffix = query.toString() ? `?${query}` : ''
+    return api.get<NotificationList>(`/admin/notifications${suffix}`)
+  },
+
+  /** Создать и разослать: адресация «все / кластер / список магазинов» (§11.5). */
+  create: (payload: NotificationCreatePayload) =>
+    api.post<NotificationCreateResponse>('/admin/notifications', payload),
+
+  /** Отчёт по магазинам и сессиям (§11.5): кто ознакомлен, кто отложил, кто ждёт. */
+  get: (id: number) => api.get<NotificationReport>(`/admin/notifications/${id}`),
+
+  /** Остановить рассылку: показы прекращаются, отчёт сохраняется (§11.5). */
+  cancel: (id: number) =>
+    api.post<CancelNotificationResponse>(`/admin/notifications/${id}/cancel`),
+
+  /**
+   * Ссылка на CSV-отчёт (§11.5): файл скачивает браузер, а cookie сессии
+   * отправляется автоматически — вручную скачивать его через `fetch` не нужно.
+   */
+  reportCsvUrl: (id: number) =>
+    `${API_BASE}/admin/notifications/${id}/report?format=csv`,
+}
+

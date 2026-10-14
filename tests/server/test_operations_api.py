@@ -239,7 +239,7 @@ class TestSingleAction:
             ("run_merge", {"file_name": "../evil"}, "разделителей"),
             ("download_file", {}, "url-file"),
             ("send_message", {}, "Текст сообщения"),
-            ("notify", {"title": "x"}, "Э5"),
+            ("notify", {"title": "x"}, "не может быть пустым"),
             ("hack_the_planet", {}, "Неизвестное действие"),
         ],
     )

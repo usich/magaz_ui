@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 from collections.abc import Iterator
 from uuid import uuid4
 
@@ -504,6 +505,13 @@ class TestUnfinishedOperation:
         dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
 
         await dispatcher.process_once()  # отправка, started_at заполнен
+
+        # Отсчёт таймаута сдвигаем в прошлое: с нулевым пределом проверка иначе
+        # зависела бы от часов — два цикла успевают пройти за доли миллисекунды.
+        state = fresh(session, command.id)
+        state.started_at = utcnow() - timedelta(seconds=5)
+        session.commit()
+
         await dispatcher.process_once()  # предел ожидания вышел
 
         state = fresh(session, command.id)

@@ -55,7 +55,12 @@ from server.core.client_http import (
 from server.core.security import SecretBox
 from server.db.models import Command, FileCheck, Store
 from server.db.session import DatabaseManager
-from server.services import command_service, device_service, settings_service
+from server.services import (
+    command_service,
+    device_service,
+    notification_service,
+    settings_service,
+)
 from shared.enums import CommandKind, CommandStatus, JobLogLevel
 from shared.schemas import CheckFilesResponse, CredentialsPush
 from shared.timeutil import utcnow
@@ -418,15 +423,14 @@ class CommandDispatcher:
                 await self._send_1c(session, store, command, client, report)
             elif kind == str(CommandKind.SEND_MESSAGE):
                 await self._send_message(session, command, client, report)
+            elif kind == str(CommandKind.NOTIFY):
+                await self._send_notify(session, store, command, client, report)
             else:
                 self._finish(
                     session,
                     command,
                     CommandStatus.ERROR,
-                    message=(
-                        f"Тип задачи {kind!r} на этом этапе не выполняется "
-                        "(уведомления — Э5)"
-                    ),
+                    message=f"Тип задачи {kind!r} на этом этапе не выполняется",
                     report=report,
                 )
 
@@ -538,6 +542,78 @@ class CommandDispatcher:
             command,
             CommandStatus.SUCCESS,
             message=f"Сообщение отправлено пользователям (1cv8.exe завершён: {killed})",
+            report=report,
+        )
+
+    async def _send_notify(
+        self,
+        session: Any,  # noqa: ANN401 - Session
+        store: Store,
+        command: Command,
+        client: AgentClient,
+        report: DispatchReport,
+    ) -> None:
+        """`POST /notify`: уведомление уходит в файловую очередь кассы (ФН3, §7.4).
+
+        Это не операция 1С: агент отвечает сразу, а показ в сессиях делает
+        TrayAgent. Отменённую рассылку не отправляем вовсе — задача закрывается
+        `canceled` без попыток (§11.5). Ответ агента несёт число видимых сессий:
+        оно попадает в `notification_targets` (§4.7).
+        """
+        try:
+            notification_id = int((command.params or {}).get("notification_id") or 0)
+        except (TypeError, ValueError):
+            notification_id = 0
+
+        if notification_id <= 0:
+            self._finish(
+                session,
+                command,
+                CommandStatus.ERROR,
+                message="В задаче нет id уведомления — отправлять нечего",
+                report=report,
+                level=JobLogLevel.ERROR,
+            )
+            return
+
+        try:
+            notification = notification_service.get_notification(session, notification_id)
+        except notification_service.NotificationNotFoundError as exc:
+            self._finish(
+                session,
+                command,
+                CommandStatus.ERROR,
+                message=str(exc),
+                report=report,
+                level=JobLogLevel.ERROR,
+            )
+            return
+
+        if not notification.is_active:
+            self._finish(
+                session,
+                command,
+                CommandStatus.CANCELED,
+                message="Уведомление отменено до отправки на кассу",
+                report=report,
+            )
+            return
+
+        payload = notification_service.push_payload(session, store, notification)
+        body = await client.notify(payload)
+        self._register_send(session, command, report)
+
+        sessions = 0
+        try:
+            sessions = int(body.get("sessions") or 0)
+        except (TypeError, ValueError):
+            sessions = 0
+        notification_service.mark_delivered(session, store, notification, sessions=sessions)
+        self._finish(
+            session,
+            command,
+            CommandStatus.SUCCESS,
+            message=f"Уведомление доставлено на кассу (сессий на кассе: {sessions})",
             report=report,
         )
 

@@ -1,0 +1,902 @@
+"""Уведомления пользователям магазинов (§4.6–4.8, ФН3, §11.5) — сервисный слой.
+
+Модуль отвечает за весь путь уведомления на серверной стороне:
+
+* **адресация** (`all` / список магазинов / кластер) и создание строк
+  `notification_targets` — знаменателя «Y» (§4.7);
+* **доставка**: рассылка ставится задачами `notify` по магазинам, поэтому
+  выключенная касса не теряет уведомление — оно ждёт в `commands` и уходит,
+  как только магазин появился в сети (§11.4, FR-16);
+* **приём факта доставки** от агента: `delivered_at` и `sessions_count`;
+* **числитель «X»**: `notification_receipts` по сессиям Windows (П-6 — учётная
+  запись, а не сотрудник). Строки `pending` создаются по составу сессий,
+  который докладывает агент, поэтому отчёт честно показывает «продавец2 —
+  ожидание» (§4.8);
+* **«Отложить» (П-2)**: статус `snoozed` остаётся **непрочитанным**, хранит
+  `snooze_count` и `snooze_until`; интервал возврата — настройка сервера
+  `notification_snooze_min` (§4.9), на кассе её не правят;
+* **отмена** (`is_active=false`) с закрытием ещё не отправленных задач;
+* **отчёт «X из Y»** по магазинам и сессиям с выгрузкой CSV (§11.5).
+
+Пароли и любые секреты через этот модуль не проходят: уведомление — это
+заголовок, текст и адресация.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import logging
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, selectinload
+
+from server.db.models import (
+    Command,
+    Notification,
+    NotificationReceipt,
+    NotificationTarget,
+    Store,
+)
+from server.services import command_service, settings_service
+from shared.enums import (
+    CommandKind,
+    CommandStatus,
+    NotificationSeverity,
+    NotificationStatus,
+    ReceiptStatus,
+    TargetType,
+)
+from shared.schemas import NotifyRequest, ReceiptBatch, ReceiptItem
+from shared.timeutil import parse_iso_z, to_iso_z, utcnow
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "CSV_HEADER",
+    "DEFAULT_LIST_LIMIT",
+    "OPEN_RECEIPT_STATUSES",
+    "RECEIPT_STATUSES",
+    "SEVERITIES",
+    "SNOOZE_SETTING",
+    "STATUS_ALL",
+    "STATUS_FILTERS",
+    "STATUS_LABELS",
+    "TARGET_TYPES",
+    "NotificationNotFoundError",
+    "NotificationValidationError",
+    "apply_receipts",
+    "cancel_notification",
+    "create_notification",
+    "get_notification",
+    "list_notifications",
+    "mark_delivered",
+    "normalize_params",
+    "pending_count",
+    "progress",
+    "push_payload",
+    "report",
+    "report_csv",
+    "snooze_min",
+    "state",
+    "target_stores",
+]
+
+#: §4.9: через сколько минут возвращается отложенное уведомление (П-2)
+SNOOZE_SETTING = "notification_snooze_min"
+DEFAULT_SNOOZE_MIN = 15
+#: §11.5: сколько уведомлений отдаём в список по умолчанию
+DEFAULT_LIST_LIMIT = 200
+#: Максимальная длина заголовка — как колонка `notifications.title` (§4.6)
+TITLE_MAX_LENGTH = 200
+#: Ограничение текста: тело уведомления — короткое сообщение, а не документ
+BODY_MAX_LENGTH = 4000
+#: §4.6/§4.8: допустимые значения
+SEVERITIES: tuple[str, ...] = tuple(item.value for item in NotificationSeverity)
+TARGET_TYPES: tuple[str, ...] = tuple(item.value for item in TargetType)
+RECEIPT_STATUSES: tuple[str, ...] = tuple(item.value for item in ReceiptStatus)
+#: Статусы рассылки в UI (§11.5) и фильтр «все»
+STATUS_ALL = "all"
+STATUS_FILTERS: tuple[str, ...] = (STATUS_ALL, *(item.value for item in NotificationStatus))
+#: Строки, которые ещё не закрыты: по ним считается плитка «Ждут ознакомления»
+OPEN_RECEIPT_STATUSES: tuple[str, ...] = (
+    str(ReceiptStatus.PENDING),
+    str(ReceiptStatus.SHOWN),
+    str(ReceiptStatus.SNOOZED),
+)
+
+
+class NotificationValidationError(ValueError):
+    """Некорректные параметры уведомления — API отвечает `422` (§5.2.2)."""
+
+
+class NotificationNotFoundError(LookupError):
+    """Уведомление не найдено — API отвечает `404` (§5.2.2)."""
+
+
+# --- Настройки и разбор параметров ------------------------------------------
+
+
+def snooze_min(session: Session) -> int:
+    """Через сколько минут снова всплывает отложенное (§4.9, П-2)."""
+    value = settings_service.get_int(session, SNOOZE_SETTING)
+    return max(1, int(value or DEFAULT_SNOOZE_MIN))
+
+
+def _clean(value: object, *, field: str, max_length: int) -> str:
+    """Обрезать и проверить обязательный текст (заголовок, тело)."""
+    text = str(value or "").strip()
+    if not text:
+        raise NotificationValidationError(f"Поле {field} не может быть пустым")
+    if len(text) > max_length:
+        raise NotificationValidationError(
+            f"Поле {field} длиннее {max_length} символов"
+        )
+    return text
+
+
+def _clean_severity(value: object) -> str:
+    """Уровень важности: `info` / `important` / `critical` (§4.6)."""
+    severity = str(value or NotificationSeverity.INFO).strip().lower()
+    if severity not in SEVERITIES:
+        raise NotificationValidationError(
+            "Недопустимый уровень важности: ожидается info/important/critical"
+        )
+    return severity
+
+
+def _clean_target_type(value: object) -> str:
+    """Тип адресации: `all` / `stores` / `cluster` (§4.6)."""
+    target_type = str(value or TargetType.ALL).strip().lower()
+    if target_type not in TARGET_TYPES:
+        raise NotificationValidationError(
+            "Недопустимая адресация: ожидается all/stores/cluster"
+        )
+    return target_type
+
+
+def _clean_repeat(value: object) -> int | None:
+    """Интервал повтора показа в минутах (`critical`, §4.6)."""
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError) as exc:
+        raise NotificationValidationError(
+            "Интервал повтора должен быть целым числом минут"
+        ) from exc
+    if minutes < 1 or minutes > 24 * 60:
+        raise NotificationValidationError(
+            "Интервал повтора — от 1 минуты до 1440 минут"
+        )
+    return minutes
+
+
+def _clean_store_ids(value: object) -> list[int]:
+    """Разобрать список id магазинов: список, строка «1,2» или «1;2» (§11.4)."""
+    if value in (None, "", []):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items: list[object] = list(value)
+    else:
+        items = str(value).replace(";", ",").split(",")
+    ids: list[int] = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            number = int(text)
+        except ValueError as exc:
+            raise NotificationValidationError(f"Некорректный id магазина: {text!r}") from exc
+        if number > 0 and number not in ids:
+            ids.append(number)
+    return ids
+
+
+def normalize_params(raw: Mapping[str, object] | None) -> dict[str, object]:
+    """Проверить и нормализовать тело создания уведомления (§11.5).
+
+    Единая точка разбора для страницы `/notifications` и для действия
+    `notify` в `/actions` / `/bulk/actions` (§5.2.2): правила адресации и
+    уровней важности не должны расходиться между двумя входами.
+    """
+    data = dict(raw or {})
+    store_ids = _clean_store_ids(data.get("store_ids"))
+    target_type = _clean_target_type(data.get("target_type"))
+    cluster = str(data.get("cluster") or "").strip() or None
+    if target_type == str(TargetType.STORES) and not store_ids:
+        raise NotificationValidationError(
+            "Адресация «магазины» требует списка id (store_ids)"
+        )
+    if target_type == str(TargetType.CLUSTER) and cluster is None:
+        raise NotificationValidationError(
+            "Адресация «кластер» требует имени кластера (cluster)"
+        )
+    deadline = data.get("deadline_at")
+    return {
+        "title": _clean(data.get("title"), field="title", max_length=TITLE_MAX_LENGTH),
+        "body": _clean(data.get("body"), field="body", max_length=BODY_MAX_LENGTH),
+        "severity": _clean_severity(data.get("severity")),
+        "requires_ack": bool(data.get("requires_ack")),
+        "target_type": target_type,
+        "use_msg_exe": bool(data.get("use_msg_exe", True)),
+        "repeat_every_min": _clean_repeat(data.get("repeat_every_min")),
+        "deadline_at": parse_iso_z(deadline) if deadline else None,
+        "store_ids": store_ids,
+        "cluster": cluster,
+    }
+
+
+def target_stores(
+    session: Session,
+    *,
+    target_type: str = str(TargetType.ALL),
+    store_ids: Sequence[int] | None = None,
+    cluster: str | None = None,
+) -> list[Store]:
+    """Выбрать магазины-получатели (§4.6, §11.4).
+
+    Отключённые магазины (`is_active=false`) в выборку не попадают: их агенты
+    остановлены, а уведомление «повисло» бы навсегда. API сообщает админу,
+    какие магазины пропущены.
+    """
+    stmt = select(Store).where(Store.is_active.is_(True)).order_by(Store.name)
+    kind = _clean_target_type(target_type)
+    if kind == str(TargetType.STORES):
+        ids = [int(item) for item in (store_ids or [])]
+        if not ids:
+            raise NotificationValidationError(
+                "Адресация «магазины» требует списка id (store_ids)"
+            )
+        stmt = stmt.where(Store.id.in_(ids))
+    elif kind == str(TargetType.CLUSTER):
+        name = (cluster or "").strip()
+        if not name:
+            raise NotificationValidationError(
+                "Адресация «кластер» требует имени кластера (cluster)"
+            )
+        stmt = stmt.where(Store.cluster_name == name)
+    return list(session.scalars(stmt).all())
+
+
+def _target_value(kind: str, stores: Sequence[Store], cluster: str | None) -> str | None:
+    """`notifications.target_value` (§4.6): id списком или имя кластера."""
+    if kind == str(TargetType.STORES):
+        return json.dumps(sorted(store.id for store in stores))
+    if kind == str(TargetType.CLUSTER):
+        return cluster
+    return None
+
+
+
+def create_notification(  # noqa: PLR0913 - параметры уведомления §4.6
+    session: Session,
+    *,
+    title: str,
+    body: str,
+    severity: str = str(NotificationSeverity.INFO),
+    requires_ack: bool = False,
+    target_type: str = str(TargetType.ALL),
+    stores: Sequence[Store] = (),
+    cluster: str | None = None,
+    deadline_at: datetime | None = None,
+    repeat_every_min: int | None = None,
+    use_msg_exe: bool = True,
+    created_by: str | None = None,
+) -> Notification:
+    """Создать уведомление и строки `notification_targets` (§4.6–4.7).
+
+    Задачи `notify` создаёт вызывающая сторона (по одной на магазин, §11.4):
+    так выключенная касса получает уведомление позже, а не теряет его.
+    """
+    kind = _clean_target_type(target_type)
+    notification = Notification(
+        title=_clean(title, field="title", max_length=TITLE_MAX_LENGTH),
+        body=_clean(body, field="body", max_length=BODY_MAX_LENGTH),
+        severity=_clean_severity(severity),
+        requires_ack=bool(requires_ack),
+        target_type=kind,
+        target_value=_target_value(kind, stores, cluster),
+        deadline_at=deadline_at,
+        repeat_every_min=_clean_repeat(repeat_every_min),
+        use_msg_exe=bool(use_msg_exe),
+        is_active=True,
+        created_by=created_by,
+    )
+    session.add(notification)
+    session.flush()
+
+    for store in stores:
+        session.add(
+            NotificationTarget(notification_id=notification.id, store_id=store.id)
+        )
+    session.flush()
+
+    logger.info(
+        "Уведомление id=%s создано: уровень %s, магазинов %s, автор %s",
+        notification.id,
+        notification.severity,
+        len(stores),
+        created_by or "—",
+    )
+    return notification
+
+
+def _load_options() -> tuple:
+    """Загрузка целей, магазинов и подтверждений ради отчёта (§11.5)."""
+    return (
+        selectinload(Notification.targets).selectinload(NotificationTarget.store),
+        selectinload(Notification.targets).selectinload(NotificationTarget.receipts),
+    )
+
+
+def get_notification(session: Session, notification_id: int) -> Notification:
+    """Уведомление по id вместе с целями и подтверждениями (§5.2.2)."""
+    notification = session.scalars(
+        select(Notification)
+        .where(Notification.id == notification_id)
+        .options(*_load_options())
+    ).first()
+    if notification is None:
+        raise NotificationNotFoundError(f"Уведомление id={notification_id} не найдено")
+    return notification
+
+
+
+def list_notifications(
+    session: Session,
+    *,
+    status: str | None = None,
+    severity: str | None = None,
+    search: str | None = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+) -> list[Notification]:
+    """Список уведомлений с фильтрами страницы `/notifications` (§11.5).
+
+    Фильтр по статусу (в работе / завершено / отменено) считается по факту —
+    по прогрессу и дедлайну, — поэтому «завершено» не хранится отдельной
+    колонкой и не может разойтись с отчётом.
+    """
+    stmt = (
+        select(Notification)
+        .options(*_load_options())
+        .order_by(Notification.id.desc())
+        .limit(max(1, int(limit)))
+    )
+    severity_filter = (severity or "").strip().lower()
+    if severity_filter and severity_filter != STATUS_ALL:
+        if severity_filter not in SEVERITIES:
+            raise NotificationValidationError("Недопустимый уровень важности в фильтре")
+        stmt = stmt.where(Notification.severity == severity_filter)
+
+    search_text = (search or "").strip()
+    if search_text:
+        pattern = f"%{search_text}%"
+        stmt = stmt.where(
+            Notification.title.ilike(pattern) | Notification.body.ilike(pattern)
+        )
+
+    rows = list(session.scalars(stmt).all())
+    status_filter = (status or "").strip().lower()
+    if status_filter and status_filter != STATUS_ALL:
+        if status_filter not in STATUS_FILTERS:
+            raise NotificationValidationError("Недопустимый статус в фильтре")
+        rows = [item for item in rows if state(item) == status_filter]
+    return rows
+
+
+def progress(notification: Notification) -> dict[str, int]:
+    """Прогресс «ознакомлены X из Y» (§4.8, §11.5).
+
+    Считается по строкам `notification_receipts`: числитель — только явное
+    «Ознакомлен», поэтому отложенное (`snoozed`) числитель не увеличивает
+    (П-2), а `shown` честно виден отдельной цифрой.
+    """
+    receipts = [item for target in notification.targets for item in target.receipts]
+    acknowledged = sum(1 for item in receipts if item.is_acknowledged)
+    shown = sum(1 for item in receipts if str(item.status) == str(ReceiptStatus.SHOWN))
+    snoozed = sum(1 for item in receipts if str(item.status) == str(ReceiptStatus.SNOOZED))
+    expired = sum(1 for item in receipts if str(item.status) == str(ReceiptStatus.EXPIRED))
+    total = len(receipts)
+    return {
+        "stores": len(notification.targets),
+        "stores_delivered": sum(
+            1 for target in notification.targets if target.delivered_at is not None
+        ),
+        "sessions": sum(int(target.sessions_count or 0) for target in notification.targets),
+        "receipts": total,
+        "acknowledged": acknowledged,
+        "shown": shown,
+        "snoozed": snoozed,
+        "expired": expired,
+        "pending": max(0, total - acknowledged - shown - snoozed - expired),
+        "percent": int(round(100 * acknowledged / total)) if total else 0,
+    }
+
+
+def state(notification: Notification, *, now: datetime | None = None) -> str:
+    """Статус рассылки для списка `/notifications` (§11.5).
+
+    * `canceled` — админ нажал «отменить» (`is_active=false`);
+    * `done` — все сессии ознакомлены, дедлайн прошёл или, для уведомления без
+      требования «ознакомлен», все сессии его увидели;
+    * `active` — работа продолжается.
+    """
+    if not notification.is_active:
+        return str(NotificationStatus.CANCELED)
+    moment = now or utcnow()
+    totals = progress(notification)
+    if totals["receipts"] and totals["acknowledged"] >= totals["receipts"]:
+        return str(NotificationStatus.DONE)
+    if notification.deadline_at is not None and notification.deadline_at <= moment:
+        return str(NotificationStatus.DONE)
+    if (
+        not notification.requires_ack
+        and totals["receipts"]
+        and totals["shown"] >= totals["receipts"]
+    ):
+        return str(NotificationStatus.DONE)
+    return str(NotificationStatus.ACTIVE)
+
+
+def pending_count(session: Session, *, now: datetime | None = None) -> int:
+    """Сколько сессий ждут ознакомления — плитка главной (§11.1).
+
+    Учитываются только доставленные уведомления, которые ещё в работе: дедлайн
+    прошёл — строка уже «просрочена» и в ожидание не попадает.
+    """
+    moment = now or utcnow()
+    stmt = (
+        select(func.count())
+        .select_from(NotificationReceipt)
+        .join(NotificationTarget, NotificationTarget.id == NotificationReceipt.target_id)
+        .join(Notification, Notification.id == NotificationTarget.notification_id)
+        .where(NotificationReceipt.status.in_(OPEN_RECEIPT_STATUSES))
+        .where(Notification.is_active.is_(True))
+        .where(NotificationTarget.delivered_at.is_not(None))
+        .where(
+            (Notification.deadline_at.is_(None)) | (Notification.deadline_at > moment)
+        )
+    )
+    return int(session.scalar(stmt) or 0)
+
+
+# --- Доставка на кассу и приём подтверждений --------------------------------
+
+
+def push_payload(session: Session, store: Store, notification: Notification) -> NotifyRequest:
+    """Собрать тело `POST /notify` для кассы (§5.1.2, §7.4).
+
+    Интервал возврата отложенного (`snooze_min`) задаёт **сервер** (П-2):
+    касса получает его вместе с уведомлением и не хранит собственных
+    настроек расписания.
+    """
+    return NotifyRequest(
+        id=notification.id,
+        title=notification.title,
+        body=notification.body,
+        severity=str(notification.severity),
+        requires_ack=bool(notification.requires_ack),
+        deadline_at=to_iso_z(notification.deadline_at),
+        repeat_every_min=notification.repeat_every_min,
+        use_msg_exe=bool(notification.use_msg_exe),
+        snooze_min=snooze_min(session),
+        store_id=store.id,
+    )
+
+
+def mark_delivered(
+    session: Session,
+    store: Store,
+    notification: Notification,
+    *,
+    sessions: int = 0,
+) -> NotificationTarget | None:
+    """Отметить доставку уведомления магазину (§4.7).
+
+    `sessions_count` не обнуляется: агент мог ещё не увидеть ни одной сессии
+    (никто не вошёл), и это не должно «стирать» уже известные цифры.
+    """
+    target = session.scalars(
+        select(NotificationTarget)
+        .where(NotificationTarget.notification_id == notification.id)
+        .where(NotificationTarget.store_id == store.id)
+    ).first()
+    if target is None:
+        logger.warning(
+            "Уведомление id=%s не адресовано магазину id=%s — доставка не учтена",
+            notification.id,
+            store.id,
+        )
+        return None
+
+    target.delivered_at = utcnow()
+    if sessions > 0:
+        target.sessions_count = int(sessions)
+    session.flush()
+    logger.info(
+        "Уведомление id=%s доставлено магазину id=%s (сессий %s)",
+        notification.id,
+        store.id,
+        target.sessions_count,
+    )
+    return target
+
+
+def _find_receipt(target: NotificationTarget, session_id: str) -> NotificationReceipt | None:
+    """Строка подтверждения по сессии Windows (§4.8, уникальность по паре)."""
+    for receipt in target.receipts:
+        if str(receipt.session_id) == str(session_id):
+            return receipt
+    return None
+
+
+def _apply_receipt(receipt: NotificationReceipt, item: ReceiptItem, *, now: datetime) -> bool:
+    """Записать одно подтверждение; `False` — запись не изменилась (§4.8).
+
+    Главное правило П-2: `snoozed` **не** считается ознакомлением, а позднее
+    `shown` из буфера агента не должно «откатывать» уже поставленное
+    «Ознакомлен» — иначе отчёт врал бы в пользу админа.
+    """
+    status = str(item.status)
+    if receipt.is_acknowledged and status != str(ReceiptStatus.ACKNOWLEDGED):
+        return False
+
+    receipt.session_user = item.session_user or receipt.session_user
+    if item.shown_at and receipt.shown_at is None:
+        receipt.shown_at = parse_iso_z(item.shown_at)
+
+    if status == str(ReceiptStatus.ACKNOWLEDGED):
+        receipt.status = status
+        receipt.acknowledged_at = now
+        receipt.ack_comment = item.comment
+        receipt.snooze_until = None
+        if receipt.shown_at is None:
+            receipt.shown_at = now
+        return True
+
+    if status == str(ReceiptStatus.SHOWN):
+        receipt.status = status
+        if receipt.shown_at is None:
+            receipt.shown_at = now
+        return True
+
+    if status == str(ReceiptStatus.SNOOZED):
+        receipt.status = status
+        receipt.snooze_count = int(receipt.snooze_count or 0) + 1
+        receipt.snooze_until = parse_iso_z(item.snooze_until) or (
+            now + timedelta(minutes=DEFAULT_SNOOZE_MIN)
+        )
+        return True
+
+    if status == str(ReceiptStatus.EXPIRED):
+        receipt.status = status
+        return True
+
+    receipt.status = status
+    return True
+
+
+def apply_receipts(session: Session, store: Store, batch: ReceiptBatch) -> dict[str, int]:
+    """Принять пакет подтверждений от кассы (§5.2.2, §4.8).
+
+    Пакет несёт две вещи, и обе нужны отчёту «X из Y»:
+
+    * `sessions` — состав сессий, который TrayAgent реально видит на кассе: по
+      нему создаются строки `pending`, поэтому «продавец2 — ожидание» видно
+      админу, даже если второй продавец ещё ничего не нажимал;
+    * `receipts` — что произошло: `shown` (тост `info`), `acknowledged`
+      («Ознакомлен»), `snoozed` («Отложить») с `snooze_until`.
+
+    Уведомления, не адресованные этому магазину, игнорируются — как и чужие
+    адреса в батче оборудования: касса не может «дописать» себе получателей.
+    """
+    now = utcnow()
+    created = updated = ignored = 0
+
+    targets = list(
+        session.scalars(
+            select(NotificationTarget)
+            .where(NotificationTarget.store_id == store.id)
+            .options(
+                selectinload(NotificationTarget.notification),
+                selectinload(NotificationTarget.receipts),
+            )
+        ).all()
+    )
+    by_notification = {target.notification_id: target for target in targets}
+
+    # 1) Состав сессий: «ждут ознакомления» по доставленным уведомлениям (§4.8)
+    if batch.sessions:
+        for target in targets:
+            notification = target.notification
+            if target.delivered_at is None or notification is None:
+                continue
+            if not notification.is_active:
+                continue
+            for ref in batch.sessions:
+                if _find_receipt(target, ref.sid) is not None:
+                    continue
+                target.receipts.append(
+                    NotificationReceipt(
+                        target_id=target.id,
+                        session_id=ref.sid,
+                        session_user=ref.user,
+                        status=str(ReceiptStatus.PENDING),
+                    )
+                )
+                created += 1
+
+    # 2) Явные подтверждения: то, что пользователи уже нажимали
+    for item in batch.receipts:
+        target = by_notification.get(int(item.notification_id))
+        if target is None:
+            ignored += 1
+            continue
+        receipt = _find_receipt(target, item.session_id)
+        if receipt is None:
+            receipt = NotificationReceipt(
+                target_id=target.id,
+                session_id=item.session_id,
+                session_user=item.session_user,
+                status=str(ReceiptStatus.PENDING),
+            )
+            target.receipts.append(receipt)
+            created += 1
+        if _apply_receipt(receipt, item, now=now):
+            updated += 1
+        else:
+            ignored += 1
+
+    session.flush()
+    expired = _expire_overdue(session, store.id, now=now)
+    if created or updated:
+        logger.info(
+            "Магазин id=%s: подтверждений создано %s, обновлено %s, пропущено %s, просрочено %s",
+            store.id,
+            created,
+            updated,
+            ignored,
+            expired,
+        )
+    return {"created": created, "updated": updated, "ignored": ignored, "expired": expired}
+
+
+def _expire_overdue(session: Session, store_id: int, *, now: datetime) -> int:
+    """Закрыть `expired` то, что не ознакомлено к дедлайну (§4.8, §11.5)."""
+    targets = session.scalars(
+        select(NotificationTarget)
+        .where(NotificationTarget.store_id == store_id)
+        .where(NotificationTarget.delivered_at.is_not(None))
+        .options(
+            selectinload(NotificationTarget.notification),
+            selectinload(NotificationTarget.receipts),
+        )
+    ).all()
+    expired = 0
+    for target in targets:
+        notification = target.notification
+        if notification is None or notification.deadline_at is None:
+            continue
+        if notification.deadline_at > now:
+            continue
+        for receipt in target.receipts:
+            if receipt.is_acknowledged or str(receipt.status) == str(ReceiptStatus.EXPIRED):
+                continue
+            receipt.status = str(ReceiptStatus.EXPIRED)
+            expired += 1
+    if expired:
+        session.flush()
+        logger.info(
+            "Магазин id=%s: не ознакомлены к дедлайну, отмечено просроченными: %s",
+            store_id,
+            expired,
+        )
+    return expired
+
+    if notification.deadline_at is not None and notification.deadline_at <= moment:
+        return str(NotificationStatus.DONE)
+    if (
+        not notification.requires_ack
+        and totals["receipts"]
+        and totals["shown"] >= totals["receipts"]
+    ):
+        return str(NotificationStatus.DONE)
+    return str(NotificationStatus.ACTIVE)
+
+
+# --- Отмена и отчёт ---------------------------------------------------------
+
+
+def _command_notification_id(command: Command) -> int:
+    """id уведомления из параметров задачи `notify` (или `0`)."""
+    try:
+        return int((command.params or {}).get("notification_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _notify_commands(
+    session: Session, notification_id: int, statuses: Sequence[str]
+) -> list[Command]:
+    """Задачи рассылки конкретного уведомления в указанных статусах (§4.3)."""
+    stmt = (
+        select(Command)
+        .where(Command.kind == str(CommandKind.NOTIFY))
+        .where(Command.status.in_(tuple(statuses)))
+        .order_by(Command.id)
+    )
+    return [
+        command
+        for command in session.scalars(stmt).all()
+        if _command_notification_id(command) == int(notification_id)
+    ]
+
+
+def cancel_notification(session: Session, notification: Notification) -> int:
+    """Отменить рассылку (§11.5) и закрыть ещё не отправленные задачи.
+
+    Уже показанные окна отозвать нельзя: TrayAgent перестанет отдавать
+    уведомление сам — `GET /notifications/pending` отдаёт только активные
+    (§7.4), — а отчёт сохранит историю «кто успел ознакомиться».
+    """
+    notification.is_active = False
+    canceled = 0
+    pending = _notify_commands(
+        session, notification.id, statuses=command_service.ACTIVE_STATUSES
+    )
+    for command in pending:
+        command_service.set_status(session, command, CommandStatus.CANCELED)
+        command_service.add_log(session, command, "Уведомление отменено администратором")
+        canceled += 1
+    session.flush()
+    logger.info(
+        "Уведомление id=%s отменено; незавершённых задач закрыто: %s",
+        notification.id,
+        canceled,
+    )
+    return canceled
+
+
+def _receipt_row(
+    receipt: NotificationReceipt, notification: Notification, *, now: datetime
+) -> dict[str, object]:
+    """Строка сессии в отчёте (§11.5): статус, времена и счётчик «отложено»."""
+    overdue = (
+        not receipt.is_acknowledged
+        and notification.deadline_at is not None
+        and notification.deadline_at <= now
+    )
+    return {
+        "session_user": receipt.session_user,
+        "session_id": receipt.session_id,
+        "status": str(receipt.status),
+        "shown_at": to_iso_z(receipt.shown_at),
+        "acknowledged_at": to_iso_z(receipt.acknowledged_at),
+        "ack_comment": receipt.ack_comment,
+        "snooze_count": int(receipt.snooze_count or 0),
+        "snooze_until": to_iso_z(receipt.snooze_until),
+        "is_acknowledged": receipt.is_acknowledged,
+        "is_overdue": overdue,
+    }
+
+
+def report(session: Session, notification: Notification) -> dict[str, object]:
+    """Отчёт «X из Y»: магазины → сессии (§11.5).
+
+    Строка на магазин создаётся даже без подтверждений: так админ видит, что
+    уведомление доставлено, но на кассе ещё никто не вошёл под своей учётной
+    записью, вместо «магазин пропал из отчёта».
+    """
+    now = utcnow()
+    stores: list[dict[str, object]] = []
+    for target in sorted(notification.targets, key=lambda item: item.id):
+        store = target.store
+        receipts = sorted(
+            target.receipts, key=lambda item: (str(item.session_user), str(item.session_id))
+        )
+        stores.append(
+            {
+                "store_id": target.store_id,
+                "store_name": store.name if store is not None else None,
+                "cluster_name": store.cluster_name if store is not None else None,
+                "store_is_active": bool(store.is_active) if store is not None else True,
+                "delivered_at": to_iso_z(target.delivered_at),
+                "sessions_count": int(target.sessions_count or 0),
+                "total": len(receipts),
+                "acknowledged": sum(1 for item in receipts if item.is_acknowledged),
+                "receipts": [_receipt_row(item, notification, now=now) for item in receipts],
+            }
+        )
+    return {
+        "notification_id": notification.id,
+        "state": state(notification, now=now),
+        "deadline_at": to_iso_z(notification.deadline_at),
+        "created_at": to_iso_z(notification.created_at),
+        "totals": progress(notification),
+        "stores": stores,
+    }
+
+
+
+
+#: Заголовок CSV-выгрузки отчёта (§11.5) — Excel-совместимый (`;` + BOM)
+CSV_HEADER: tuple[str, ...] = (
+    "Магазин",
+    "Сессия (пользователь)",
+    "Session ID",
+    "Статус",
+    "Показано",
+    "Ознакомлен",
+    "Отложено, раз",
+    "Отложено до",
+    "Комментарий",
+    "Дедлайн",
+    "Просрочено",
+)
+
+#: Человекочитаемые статусы для выгрузки (§4.8)
+STATUS_LABELS: dict[str, str] = {
+    str(ReceiptStatus.PENDING): "ожидание",
+    str(ReceiptStatus.SHOWN): "показано",
+    str(ReceiptStatus.ACKNOWLEDGED): "ознакомлен",
+    str(ReceiptStatus.SNOOZED): "отложено",
+    str(ReceiptStatus.EXPIRED): "просрочено",
+}
+
+
+def report_csv(data: Mapping[str, object]) -> str:
+    """Отчёт в CSV (§11.5): `;` и BOM — Excel открывает файл без «кракозябр»."""
+    deadline = str(data.get("deadline_at") or "")
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";", lineterminator="\r\n")
+    writer.writerow(CSV_HEADER)
+
+    stores = data.get("stores")
+    for store in stores if isinstance(stores, list) else []:
+        if not isinstance(store, dict):
+            continue
+        receipts = store.get("receipts")
+        rows = receipts if isinstance(receipts, list) else []
+        if not rows:
+            # Магазин, в котором ещё никто не вошёл: строка «ожидание» (§4.8)
+            writer.writerow(
+                [
+                    store.get("store_name") or "",
+                    "",
+                    "",
+                    STATUS_LABELS[str(ReceiptStatus.PENDING)],
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    deadline,
+                    "",
+                ]
+            )
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "")
+            writer.writerow(
+                [
+                    store.get("store_name") or "",
+                    row.get("session_user") or "",
+                    row.get("session_id") or "",
+                    STATUS_LABELS.get(status, status),
+                    row.get("shown_at") or "",
+                    row.get("acknowledged_at") or "",
+                    row.get("snooze_count") or 0,
+                    row.get("snooze_until") or "",
+                    row.get("ack_comment") or "",
+                    deadline,
+                    "да" if row.get("is_overdue") else "",
+                ]
+            )
+    return "\ufeff" + buffer.getvalue()
