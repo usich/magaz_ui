@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -579,7 +580,8 @@ class TrayWindows:  # pragma: no cover - GUI: проверяется на кас
         """Картинка из локального кэша кассы; вместо отсутствующей — подпись (§7.4, Э9)."""
         label = block.alt or block.name
         data = self._client.image(notification_id, block.name) if self._client else None
-        photo = _photo_image(data, width=max(160, int(widget.winfo_width()) - 24))
+        available = max(160, int(widget.winfo_width()) - 24)
+        photo = _photo_image(data, width=_image_pixel_width(block.width, available))
         if photo is None:
             widget.insert("end", f"[{label}]\n", ("marker",))
             return
@@ -627,6 +629,22 @@ class TrayWindows:  # pragma: no cover - GUI: проверяется на кас
             winsound.MessageBeep(winsound.MB_ICONHAND)
         except Exception:  # pragma: no cover - нет звуковой подсистемы
             pass
+
+
+def _image_pixel_width(width: str, available: int) -> int:
+    """Ширина картинки в пикселях: админ задал её в редакторе (§11.5, Э9).
+
+    Процент считается от ширины области тела, пиксели берутся как есть — но не
+    больше области и не меньше 60 px, чтобы крестик окна не спрятался под картинкой.
+    Пустая ширина — «по ширине окна»: так было до появления размеров.
+    """
+    match = re.match(r"^(\d{1,4})(px|%)$", str(width or "").strip().lower())
+    if match is None:
+        return available
+    value = int(match.group(1))
+    if match.group(2) == "px":
+        return max(60, min(available, value))
+    return max(60, min(available, int(available * value / 100)))
 
 
 def _photo_image(data: bytes | None, *, width: int):  # pragma: no cover - GUI

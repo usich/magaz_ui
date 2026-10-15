@@ -59,6 +59,20 @@ _MARKS: dict[str, str] = {
     "code": "code",
 }
 _COLOR = re.compile(r"^#[0-9a-fA-F]{3,8}$|^[a-zA-Z]{3,20}$")
+#: Ширина картинки: та же длина, что пропускает санитайз сервера (`shared.richtext`)
+_WIDTH = re.compile(r"^\d{1,4}(px|%)$")
+
+
+def _image_width(style: str) -> str:
+    """Ширина картинки из `style`: пусто — размер не задавали (§11.5, Э9)."""
+    for chunk in str(style or "").split(";"):
+        name, _, value = chunk.partition(":")
+        if name.strip().lower() != "width":
+            continue
+        candidate = value.strip().lower()
+        if _WIDTH.match(candidate):
+            return candidate
+    return ""
 
 
 @dataclass
@@ -85,6 +99,8 @@ class Block:
     marker: str = ""
     name: str = ""
     alt: str = ""
+    #: Ширина картинки из тела (`320px`, `50%`): пусто — по ширине окна (§11.5, Э9)
+    width: str = ""
 
     @property
     def text(self) -> str:
@@ -210,7 +226,14 @@ class _BodyParser(HTMLParser):
             self._close()
             name = _image_name(attributes.get("src"))
             if name:
-                self.blocks.append(Block(KIND_IMAGE, name=name, alt=attributes.get("alt", "")))
+                self.blocks.append(
+                    Block(
+                        KIND_IMAGE,
+                        name=name,
+                        alt=attributes.get("alt", ""),
+                        width=_image_width(attributes.get("style", "")),
+                    )
+                )
             return
         if tag in _MARKS:
             self._marks.append(_MARKS[tag])

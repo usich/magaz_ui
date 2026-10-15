@@ -20,7 +20,8 @@
   `sanitize_html(..., allowed_images=…)` выбрасывает `img`, для которых картинку
   не приложили, — лучше без картинки, чем с битой (§4.6, §7.4);
 * `style` сохраняется частично: только безопасные свойства (`color`,
-  `background-color`, `text-align`, `font-weight`, `text-decoration`), поэтому
+  `background-color`, `text-align`, `font-weight`, `text-decoration`, а для
+  картинок ещё `width`/`max-width` — это размер из редактора, §11.5), поэтому
   «важный текст красным» из редактора доезжает, а `position:fixed` — нет.
 
 `html_to_text()` нужен там, где форматирование не поддерживается: дублирующий
@@ -97,12 +98,18 @@ _COLOR = re.compile(
     r"|[a-zA-Z]{3,20})$"
 )
 _SIZE = re.compile(r"^\d{1,4}$")
+#: Длина в стиле: только число с `px`/`%` — «100vw» и «calc(...)» не проходят (§4.6, Э9)
+_LENGTH = re.compile(r"^\d{1,4}(px|%)$")
 _ALLOWED_STYLE: dict[str, re.Pattern[str]] = {
     "color": _COLOR,
     "background-color": _COLOR,
     "text-align": re.compile(r"^(left|right|center|justify)$"),
     "font-weight": re.compile(r"^(normal|bold|[1-9]00)$"),
     "text-decoration": re.compile(r"^(none|underline|line-through)$"),
+    # Размер картинки из редактора (§11.5): сервер пропускает его, только если это
+    # безопасная длина — «картинка во всю ширину» доезжает до кассы, `100vw` — нет
+    "width": _LENGTH,
+    "max-width": _LENGTH,
 }
 _BLOCK_TAGS = frozenset(
     {

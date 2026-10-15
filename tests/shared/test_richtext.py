@@ -78,6 +78,24 @@ class TestSanitizeHtml:
 
         assert sanitize_html(body) == f'<img src="{image_src("a.png")}" height="12" />'
 
+    def test_image_width_style_survives_and_junk_is_dropped(self) -> None:
+        """Размер картинки из редактора (§11.5, Э9): длина в стиле, но не `position`."""
+        source = (
+            f'<img src="{image_src("shema.png")}" '
+            'style="width: 50%; max-width: 320px; position: fixed">'
+        )
+        expected = f'<img src="{image_src("shema.png")}" style="width: 50%; max-width: 320px" />'
+
+        assert sanitize_html(source) == expected
+
+    def test_image_width_must_be_a_plain_length(self) -> None:
+        body = (
+            f'<img src="{image_src("a.png")}" '
+            'style="width: 100vw; max-width: calc(100% - 10px)">'
+        )
+
+        assert sanitize_html(body) == f'<img src="{image_src("a.png")}" />'
+
 
 class TestAllowedImages:
     """Метка картинки, для которой файла нет, до потребителя не доезжает (§4.6, Э9)."""

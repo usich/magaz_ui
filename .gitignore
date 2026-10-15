@@ -16,6 +16,8 @@ server/data/*.db-shm
 server/data/*.log
 server/data/secrets.key
 server/data/logs/
+# Картинки уведомлений (Э9, §4.6.1): файлы стенда, в поставку не входят
+server/data/notification-images/
 
 # --- Агент: рабочие артефакты кассы (не в git) ---
 client/**/agent-config.json

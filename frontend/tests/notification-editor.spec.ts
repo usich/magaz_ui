@@ -51,6 +51,8 @@ describe('RichTextEditor (§11.5, Э9)', () => {
       'rte-align-center',
       'rte-color',
       'rte-image',
+      'rte-image-half',
+      'rte-image-original',
     ]) {
       expect(wrapper.find(`[data-test="${test}"]`).exists(), test).toBe(true)
     }
@@ -94,6 +96,54 @@ describe('RichTextEditor (§11.5, Э9)', () => {
     expect(body).not.toContain('data:image/png')
   })
 
+  it('картинка видна сразу: узел получает адрес черновика (Э9)', async () => {
+    const wrapper = mount(RichTextEditor, { props: { modelValue: '' } })
+    await flushPromises()
+
+    const input = wrapper.find('[data-test="rte-file"]')
+    const file = new File([PNG_BYTES], 'shema.png', { type: 'image/png' })
+    Object.defineProperty(input.element, 'files', { value: [file] })
+    await input.trigger('change')
+    await vi.waitFor(() => expect(wrapper.emitted('update:drafts')).toBeTruthy())
+
+    // Так ведёт себя форма: черновик возвращается редактору пропом — раньше
+    // в этом месте оставался узел без `src`, то есть «картинка не вставилась»
+    const drafts = lastEmitted(wrapper, 'update:drafts') as NotificationImageDraft[]
+    await wrapper.setProps({ drafts })
+    await flushPromises()
+
+    const picture = wrapper.find('.magaz-image-node img')
+    expect(picture.exists()).toBe(true)
+    expect(String(picture.attributes('src')).startsWith('data:image/png')).toBe(true)
+    expect(picture.attributes('alt')).toBe('shema.png')
+  })
+
+  it('картинка из буфера обмена попадает в тело и без файлов в dataTransfer (Э9)', async () => {
+    const wrapper = mount(RichTextEditor, { props: { modelValue: '' } })
+    await flushPromises()
+    const editor = (wrapper.vm as unknown as { editor: Editor }).editor
+
+    // Скриншот из «Ножниц» и картинка из Word приходят только во `items`
+    const file = new File([PNG_BYTES], 'snimok.png', { type: 'image/png' })
+    const clipboard = {
+      files: [],
+      items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }],
+      getData: () => '',
+    } as unknown as DataTransfer
+    const event = { clipboardData: clipboard } as unknown as ClipboardEvent
+
+    const handled = editor.view.someProp('handlePaste', (handler) =>
+      (handler as (view: unknown, event: unknown) => boolean)(editor.view, event),
+    )
+    await vi.waitFor(() => expect(wrapper.emitted('update:drafts')).toBeTruthy())
+
+    const drafts = lastEmitted(wrapper, 'update:drafts') as NotificationImageDraft[]
+    expect(handled).toBe(true)
+    expect(drafts).toHaveLength(1)
+    expect(drafts[0].sourceName).toBe('snimok.png')
+    expect(String(lastEmitted(wrapper, 'update:modelValue'))).toContain('magaz-image:')
+  })
+
   it('слишком большая картинка объясняет отказ и не попадает в тело', async () => {
     const wrapper = mount(RichTextEditor, { props: { modelValue: '' } })
     await flushPromises()
@@ -125,6 +175,36 @@ describe('RichTextEditor (§11.5, Э9)', () => {
     expect(lastEmitted(wrapper, 'update:drafts')).toEqual([])
     expect(String(lastEmitted(wrapper, 'update:modelValue'))).not.toContain('magaz-image')
   })
+
+  it('размер картинки задаётся кнопками панели (§11.5, Э9)', async () => {
+    const draft = makeDraft()
+    const wrapper = mount(RichTextEditor, {
+      props: {
+        modelValue: `<img src="magaz-image:${draft.name}" alt="Схема">`,
+        drafts: [draft],
+      },
+    })
+    await flushPromises()
+    const editor = (wrapper.vm as unknown as { editor: Editor }).editor
+
+    // Выделяем картинку так, как это делает клик по ней в редакторе
+    let position = 0
+    editor.state.doc.descendants((node, pos) => {
+      if (node.type.name === 'image') position = pos
+      return true
+    })
+    editor.chain().setNodeSelection(position).run()
+    await flushPromises()
+
+    await wrapper.find('[data-test="rte-image-half"]').trigger('click')
+    await flushPromises()
+    const half = String(lastEmitted(wrapper, 'update:modelValue'))
+    expect(half).toMatch(/style="width: \d+px;?"/)
+
+    await wrapper.find('[data-test="rte-image-original"]').trigger('click')
+    await flushPromises()
+    expect(String(lastEmitted(wrapper, 'update:modelValue'))).not.toContain('width:')
+  })
 })
 
 describe('NotificationBody (§4.6, §11.5, Э9)', () => {
@@ -142,6 +222,19 @@ describe('NotificationBody (§4.6, §11.5, Э9)', () => {
     expect(image.attributes('src')).toBe('/api/v1/admin/notifications/7/images/shema.png')
     expect(image.attributes('alt')).toBe('shema.png')
     expect(wrapper.text()).toContain('Схема')
+  })
+
+  it('размер картинки из редактора доезжает до предпросмотра (§11.5, Э9)', async () => {
+    const wrapper = mount(NotificationBody, {
+      props: {
+        body: '<img src="magaz-image:shema.png" style="width: 320px">',
+        bodyFormat: 'html',
+        notificationId: 7,
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.find('img').attributes('style')).toBe('width: 320px')
   })
 
   it('до сохранения показывает картинку-черновик из редактора', async () => {

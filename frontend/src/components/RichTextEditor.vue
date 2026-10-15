@@ -13,6 +13,7 @@
  * тело, в котором метка есть, а файла нет.
  */
 import { computed, ref, watch } from 'vue'
+import { mergeAttributes } from '@tiptap/core'
 import Image from '@tiptap/extension-image'
 import StarterKit from '@tiptap/starter-kit'
 import TextAlign from '@tiptap/extension-text-align'
@@ -20,12 +21,15 @@ import { BackgroundColor, Color, TextStyle } from '@tiptap/extension-text-style'
 import { EditorContent, useEditor } from '@tiptap/vue-3'
 
 import {
+  IMAGE_CONTENT_TYPES,
+  IMAGE_MAX_BYTES,
   IMAGES_MAX_PER_NOTIFICATION,
   IMAGE_SRC_PREFIX,
   imageFileError,
   imageNameFromSrc,
   makeImageName,
   notificationImageUrl,
+  sizeMb,
   type NotificationImageDraft,
 } from '@/stores/notifications'
 
@@ -62,6 +66,8 @@ const HIGHLIGHTS = [
 ]
 
 const errorMessage = ref('')
+/** Счётчик транзакций: выделение и формат меняются без правки текста (§11.5). */
+const editorTick = ref(0)
 const fileInput = ref<HTMLInputElement | null>(null)
 const drafts = computed(() => props.drafts)
 
@@ -71,38 +77,139 @@ function resolveImage(name: string): string {
   return draft?.dataUrl ?? notificationImageUrl(props.notificationId, name)
 }
 
+/** Расширение по типу картинки: имя файла должно оставаться понятным (§4.6). */
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+}
+
+/** Ширина картинки в атрибуте: `320px`, `50%` или пусто — «как есть» (§4.6). */
+const IMAGE_WIDTH_PATTERN = /^\d{1,4}(px|%)$/
+
+/** Шаг кнопок «уже/шире» — доля ширины области редактирования. */
+const IMAGE_WIDTH_STEP_SHARE = 0.1
+/** Ниже этого картинку не уменьшаем: подпись и крестик должны помещаться. */
+const IMAGE_WIDTH_MIN = 60
+
+/**
+ * Картинки, которые нужно дорисовать: черновик приходит уже после вставки узла.
+ *
+ * `stageFiles` сначала вставляет узел `magaz-image:<имя>` и только потом отдаёт
+ * черновик наружу, а `drafts` возвращаются пропом на следующем тике. Без этого
+ * реестра узел остался бы с пустым `src` — «картинка не вставилась» (§11.5, Э9).
+ */
+const imageRenderers = new Set<() => void>()
+
+/** Ширина из атрибута или стиля: всё, что не число с `px`/`%`, — «как есть». */
+function normalizeImageWidth(value: unknown): string {
+  const text = String(value ?? '').trim().toLowerCase()
+  return IMAGE_WIDTH_PATTERN.test(text) ? text : ''
+}
+
 /**
  * Узел картинки: в документе живёт метка `magaz-image:<имя>`, а на экране —
  * сама картинка. Иначе админ видел бы «пропавшее изображение»: файла на сервере
  * ещё нет, уведомление не создано.
+ *
+ * Размер картинки живёт в атрибуте `width` и уезжает **стилем** (`style="width:
+ * 50%"`): сервер пропускает `width`/`max-width` в стиле (§4.6), а сам атрибут
+ * `width` HTML оставил бы картинку с «зашитым» размером.
  */
 const MagazImage = Image.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      width: {
+        default: '',
+        parseHTML: (element: HTMLElement) =>
+          normalizeImageWidth(element.style.width) || normalizeImageWidth(element.getAttribute('width')),
+        // Атрибут отдаём как `width` — узел сам превратит его в `style` (см. renderHTML)
+        renderHTML: (attributes: { width?: string }) =>
+          attributes.width ? { width: attributes.width } : {},
+      },
+    }
+  },
+  renderHTML({ HTMLAttributes }) {
+    const { width, ...rest } = HTMLAttributes as { width?: string }
+    const style = width ? `width: ${width}` : ''
+    return ['img', mergeAttributes(this.options.HTMLAttributes, rest, style ? { style } : {})]
+  },
   addNodeView() {
     return ({ node, getPos, editor }) => {
       const wrapper = document.createElement('span')
       wrapper.className = 'magaz-image-node'
+      const frame = document.createElement('span')
+      frame.className = 'magaz-image-frame'
       const picture = document.createElement('img')
       const remove = document.createElement('button')
       remove.type = 'button'
       remove.className = 'magaz-image-remove'
       remove.title = 'Убрать картинку'
       remove.textContent = '✕'
+      const resize = document.createElement('span')
+      resize.className = 'magaz-image-resize'
+      resize.title = 'Потяните, чтобы изменить размер'
+      resize.textContent = '⇲'
 
       let current = node
+
+      /** Позиция узла в документе: `null` — узел уже удалён, менять нечего. */
+      const position = (): number | null => {
+        const value = typeof getPos === 'function' ? getPos() : null
+        return typeof value === 'number' ? value : null
+      }
+
+      /** Проставить ширину (`''` — «как есть»): узел перерисуется через `update`. */
+      const setWidth = (width: string): void => {
+        const at = position()
+        if (at === null) return
+        editor.view.dispatch(editor.state.tr.setNodeMarkup(at, undefined, { ...current.attrs, width }))
+      }
+
       const render = (): void => {
         const name = imageNameFromSrc(current.attrs.src as string)
         picture.alt = String(current.attrs.alt ?? name ?? 'картинка')
+        picture.style.width = normalizeImageWidth(current.attrs.width)
         const src = name ? resolveImage(name) : ''
         if (src) picture.src = src
         else picture.removeAttribute('src')
       }
+
+      // Черновик приходит после вставки узла: подписываемся на его появление,
+      // иначе картинка осталась бы без `src` — «вставил, а её не видно» (Э9)
+      imageRenderers.add(render)
       render()
       remove.addEventListener('click', () => {
-        const position = typeof getPos === 'function' ? getPos() : null
-        if (position === null || position === undefined) return
-        editor.chain().focus().deleteRange({ from: position, to: position + current.nodeSize }).run()
+        const at = position()
+        if (at === null) return
+        editor.chain().focus().deleteRange({ from: at, to: at + current.nodeSize }).run()
       })
-      wrapper.append(picture, remove)
+
+      /**
+       * Ручка размера: тянем вправо-влево — ширина считается от ширины области
+       * редактирования, так админ видит тот же масштаб, что и кассир (§7.4).
+       */
+      resize.addEventListener('mousedown', (event: MouseEvent) => {
+        event.preventDefault()
+        event.stopPropagation()
+        const startX = event.clientX
+        const startWidth = picture.getBoundingClientRect().width || editor.view.dom.clientWidth || 1
+        const onMove = (move: MouseEvent): void => {
+          const width = Math.max(IMAGE_WIDTH_MIN, Math.round(startWidth + (move.clientX - startX)))
+          setWidth(`${width}px`)
+        }
+        const onUp = (): void => {
+          document.removeEventListener('mousemove', onMove)
+          document.removeEventListener('mouseup', onUp)
+        }
+        document.addEventListener('mousemove', onMove)
+        document.addEventListener('mouseup', onUp)
+      })
+
+      frame.append(picture, remove, resize)
+      wrapper.append(frame)
       return {
         dom: wrapper,
         update: (updated) => {
@@ -110,6 +217,9 @@ const MagazImage = Image.extend({
           current = updated
           render()
           return true
+        },
+        destroy: () => {
+          imageRenderers.delete(render)
         },
       }
     }
@@ -143,6 +253,9 @@ const editor = useEditor({
     handleDrop: (_view, event) => insertFromData(event.dataTransfer),
   },
   onUpdate: ({ editor: instance }) => emit('update:modelValue', instance.getHTML()),
+  onTransaction: () => {
+    editorTick.value += 1
+  },
 })
 
 /** Разметка синхронна и «снаружи»: форму открывают заново — тело должно сброситься. */
@@ -157,51 +270,174 @@ watch(
 )
 
 /**
+ * Картинки дорисовываются, когда приходит черновик: узел `magaz-image:<имя>`
+ * появляется в теле раньше, чем родитель отдаёт `drafts` обратно пропом, и без
+ * этого перерисовывания в редакторе было бы пустое место вместо картинки (Э9).
+ */
+watch(
+  () => props.drafts,
+  () => {
+    imageRenderers.forEach((render) => render())
+  },
+  { deep: true },
+)
+
+/**
  * Разложить файлы по черновикам и поставить в тело по узлу на каждый.
  *
  * Картинка превращается в `data:`-URL: так её видно в редакторе и предпросмотре,
  * а на сервер она уедет тем же телом (`data_base64`) при создании уведомления.
  */
 async function stageFiles(files: File[]): Promise<void> {
-  const images = files.filter((file) => file.type.startsWith('image/'))
-  if (!images.length) return
+  if (!files.length) return
   const staged = [...drafts.value]
-  for (const file of images) {
+  const added: NotificationImageDraft[] = []
+  for (const file of files) {
     if (staged.length >= IMAGES_MAX_PER_NOTIFICATION) {
       errorMessage.value =
         `К одному уведомлению можно приложить не больше ` +
         `${IMAGES_MAX_PER_NOTIFICATION} картинок`
       break
     }
-    const reason = imageFileError(file)
-    if (reason) {
-      errorMessage.value = `${file.name}: ${reason}`
+    // Тип и размер — по метаданным файла: 3-МБ картинку незачем превращать в base64
+    const quickReason = imageFileError(file)
+    if (quickReason) {
+      errorMessage.value = `${file.name || 'картинка'}: ${quickReason}`
       continue
     }
-    const name = makeImageName(file.name)
-    staged.push({
-      name,
-      contentType: file.type,
-      dataUrl: await readAsDataUrl(file),
-      sizeBytes: file.size,
-      sourceName: file.name,
-    })
+    const dataUrl = await readAsDataUrl(file)
+    const contentType = imageContentType(file, dataUrl)
+    if (!contentType) {
+      errorMessage.value = `${file.name || 'картинка'}: это не PNG, JPEG, GIF или WebP`
+      continue
+    }
+    if (file.size === 0 && dataUrlSize(dataUrl) > IMAGE_MAX_BYTES) {
+      errorMessage.value = `${file.name || 'картинка'}: картинка больше ${sizeMb(IMAGE_MAX_BYTES)}`
+      continue
+    }
+    const draft: NotificationImageDraft = {
+      name: makeImageName(file.name),
+      contentType,
+      dataUrl,
+      sizeBytes: file.size || dataUrlSize(dataUrl),
+      sourceName: file.name || 'картинка',
+    }
+    staged.push(draft)
+    added.push(draft)
+  }
+  // Черновики отдаём наружу **до** вставки узлов: узел появляется в теле раньше,
+  // чем родитель вернёт `drafts` пропом, и картинку дорисует `imageRenderers` (Э9)
+  if (added.length) emit('update:drafts', staged)
+  for (const draft of added) {
     editor.value
       ?.chain()
       .focus()
-      .setImage({ src: `${IMAGE_SRC_PREFIX}${name}`, alt: file.name })
+      .setImage({ src: `${IMAGE_SRC_PREFIX}${draft.name}`, alt: draft.sourceName })
       .run()
   }
-  // Ничего не приняли — не считаем это изменением: панель не должна «мигать» (Э9)
-  if (staged.length !== drafts.value.length) emit('update:drafts', staged)
+}
+
+/**
+ * Тип картинки: сначала «магические» байты самого файла (`data:image/png;base64,…`),
+ * и только потом `file.type`. Так вставка из буфера не теряется, когда браузер
+ * отдаёт файл без типа (Э9).
+ */
+function imageContentType(file: File, dataUrl: string): string {
+  const fromData = /^data:([a-z]+\/[a-z0-9.+-]+)[;,]/i.exec(dataUrl)?.[1]?.toLowerCase() ?? ''
+  if (IMAGE_CONTENT_TYPES.includes(fromData)) return fromData
+  const fromFile = (file.type || '').toLowerCase()
+  return IMAGE_CONTENT_TYPES.includes(fromFile) ? fromFile : ''
+}
+
+/** Размер картинки по `data:`-URL: base64 — 4 символа на 3 байта (§4.6). */
+function dataUrlSize(dataUrl: string): number {
+  const separator = dataUrl.indexOf(',')
+  if (separator < 0) return 0
+  return Math.floor(((dataUrl.length - separator - 1) * 3) / 4)
+}
+
+/** Файл-картинка: тип бывает пустым — тогда смотрим на расширение. */
+function isImageFile(file: File): boolean {
+  return file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp)$/i.test(file.name)
 }
 
 /** Картинки из буфера обмена или перетаскивания: тот же путь, что у выбора файла. */
 function insertFromData(data: DataTransfer | null): boolean {
-  const files = Array.from(data?.files ?? []).filter((file) => file.type.startsWith('image/'))
-  if (!files.length) return false
-  void stageFiles(files)
-  return true
+  if (!data) return false
+  const files = collectImageFiles(data)
+  if (files.length) {
+    void stageFiles(files)
+    return true
+  }
+  const inline = inlineImageSources(data.getData('text/html'))
+  if (inline.length) {
+    void stageInlineImages(inline)
+    return true
+  }
+  return false
+}
+
+/**
+ * Картинки из буфера: браузеры кладут их и в `files`, и в `items` — например,
+ * скриншот из «Ножниц» или картинка из Word приходят только во `items` (Э9).
+ */
+function collectImageFiles(data: DataTransfer): File[] {
+  const files: File[] = []
+  for (const file of Array.from(data.files ?? [])) {
+    if (isImageFile(file)) files.push(file)
+  }
+  if (!files.length) {
+    for (const item of Array.from(data.items ?? [])) {
+      if (item.kind !== 'file') continue
+      const file = item.getAsFile()
+      if (file && isImageFile(file)) files.push(file)
+    }
+  }
+  return files
+}
+
+/** `data:`-картинки из скопированной разметки: внешние адреса до кассы не доедут (§4.6). */
+function inlineImageSources(html: string): string[] {
+  if (!html) return []
+  const parsed = new DOMParser().parseFromString(html, 'text/html')
+  return [...parsed.querySelectorAll('img')]
+    .map((node) => node.getAttribute('src') ?? '')
+    .filter((src) => src.toLowerCase().startsWith('data:image/'))
+}
+
+/** Разложить картинки из буфера по черновикам — тот же путь, что у файлов (Э9). */
+async function stageInlineImages(sources: string[]): Promise<void> {
+  const staged = [...drafts.value]
+  const added: NotificationImageDraft[] = []
+  for (const dataUrl of sources) {
+    if (staged.length >= IMAGES_MAX_PER_NOTIFICATION) break
+    const contentType = imageContentType(new File([], 'clipboard'), dataUrl)
+    if (!contentType) continue
+    const extension = IMAGE_EXTENSIONS[contentType] ?? 'png'
+    const size = dataUrlSize(dataUrl)
+    const reason = imageFileError({ type: contentType, size })
+    if (reason) {
+      errorMessage.value = `картинка из буфера: ${reason}`
+      continue
+    }
+    const draft: NotificationImageDraft = {
+      name: makeImageName(`clipboard.${extension}`),
+      contentType,
+      dataUrl,
+      sizeBytes: size,
+      sourceName: `картинка из буфера.${extension}`,
+    }
+    staged.push(draft)
+    added.push(draft)
+  }
+  if (added.length) emit('update:drafts', staged)
+  for (const draft of added) {
+    editor.value
+      ?.chain()
+      .focus()
+      .setImage({ src: `${IMAGE_SRC_PREFIX}${draft.name}`, alt: draft.sourceName })
+      .run()
+  }
 }
 
 function readAsDataUrl(file: File): Promise<string> {
@@ -285,6 +521,51 @@ function setHighlight(value: string): void {
   instance.chain().focus().setBackgroundColor(value).run()
 }
 
+// --- Размер картинки (§11.5, Э9) -------------------------------------------
+
+/** Ширина выделенной картинки в пикселях: считаем по тому, что видно админу. */
+function selectedImagePixels(): number {
+  const picture = document.querySelector<HTMLImageElement>(
+    '.magaz-image-node.ProseMirror-selectednode img',
+  )
+  return picture ? Math.round(picture.getBoundingClientRect().width) : 0
+}
+
+/** Записать ширину выделенной картинке; `null` — вернуть натуральный размер. */
+function applyImageWidth(width: string | null): void {
+  const instance = editor.value
+  if (!instance) return
+  const { from } = instance.state.selection
+  const node = instance.state.doc.nodeAt(from)
+  if (!node || node.type.name !== 'image') return
+  instance.view.dispatch(
+    instance.state.tr.setNodeMarkup(from, undefined, { ...node.attrs, width: width ?? '' }),
+  )
+  emit('update:modelValue', instance.getHTML())
+}
+
+/** «Уже»/«шире» на 10 % ширины области редактирования — шаг заметный, но не грубый. */
+function stepImageWidth(direction: 1 | -1): void {
+  const instance = editor.value
+  const current = selectedImagePixels()
+  if (!instance || !current) return
+  const available = instance.view.dom.clientWidth || 600
+  // Не больше четверти самой картинки: маленькую иначе «перепрыгивало» бы в минимум (Э9)
+  const step = Math.max(
+    20,
+    Math.min(Math.round(available * IMAGE_WIDTH_STEP_SHARE), Math.round(current / 4)),
+  )
+  applyImageWidth(`${Math.max(IMAGE_WIDTH_MIN, current + direction * step)}px`)
+}
+
+/** Доля ширины области редактирования: кнопки «половина» и «во всю ширину». */
+function setImageWidthShare(share: number): void {
+  const instance = editor.value
+  if (!instance) return
+  const available = instance.view.dom.clientWidth || 600
+  applyImageWidth(`${Math.max(IMAGE_WIDTH_MIN, Math.round(available * share))}px`)
+}
+
 /** Состояние кнопок читается из редактора — панель показывает активные форматы (§11.5). */
 const can = computed(() => editor.value?.isEditable ?? false)
 
@@ -293,10 +574,14 @@ function isActive(
   name: string | Record<string, unknown>,
   attrs?: Record<string, unknown>,
 ): boolean {
+  void editorTick.value
   const instance = editor.value
   if (!instance) return false
   return typeof name === 'string' ? instance.isActive(name, attrs) : instance.isActive(name)
 }
+
+/** Выделена картинка: только тогда кнопки размера в панели работают (§11.5). */
+const imageSelected = computed(() => isActive('image'))
 
 defineExpose({ removeDraft, editor })
 </script>
@@ -467,6 +752,60 @@ defineExpose({ removeDraft, editor })
       >
         🖼 картинка
       </button>
+
+      <span class="rte-sep" />
+
+      <button
+        type="button"
+        class="rte-btn"
+        :disabled="!imageSelected"
+        title="Уже на 10 %"
+        data-test="rte-image-smaller"
+        @click="stepImageWidth(-1)"
+      >
+        −
+      </button>
+      <button
+        type="button"
+        class="rte-btn"
+        :disabled="!imageSelected"
+        title="Шире на 10 %"
+        data-test="rte-image-bigger"
+        @click="stepImageWidth(1)"
+      >
+        +
+      </button>
+      <button
+        type="button"
+        class="rte-btn"
+        :disabled="!imageSelected"
+        title="Половина ширины"
+        data-test="rte-image-half"
+        @click="setImageWidthShare(0.5)"
+      >
+        50 %
+      </button>
+      <button
+        type="button"
+        class="rte-btn"
+        :disabled="!imageSelected"
+        title="Во всю ширину"
+        data-test="rte-image-full"
+        @click="setImageWidthShare(1)"
+      >
+        100 %
+      </button>
+      <button
+        type="button"
+        class="rte-btn"
+        :disabled="!imageSelected"
+        title="Натуральный размер"
+        data-test="rte-image-original"
+        @click="applyImageWidth(null)"
+      >
+        как есть
+      </button>
+
       <input
         ref="fileInput"
         type="file"

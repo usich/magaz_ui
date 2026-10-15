@@ -129,13 +129,24 @@ export function makeImageName(sourceName: string): string {
   return `img-${Math.random().toString(16).slice(2, 10)}.${allowed.includes(safe) ? safe : 'png'}`
 }
 
-/** Почему картинку нельзя приложить; `null` — можно (проверки сервера дублирует UI). */
-export function imageFileError(file: { type: string; size: number }): string | null {
-  if (!IMAGE_CONTENT_TYPES.includes(file.type)) {
+/** Размер картинки по-человечески: «2 МБ» — для подсказок и ошибок (Э9). */
+export function sizeMb(bytes: number): string {
+  return `${Math.round((bytes / (1024 * 1024)) * 10) / 10} МБ`
+}
+
+/**
+ * Почему картинку нельзя приложить; `null` — можно (проверки сервера дублирует UI).
+ *
+ * Пустой `type` — не отказ: браузер не всегда знает тип (например, при вставке из
+ * буфера). Тогда редактор определит тип по содержимому файла (Э9).
+ */
+export function imageFileError(file: { type?: string; size: number }): string | null {
+  const type = (file.type ?? '').toLowerCase()
+  if (type && !IMAGE_CONTENT_TYPES.includes(type)) {
     return 'Поддерживаются PNG, JPEG, GIF и WebP'
   }
   if (file.size > IMAGE_MAX_BYTES) {
-    return `Картинка больше ${IMAGE_MAX_BYTES / (1024 * 1024)} МБ`
+    return `Картинка больше ${sizeMb(IMAGE_MAX_BYTES)}`
   }
   return null
 }

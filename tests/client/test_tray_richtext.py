@@ -81,6 +81,18 @@ class TestBodyBlocks:
         assert blocks[-1].name == "shema.png"
         assert blocks[-1].alt == "Схема"
 
+    def test_image_width_comes_from_style(self) -> None:
+        """Размер картинки задаёт админ в редакторе (§11.5, Э9)."""
+        body = (
+            '<img src="magaz-image:shema.png" style="width: 50%">'
+            '<img src="magaz-image:plan.png" style="width: 320px">'
+            '<img src="magaz-image:tak.png" style="width: 100vw">'
+            '<img src="magaz-image:net.png">'
+        )
+        blocks = body_blocks(body, "html")
+
+        assert [block.width for block in blocks] == ["50%", "320px", "", ""]
+
     def test_foreign_image_is_ignored(self) -> None:
         """Внешний адрес рисовать нечем: касса в интернет не ходит (§7.4)."""
         assert body_blocks('<img src="https://example.com/a.png">', "html") == []

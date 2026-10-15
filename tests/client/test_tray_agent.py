@@ -711,3 +711,23 @@ class TestTrayPanel:
         assert client.archive_calls == 1
         assert windows.archive == [2]
 
+
+class TestImagePixelWidth:
+    """Размер картинки из тела: его задаёт админ в редакторе (§11.5, Э9)."""
+
+    def test_percent_counts_from_area(self) -> None:
+        assert tray_main._image_pixel_width("50%", 600) == 300
+        assert tray_main._image_pixel_width("100%", 600) == 600
+
+    def test_pixels_are_limited_by_area(self) -> None:
+        assert tray_main._image_pixel_width("320px", 600) == 320
+        assert tray_main._image_pixel_width("900px", 600) == 600
+
+    def test_too_small_width_is_raised_to_minimum(self) -> None:
+        assert tray_main._image_pixel_width("10px", 600) == 60
+        assert tray_main._image_pixel_width("5%", 600) == 60
+
+    def test_empty_or_broken_width_takes_the_whole_area(self) -> None:
+        assert tray_main._image_pixel_width("", 600) == 600
+        assert tray_main._image_pixel_width("100vw", 600) == 600
+

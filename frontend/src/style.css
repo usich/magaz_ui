@@ -226,16 +226,29 @@ a {
 }
 
 /* Картинка в редакторе: метка `magaz-image:<имя>` показывается самой картинкой,
- * а крестик убирает её из тела целиком (§4.6, Э9). */
+ * крестик убирает её из тела, ручка в углу меняет размер (§4.6, §11.5, Э9). */
 .magaz-image-node {
+  display: block;
+  margin: 4px 0;
+}
+
+/* Рамка по размеру картинки: крестик и ручка стоят у её краёв, а не у края поля */
+.magaz-image-frame {
   position: relative;
   display: inline-block;
+  max-width: 100%;
 }
 
 .magaz-image-node img {
   max-width: 100%;
   border-radius: 8px;
   border: 1px solid var(--magaz-border);
+}
+
+/* Выделенная картинка: видно, к чему применятся кнопки размера панели */
+.magaz-image-node.ProseMirror-selectednode img {
+  border-color: #0284c7;
+  box-shadow: 0 0 0 2px rgba(2, 132, 199, 0.25);
 }
 
 .magaz-image-remove {
@@ -250,6 +263,27 @@ a {
   font-size: 11px;
   line-height: 1;
   cursor: pointer;
+}
+
+/* Ручка размера: тянется мышью вправо-влево, ширина считается в пикселях (§11.5) */
+.magaz-image-resize {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  border: 1px solid var(--magaz-border);
+  background: rgba(255, 255, 255, 0.9);
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+  cursor: nwse-resize;
+  user-select: none;
+}
+
+.magaz-image-resize:hover {
+  border-color: #0284c7;
 }
 
 /* ---------------------------------------------------------------------------
