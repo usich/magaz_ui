@@ -172,6 +172,17 @@ export const useDevicesStore = defineStore('devices', () => {
     await load()
   }
 
+  /**
+   * Э10: удалить устройство из списка насовсем (`.../purge`).
+   *
+   * Это не «Отключить из опроса»: строка `store_devices` исчезает вместе с
+   * историей опроса, а магазин получает агенту новый список устройств (§7.6).
+   */
+  async function purge(targetStoreId: number, deviceId: number): Promise<void> {
+    await devicesApi.purge(targetStoreId, deviceId)
+    await load()
+  }
+
   let timer: ReturnType<typeof setInterval> | null = null
 
   /** Автообновление таблицы (идемпотентно) — включено, пока открыта страница. */
@@ -217,6 +228,7 @@ export const useDevicesStore = defineStore('devices', () => {
     update,
     deactivate,
     restore,
+    purge,
     startPolling,
     stopPolling,
   }

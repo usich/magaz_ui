@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from client.agent.processes import DEFAULT_PROVIDER
+from shared.paths import UPDATE_FILE_SUFFIXES, validate_file_name
 
 if TYPE_CHECKING:  # pragma: no cover - только для аннотаций
     from client.agent.processes import ProcessProvider
@@ -57,12 +58,14 @@ __all__ = [
     "USERS_SHUTDOWN_TIMEOUT",
     "USERS_UNLOCK_TIMEOUT",
     "OneCPaths",
+    "UpdateFileError",
     "build_enable_users_command",
     "build_merge_command",
     "build_shutdown_users_command",
     "build_update_db_command",
     "check_log_file",
     "clear_log_file",
+    "delete_update_files",
     "format_command",
     "mask_command",
     "run_1c_command",
@@ -187,6 +190,41 @@ class OneCPaths:
 def mask_command(args: list[str]) -> list[str]:
     """Скрыть пароль в аргументах команды перед записью в лог (I-7)."""
     return [PASSWORD_MASK if arg.startswith(PASSWORD_ARG_PREFIX) else arg for arg in args]
+
+
+class UpdateFileError(RuntimeError):
+    """Файл обновления удалить не удалось: занят, нет прав, каталог только для чтения."""
+
+
+def delete_update_files(
+    paths: OneCPaths, *, file_name: str, suffix: str | None = None
+) -> tuple[list[str], list[str]]:
+    """Удалить файлы обновления из рабочей папки кассы (Э10, §11.3).
+
+    Возвращает `(удалённые, отсутствовавшие)`. Удаляются только файлы обновления:
+    имя проходит `validate_file_name` (без пути и разделителей, I-2), расширение
+    берётся из `UPDATE_FILE_SUFFIXES` (`.cf/.cfe/.xml`) — поэтому действием нельзя
+    задеть ни `1cv8.exe`, ни логи, ни файлы базы; пустой `suffix` — «все три».
+
+    Логи 1С и снимок `file_checks` это не трогает: после удаления админ может
+    нажать «Проверить», чтобы матрица `/files` отразила факт (§11.3).
+    """
+    name = validate_file_name(file_name)
+    suffixes = (suffix,) if suffix else UPDATE_FILE_SUFFIXES
+    removed: list[str] = []
+    missing: list[str] = []
+    for item in suffixes:
+        path = paths.update_file(name, item)
+        if not path.is_file():
+            missing.append(path.name)
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise UpdateFileError(f"Не удалось удалить {path.name}: {exc}") from exc
+        removed.append(path.name)
+        logger.info("Файл обновления %s удалён из %s", path.name, paths.work_dir)
+    return removed, missing
 
 
 def format_command(args: list[str]) -> str:

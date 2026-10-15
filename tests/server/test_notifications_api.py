@@ -674,3 +674,29 @@ class TestNotifyDelivery:
 
 
 
+
+
+class TestDeleteNotification:
+    """Э10: удаление уведомления целиком — задачи, отметки, адресаты (§11.5)."""
+
+    def test_delete_closes_jobs_and_hides_notification(  # noqa: ANN001
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        notification_id = create_notification(auth_client)["notification"]["id"]
+
+        response = auth_client.delete(f"{NOTIFICATIONS_URL}/{notification_id}")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["notification_id"] == notification_id
+        assert body["canceled_jobs"] == 1, "незавершённая задача рассылки закрывается"
+        assert "Уведомление удалено" in body["message"]
+        assert auth_client.get(f"{NOTIFICATIONS_URL}").json()["items"] == []
+        assert auth_client.get(f"{NOTIFICATIONS_URL}/{notification_id}").status_code == 404
+        assert all(
+            job.status == str(CommandStatus.CANCELED) for job in notify_jobs(session)
+        ), "офлайн-касса не получит удалённое уведомление"
+        actions = [row.action for row in session.scalars(select(AuditLog)).all()]
+        assert "notification_delete" in actions
+        assert auth_client.delete(f"{NOTIFICATIONS_URL}/{notification_id}").status_code == 404
+

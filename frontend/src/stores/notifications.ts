@@ -309,6 +309,39 @@ export const useNotificationsStore = defineStore('notifications', () => {
     }
   }
 
+  /**
+   * Э10: удалить уведомление целиком (адресаты, отметки, картинки, задачи).
+   * Список перечитывается, а если открыт отчёт по этому уведомлению — он гасится:
+   * показывать нечего, уведомления больше нет (§11.5).
+   */
+  async function remove(id: number): Promise<boolean> {
+    try {
+      await notificationsApi.remove(id)
+      if (report.value?.notification.id === id) {
+        report.value = null
+      }
+      await load()
+      errorMessage.value = ''
+      return true
+    } catch (error) {
+      errorMessage.value = error instanceof ApiError ? error.message : 'Уведомление не удалено'
+      return false
+    }
+  }
+
+  /** Э10: убрать картинку из тела уведомления — файл, запись и метку (§4.6). */
+  async function removeImage(id: number, name: string): Promise<boolean> {
+    try {
+      await notificationsApi.removeImage(id, name)
+      await loadReport(id)
+      errorMessage.value = ''
+      return true
+    } catch (error) {
+      errorMessage.value = error instanceof ApiError ? error.message : 'Картинка не удалена'
+      return false
+    }
+  }
+
   /** Ссылка на CSV-отчёт: скачивание делает браузер вместе с cookie сессии (§11.5). */
   function csvUrl(id: number): string {
     return notificationsApi.reportCsvUrl(id)
@@ -338,6 +371,8 @@ export const useNotificationsStore = defineStore('notifications', () => {
     loadReport,
     create,
     cancel,
+    remove,
+    removeImage,
     csvUrl,
   }
 })

@@ -37,6 +37,8 @@ class CommandKind(StrEnum):
     RUN_UPDATE_DB = "run_update_db"
     SEND_MESSAGE = "send_message"
     NOTIFY = "notify"
+    #: Э10: удаление файлов обновления в рабочей папке кассы
+    DELETE_FILE = "delete_file"
 
 
 class CommandStatus(StrEnum):
@@ -61,6 +63,8 @@ class ActionKind(StrEnum):
     RUN_UPDATE_DB = "run_update_db"
     SEND_MESSAGE = "send_message"
     NOTIFY = "notify"
+    #: Э10: удалить файлы обновления на кассе (`.cf/.cfe/.xml` в рабочей папке)
+    DELETE_FILE = "delete_file"
 
 
 class JobLogLevel(StrEnum):

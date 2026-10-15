@@ -31,7 +31,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from server.core.dependencies import get_client_ip, get_db, require_active_admin
@@ -43,6 +43,7 @@ from server.services import (
     settings_service,
 )
 from shared.enums import ActionKind, CommandKind, CommandStatus, TargetType
+from shared.paths import UPDATE_FILE_SUFFIXES
 from shared.schemas import CheckFilesParams
 from shared.timeutil import to_iso_z, utcnow
 
@@ -71,6 +72,7 @@ SUPPORTED_ACTIONS: frozenset[str] = frozenset(
         str(ActionKind.RUN_UPDATE_DB),
         str(ActionKind.SEND_MESSAGE),
         str(ActionKind.NOTIFY),
+        str(ActionKind.DELETE_FILE),
     }
 )
 
@@ -84,6 +86,8 @@ ACTION_KIND: dict[str, str] = {
     str(ActionKind.RUN_UPDATE_DB): str(CommandKind.RUN_UPDATE_DB),
     str(ActionKind.SEND_MESSAGE): str(CommandKind.SEND_MESSAGE),
     str(ActionKind.NOTIFY): str(CommandKind.NOTIFY),
+    #: Э10: удаление файлов обновления на кассе
+    str(ActionKind.DELETE_FILE): str(CommandKind.DELETE_FILE),
 }
 
 
@@ -324,6 +328,28 @@ def _validate_action(action: str, params: dict[str, Any]) -> tuple[str, dict[str
         extension_name = str(raw.get("extension_name") or "").strip()
         if extension_name:
             clean["extension_name"] = extension_name
+
+    elif name == str(ActionKind.DELETE_FILE):
+        file_name = str(raw.get("file_name") or raw.get("filename") or "").strip()
+        if not file_name:
+            raise HTTPException(
+                status_code=HTTP_422,
+                detail="Не указано имя файла обновления (file_name)",
+            )
+        clean["file_name"] = _validate_filename(file_name)
+        suffix = str(raw.get("suffix") or "").strip().lower()
+        if suffix:
+            if not suffix.startswith("."):
+                suffix = f".{suffix}"
+            if suffix not in UPDATE_FILE_SUFFIXES:
+                raise HTTPException(
+                    status_code=HTTP_422,
+                    detail=(
+                        f"Недопустимое расширение {suffix!r}: "
+                        f"ожидается {', '.join(UPDATE_FILE_SUFFIXES)}"
+                    ),
+                )
+            clean["suffix"] = suffix
 
     elif name == str(ActionKind.NOTIFY):
         # Уведомление — не параметр задачи 1С, а отдельная сущность (§11.5):
@@ -872,4 +898,75 @@ def files_matrix(  # noqa: PLR0913 - параметры HTTP-точки
     )
 
 
+
+
+
+# --- Удаление снимков файлов (Э10) ------------------------------------------
+
+
+class FileSnapshotDeletedOut(BaseModel):
+    """Ответ `DELETE /files/{store_id}`: снимки проверки убраны из матрицы (§11.3)."""
+
+    store_id: int
+    store_name: str
+    filename: str | None = None
+    removed: int = 0
+    message: str
+
+
+@router.delete(
+    "/files/{store_id}",
+    response_model=FileSnapshotDeletedOut,
+    summary="Убрать снимок файлов из матрицы (Э10)",
+)
+def delete_file_snapshot(
+    store_id: int,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+    filename: Annotated[str | None, Query(max_length=200)] = None,
+) -> FileSnapshotDeletedOut:
+    """Удалить снимок(и) `file_checks` магазина (Э10, §4.5, Q52).
+
+    Матрица `/files` рисует **последний** снимок на магазин: после удаления строка
+    снова «не проверялся», пока касса не пришлёт новый снимок (§11.3). Файлы на
+    кассе это не трогает — для них есть отдельное действие `delete_file`.
+    """
+    store = _get_store(session, store_id)
+    name: str | None = None
+    if filename is not None and filename.strip():
+        name = _validate_filename(filename.strip())
+
+    stmt = delete(FileCheck).where(FileCheck.store_id == store.id)
+    if name is not None:
+        stmt = stmt.where(FileCheck.filename == name)
+    removed = int(session.execute(stmt).rowcount or 0)
+
+    audit_service.record(
+        session,
+        action="file_snapshot_delete",
+        actor=admin.username,
+        entity="store",
+        entity_id=store.id,
+        details={"filename": name, "removed": removed},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    logger.info(
+        "Снимки файлов магазина id=%s удалены (имя: %s): строк %s",
+        store.id,
+        name or "все",
+        removed,
+    )
+    return FileSnapshotDeletedOut(
+        store_id=store.id,
+        store_name=store.name,
+        filename=name,
+        removed=removed,
+        message=(
+            f"Снимок проверки убран из матрицы: строк {removed}"
+            if removed
+            else "Снимков не было — матрица и так пустая для этого магазина"
+        ),
+    )
 

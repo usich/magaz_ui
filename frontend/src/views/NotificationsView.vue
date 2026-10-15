@@ -20,6 +20,7 @@ import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
 import type { NotificationFilters, NotificationItem, NotificationSeverity } from '@/api/types'
+import ConfirmDeleteDialog from '@/components/ConfirmDeleteDialog.vue'
 import NotificationFormDialog from '@/components/NotificationFormDialog.vue'
 import {
   SEVERITY_LABELS,
@@ -93,6 +94,40 @@ function onSaved(count: number): void {
     detail: `Магазинов: ${count}. Доставку выполняет диспетчер (§11.4)`,
     life: 5000,
   })
+}
+
+/** Э10: «Удалить» — уведомление уходит вместе с отчётом, поэтому подтверждение. */
+const pendingDelete = ref<NotificationItem | null>(null)
+const isDeleting = ref(false)
+
+function askDelete(item: NotificationItem): void {
+  pendingDelete.value = item
+}
+
+async function confirmDelete(): Promise<void> {
+  const item = pendingDelete.value
+  if (!item) return
+  isDeleting.value = true
+  try {
+    if (!(await notifications.remove(item.id))) {
+      toast.add({
+        severity: 'error',
+        summary: 'Уведомление не удалено',
+        detail: notifications.errorMessage,
+        life: 6000,
+      })
+      return
+    }
+    pendingDelete.value = null
+    toast.add({
+      severity: 'success',
+      summary: 'Уведомление удалено',
+      detail: `${item.title} — задачи рассылки закрыты, картинки удалены`,
+      life: 5000,
+    })
+  } finally {
+    isDeleting.value = false
+  }
 }
 
 function formatTime(value: string | null): string {
@@ -325,6 +360,14 @@ function formatTime(value: string | null): string {
                   :data-test="`notification-cancel-${row.id}`"
                   @click="cancel(row)"
                 />
+                <Button
+                  label="Удалить"
+                  size="small"
+                  text
+                  severity="danger"
+                  :data-test="`notification-delete-${row.id}`"
+                  @click="askDelete(row)"
+                />
               </div>
             </td>
           </tr>
@@ -342,6 +385,21 @@ function formatTime(value: string | null): string {
       :store-options="storeOptions"
       :cluster-options="clusterOptions"
       @saved="onSaved($event.stores)"
+    />
+
+    <ConfirmDeleteDialog
+      :visible="pendingDelete !== null"
+      header="Удалить уведомление?"
+      :message="`«${pendingDelete?.title ?? ''}» исчезнет из списка вместе с отчётом «кто ознакомился».`"
+      :details="[
+        'Отметки «ознакомлен», «отложено» и адресаты магазинов будут удалены',
+        'Картинки тела удаляются с сервера вместе с файлами',
+        'Незавершённые задачи рассылки закроются: офлайн-кассы его не получат',
+        'Окна, уже показанные сотрудникам, отозвать нельзя — как и при отмене (§7.4)',
+      ]"
+      :loading="isDeleting"
+      @update:visible="(value: boolean) => { if (!value) pendingDelete = null }"
+      @confirm="confirmDelete"
     />
   </div>
 </template>

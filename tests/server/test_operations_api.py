@@ -766,3 +766,75 @@ class TestUpdateConflictBlock:
 
         assert response.status_code == 202, response.text
         assert len(jobs(session)) == 1
+
+
+class TestDeleteFileAction:
+    """Э10: удаление файлов обновления на кассе — действие `delete_file` (§11.3)."""
+
+    def test_action_creates_delete_file_job(  # noqa: ANN001
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        response = auth_client.post(
+            actions_url(store.id),
+            json={"action": "delete_file", "params": {"file_name": "update", "suffix": "cf"}},
+        )
+
+        assert response.status_code == 202, response.text
+        assert response.json()["job"]["kind"] == CommandKind.DELETE_FILE
+        stored = jobs(session)
+        assert stored[0].kind == str(CommandKind.DELETE_FILE)
+        assert stored[0].params == {"file_name": "update", "suffix": ".cf"}
+        assert "store_action" in audit_actions(session)
+
+    def test_action_without_file_name_is_rejected(  # noqa: ANN001
+        self, auth_client: TestClient, store: Store
+    ) -> None:
+        empty = auth_client.post(actions_url(store.id), json={"action": "delete_file", "params": {}})
+
+        assert empty.status_code == 422
+
+    def test_action_rejects_traversal_and_unknown_suffix(  # noqa: ANN001
+        self, auth_client: TestClient, store: Store
+    ) -> None:
+        traversal = auth_client.post(
+            actions_url(store.id),
+            json={"action": "delete_file", "params": {"file_name": "..\\1cv8"}},
+        )
+        bad_suffix = auth_client.post(
+            actions_url(store.id),
+            json={"action": "delete_file", "params": {"file_name": "update", "suffix": ".exe"}},
+        )
+
+        assert traversal.status_code == 422, "I-2: имя файла без разделителей пути"
+        assert bad_suffix.status_code == 422, "удалять можно только .cf/.cfe/.xml"
+
+    def test_file_snapshot_can_be_dropped(  # noqa: ANN001
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """Э10: `DELETE /files/{store_id}` убирает снимок — строка «не проверялся»."""
+        session.add(
+            FileCheck(
+                store_id=store.id,
+                filename="update",
+                cf_exists=True,
+                cfe_exists=False,
+                xml_exists=False,
+                cf_size=1024,
+                checked_at=utcnow(),
+            )
+        )
+        session.commit()
+
+        response = auth_client.delete(f"/api/v1/admin/files/{store.id}?filename=update")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["removed"] == 1
+        assert body["filename"] == "update"
+        matrix = auth_client.get("/api/v1/admin/files/matrix?filename=update").json()
+        row = next(item for item in matrix["rows"] if item["store_id"] == store.id)
+        assert row["checked"] is False
+        assert row["has_file"] is False
+        again = auth_client.delete(f"/api/v1/admin/files/{store.id}?filename=update")
+        assert again.json()["removed"] == 0
+        assert "file_snapshot_delete" in audit_actions(session)

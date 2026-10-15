@@ -59,7 +59,9 @@ from client.agent.one_c import (
     OneCPaths,
     SUCCESS_MERGE_MSG,
     SUCCESS_UPDATE_MSG,
+    UpdateFileError,
     check_log_file,
+    delete_update_files,
 )
 from client.agent.processes import DEFAULT_PROVIDER, ProcessProvider
 from shared.schemas import (
@@ -67,6 +69,8 @@ from shared.schemas import (
     CheckFilesParams,
     CheckFilesResponse,
     CredentialsPush,
+    DeleteFileParams,
+    DeleteFileResponse,
     DeviceCheckRequest,
     DeviceCheckResult,
     DevicesConfigPush,
@@ -373,6 +377,40 @@ def create_agent_app(
             cf_mtime=cf_mtime,
             cfe_mtime=cfe_mtime,
             xml_mtime=xml_mtime,
+        )
+
+    @app.post(
+        "/files/delete",
+        response_model=DeleteFileResponse,
+        dependencies=[Depends(require_agent_token)],
+        summary="Удалить файлы обновления на кассе (Э10)",
+        tags=["1c"],
+    )
+    async def delete_files(params: DeleteFileParams = Body(...)) -> DeleteFileResponse:
+        """Удалить `.cf`/`.cfe`/`.xml` из рабочей папки агента (Э10, §11.3).
+
+        Удаляются только файлы обновления: имя проверяется по I-2 (без разделителей
+        пути), расширение — из `.cf/.cfe/.xml`. Логи 1С и файлы базы не задеваются.
+        Снимок `file_checks` сервер обновит следующей проверкой («Проверить»).
+        """
+        try:
+            removed, missing = delete_update_files(
+                one_c_paths, file_name=params.file_name, suffix=params.suffix
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+        except UpdateFileError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        logger.info(
+            "Удаление файлов «%s»: удалено %s, не было %s",
+            params.file_name,
+            removed,
+            missing,
+        )
+        return DeleteFileResponse(
+            removed=removed, missing=missing, work_dir=str(one_c_paths.work_dir)
         )
 
     @app.post(

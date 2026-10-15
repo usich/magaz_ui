@@ -257,4 +257,28 @@ describe('страница «Оборудование подсети»', () => {
     expect(wrapper.find('[data-test="devices-empty"]').text()).toContain('карточку магазина')
     wrapper.unmount()
   })
+
+  it('«Удалить» подтверждает и шлёт purge: строка исчезает насовсем (Э10)', async () => {
+    fetchMock.mockImplementation(apiMock(makeMatrix([makeDevice({ id: 4, store_id: 5 })])))
+
+    const { wrapper } = await mountDevices(fetchMock)
+    const deleteButton = wrapper.findAll('button').find((item) => item.text() === 'Удалить')
+    expect(deleteButton).toBeTruthy()
+    await deleteButton?.trigger('click')
+    await flushPromises()
+
+    const dialog = wrapper.find('[data-test="confirm-dialog"]')
+    expect(dialog.exists()).toBe(true)
+    expect(dialog.text()).toContain('вернуть его будет нельзя')
+
+    const confirm = dialog.findAll('button').find((item) => item.text() === 'Удалить')
+    await confirm?.trigger('click')
+    await flushPromises()
+
+    const purgeCall = fetchMock.mock.calls.find((call) => String(call[0]).includes('/purge'))
+    expect(String(purgeCall?.[0])).toBe('/api/v1/admin/stores/5/devices/4/purge')
+    expect(String((purgeCall?.[1] as RequestInit).method)).toBe('DELETE')
+    wrapper.unmount()
+  })
 })
+

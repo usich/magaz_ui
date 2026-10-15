@@ -14,19 +14,23 @@ import type {
   CancelNotificationResponse,
   DeviceCheckResponse,
   DeviceCreatePayload,
+  DeviceDeleted,
   DeviceItem,
   DeviceListFilters,
   DeviceUpdatePayload,
   DevicesMatrix,
   FileMatrix,
   FileMatrixFilters,
+  FileSnapshotDeleted,
   JobDetail,
   JobFilters,
   JobsPage,
   LoginPayload,
   NotificationCreatePayload,
   NotificationCreateResponse,
+  NotificationDeleted,
   NotificationFilters,
+  NotificationImageDeleted,
   NotificationList,
   NotificationReport,
   ServerHealth,
@@ -196,6 +200,30 @@ export const filesApi = {
     const suffix = query.toString() ? `?${query}` : ''
     return api.get<FileMatrix>(`/admin/files/matrix${suffix}`)
   },
+
+  /**
+   * Э10: `DELETE /admin/files/{store_id}` — убрать снимок проверки из матрицы.
+   * Файлы на кассе не трогаются: строка снова «не проверялся» до новой проверки.
+   */
+  dropSnapshot: (storeId: number, filename?: string | null) => {
+    const query = new URLSearchParams()
+    if (filename?.trim()) query.set('filename', filename.trim())
+    const suffix = query.toString() ? `?${query}` : ''
+    return api.delete<FileSnapshotDeleted>(`/admin/files/${storeId}${suffix}`)
+  },
+
+  /**
+   * Э10: удалить файлы обновления на самой кассе — действие `delete_file`
+   * (`POST /admin/stores/{id}/actions`). `suffix` пусто — все `.cf/.cfe/.xml`.
+   */
+  deleteOnStore: (storeId: number, fileName: string, suffix?: string | null) =>
+    actionsApi.run(storeId, {
+      action: 'delete_file',
+      params: {
+        file_name: fileName,
+        ...(suffix ? { suffix } : {}),
+      },
+    }),
 }
 
 /**
@@ -224,6 +252,14 @@ export const devicesApi = {
   /** `DELETE /admin/stores/{id}/devices/{device_id}` — мягкое «Отключить из опроса». */
   deactivate: (storeId: number, deviceId: number) =>
     api.delete<DeviceItem>(`/admin/stores/${storeId}/devices/${deviceId}`),
+
+  /**
+   * Э10: `DELETE /admin/stores/{id}/devices/{device_id}/purge` — удалить устройство
+   * из списка насовсем. Отличие от «Отключить из опроса»: строка `store_devices`
+   * исчезает, версия списка растёт, и касса получает новый список (§7.6, §11.7).
+   */
+  purge: (storeId: number, deviceId: number) =>
+    api.delete<DeviceDeleted>(`/admin/stores/${storeId}/devices/${deviceId}/purge`),
 
   /** `POST /admin/stores/{id}/devices/check` — «Проверить сейчас» (пусто — все устройства). */
   check: (storeId: number, deviceIds: number[] = []) =>
@@ -274,6 +310,22 @@ export const notificationsApi = {
   /** Остановить рассылку: показы прекращаются, отчёт сохраняется (§11.5). */
   cancel: (id: number) =>
     api.post<CancelNotificationResponse>(`/admin/notifications/${id}/cancel`),
+
+  /**
+   * Э10: `DELETE /admin/notifications/{id}` — удалить уведомление целиком:
+   * адресаты, отметки «ознакомлен», картинки тела и незавершённые задачи
+   * рассылки. Уже показанные на кассах окна не отзываются (§7.4).
+   */
+  remove: (id: number) => api.delete<NotificationDeleted>(`/admin/notifications/${id}`),
+
+  /**
+   * Э10: `DELETE /admin/notifications/{id}/images/{name}` — убрать одну картинку:
+   * файл, запись и метку `magaz-image:<имя>` из тела (§4.6).
+   */
+  removeImage: (id: number, name: string) =>
+    api.delete<NotificationImageDeleted>(
+      `/admin/notifications/${id}/images/${encodeURIComponent(name)}`,
+    ),
 
   /**
    * Ссылка на CSV-отчёт (§11.5): файл скачивает браузер, а cookie сессии

@@ -398,6 +398,62 @@ def deactivate_store_device(
     )
 
 
+class DeviceDeletedOut(BaseModel):
+    """Ответ `DELETE .../devices/{id}` (Э10): устройство удалено, список уехал агенту."""
+
+    store_id: int
+    device_id: int
+    devices_version: int
+    message: str
+
+
+@router.delete(
+    "/stores/{store_id}/devices/{device_id}/purge",
+    response_model=DeviceDeletedOut,
+    summary="Удалить устройство из списка (Э10)",
+)
+def purge_store_device(
+    store_id: int,
+    device_id: int,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+) -> DeviceDeletedOut:
+    """Удалить устройство насовсем (Э10, §11.7).
+
+    Отличие от `DELETE /stores/{id}/devices/{id}` («Отключить из опроса»): строка
+    `store_devices` удаляется, а не помечается `is_active=false`. Версия списка
+    поднимается, поэтому диспетчер досылает агенту новый список устройств (§7.6).
+    """
+    store = _get_store_or_404(session, store_id)
+    device = _get_device_or_404(session, store_id, device_id)
+    name = device.name
+    version = device_service.delete_device(session, store, device)
+    audit_service.record(
+        session,
+        action="device_delete",
+        actor=admin.username,
+        entity="store_device",
+        entity_id=device_id,
+        details={"store_id": store.id, "name": name, "devices_version": version},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    logger.info(
+        "Устройство id=%s (%s) магазина id=%s удалено администратором %s",
+        device_id,
+        name,
+        store.id,
+        admin.username,
+    )
+    return DeviceDeletedOut(
+        store_id=store.id,
+        device_id=device_id,
+        devices_version=version,
+        message=f"Устройство «{name}» удалено из списка магазина",
+    )
+
+
 
 # --- «Проверить сейчас» (§11.7, Д-1) ----------------------------------------
 

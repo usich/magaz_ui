@@ -523,3 +523,43 @@ class TestAgentImageEndpoint:
         assert response.status_code == 404
 
 
+
+
+class TestImageDelete:
+    """Э10: удаление картинки тела — файл, запись и метка из разметки (§4.6)."""
+
+    def test_delete_removes_file_and_markup(  # noqa: ANN001
+        self, auth_client: TestClient, settings: Settings
+    ) -> None:
+        created = create_notification(
+            auth_client,
+            body_format="html",
+            body='<p>схема зала</p><img src="magaz-image:shema.png" alt="схема" />',
+            images=[
+                {
+                    "name": "shema.png",
+                    "data_base64": base64.b64encode(PNG_1PX).decode("ascii"),
+                }
+            ],
+        )
+        notification_id = created["notification"]["id"]
+        assert created["notification"]["images"] == ["shema.png"]
+        on_disk = settings.notification_images_dir / str(notification_id) / "shema.png"
+        assert on_disk.is_file(), "перед удалением картинка лежит рядом с БД"
+
+        response = auth_client.delete(
+            f"{NOTIFICATIONS_URL}/{notification_id}/images/shema.png"
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["images"] == []
+        assert "magaz-image:shema.png" not in body["body"], "метка уходит из тела"
+        assert not on_disk.exists(), "файл удалён с диска"
+        assert (
+            auth_client.delete(
+                f"{NOTIFICATIONS_URL}/{notification_id}/images/shema.png"
+            ).status_code
+            == 404
+        )
+

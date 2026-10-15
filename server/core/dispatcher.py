@@ -426,6 +426,8 @@ class CommandDispatcher:
                 await self._send_1c(session, store, command, client, report)
             elif kind == str(CommandKind.SEND_MESSAGE):
                 await self._send_message(session, command, client, report)
+            elif kind == str(CommandKind.DELETE_FILE):
+                await self._send_delete_files(session, store, command, client, report)
             elif kind == str(CommandKind.NOTIFY):
                 await self._send_notify(session, store, command, client, report)
             else:
@@ -482,6 +484,44 @@ class CommandDispatcher:
             report=report,
             level=JobLogLevel.INFO if present else JobLogLevel.WARNING,
         )
+
+    async def _send_delete_files(  # noqa: PLR0913 - параметры цикла
+        self,
+        session: Any,  # noqa: ANN401 - Session
+        store: Store,
+        command: Command,
+        client: AgentClient,
+        report: DispatchReport,
+    ) -> None:
+        """`POST /files/delete`: удалить файлы обновления на кассе (Э10, §11.3).
+
+        Выполняется прямо в HTTP-запросе, как `send_message`: как только касса
+        ответила — задача закрывается результатом. Затем диспетчер перечитывает
+        снимок (`/check-files`), поэтому матрица `/files` показывает факт сразу,
+        без ручного «Проверить» (Q52).
+        """
+        params = command.params or {}
+        file_name = str(params.get("file_name") or self._default_file_name(session))
+        suffix = str(params.get("suffix") or "").strip() or None
+        response = await client.delete_files(file_name, suffix=suffix)
+        self._register_send(session, command, report)
+
+        done = ", ".join(response.removed) if response.removed else "ничего не удалено"
+        missing = f"; не было: {', '.join(response.missing)}" if response.missing else ""
+        self._finish(
+            session,
+            command,
+            CommandStatus.SUCCESS,
+            message=f"Файлы «{file_name}»: удалено {done}{missing}",
+            report=report,
+            level=JobLogLevel.INFO if response.removed else JobLogLevel.WARNING,
+        )
+        try:
+            snapshot = await client.check_files(file_name)
+        except AgentError as exc:
+            logger.info("Снимок после удаления «%s» не получен: %s", file_name, exc)
+            return
+        apply_file_check(session, store, file_name, snapshot)
 
     async def _send_download(
         self,

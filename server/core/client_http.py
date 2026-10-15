@@ -27,6 +27,7 @@ from server.config import Settings
 from shared.schemas import (
     CheckFilesResponse,
     CredentialsPush,
+    DeleteFileResponse,
     DeviceCheckRequest,
     DeviceCheckResult,
     DevicesConfigPush,
@@ -69,6 +70,8 @@ DEVICES_CONFIG_PATH = "/devices/config"
 DEVICES_CHECK_NOW_PATH = "/devices/check-now"
 #: §5.1.2: приём уведомления от сервера (ФН3, Э5)
 NOTIFY_PATH = "/notify"
+#: Э10: удаление файлов обновления в рабочей папке кассы
+DELETE_FILES_PATH = "/files/delete"
 
 #: Тип задачи → путь опроса его состояния (`/check-*`, Приложение B)
 JOB_STATE_PATHS: dict[str, str] = {
@@ -291,6 +294,24 @@ class AgentClient:
     async def send_message(self, text_message: str) -> dict[str, Any]:
         """`POST /send-message` — окно `msg` + завершение `1cv8.exe` (FR-8)."""
         return await self._accepted(SEND_MESSAGE_PATH, {"text_message": text_message})
+
+    async def delete_files(self, file_name: str, *, suffix: str | None = None) -> DeleteFileResponse:
+        """`POST /files/delete` — удалить файлы обновления на кассе (Э10, §11.3).
+
+        Ответ разбирается строго: диспетчер показывает в журнале задачи, что именно
+        удалено, а чего на кассе не было.
+        """
+        payload: dict[str, Any] = {"file_name": file_name}
+        if suffix:
+            payload["suffix"] = suffix
+        body = await self.request_json("POST", DELETE_FILES_PATH, json_body=payload)
+        try:
+            return DeleteFileResponse.model_validate(body)
+        except ValidationError as exc:
+            raise AgentProtocolError(
+                "Агент магазина id="
+                f"{self.target.store_id} вернул неожиданный /files/delete ({exc.error_count()} ошибок)"
+            ) from exc
 
     async def check_job_state(
         self, kind: str, *, extension: bool = False

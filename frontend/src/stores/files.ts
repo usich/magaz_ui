@@ -78,6 +78,39 @@ export const useFilesStore = defineStore('files', () => {
   }
 
   /**
+   * Э10: «Удалить на кассе» — действие `delete_file`: убирает `.cf/.cfe/.xml`
+   * из рабочей папки агента. Снимок после удаления диспетчер обновит сам, поэтому
+   * матрица сразу покажет «файла нет» (§11.3).
+   */
+  async function deleteOnStore(
+    storeId: number,
+    suffix?: string | null,
+  ): Promise<ActionOutcome | null> {
+    return runAction(
+      'delete_file',
+      { file_name: filename.value, ...(suffix ? { suffix } : {}) },
+      { storeIds: [storeId] },
+    )
+  }
+
+  /** Э10: «Убрать из матрицы» — удалить снимок `file_checks`, файлы на кассе целы. */
+  async function dropSnapshot(storeId: number): Promise<boolean> {
+    isRunning.value = true
+    errorMessage.value = ''
+    try {
+      await filesApi.dropSnapshot(storeId, filename.value)
+      await load()
+      return true
+    } catch (error) {
+      errorMessage.value =
+        error instanceof ApiError ? error.message : 'Снимок проверки не удалён'
+      return false
+    } finally {
+      isRunning.value = false
+    }
+  }
+
+  /**
    * Кому адресована операция: явный кластер, «все» или список магазинов.
    * Пустой список трактуется как «все» — так кнопка «проверить» не даёт `422`.
    */
@@ -88,7 +121,7 @@ export const useFilesStore = defineStore('files', () => {
   }
 
   async function runAction(
-    action: 'check_files' | 'download_file',
+    action: 'check_files' | 'download_file' | 'delete_file',
     params: Record<string, unknown>,
     targets: ActionTargets,
   ): Promise<ActionOutcome | null> {
@@ -129,6 +162,8 @@ export const useFilesStore = defineStore('files', () => {
     toggleAll,
     checkFiles,
     sendLink,
+    deleteOnStore,
+    dropSnapshot,
     runAction,
   }
 })

@@ -52,6 +52,8 @@ class TestEnumValues:
             "run_update_db",
             "send_message",
             "notify",
+            #: Э10: удаление файлов обновления на кассе
+            "delete_file",
         }
 
     def test_command_statuses_match_spec(self) -> None:

@@ -16,6 +16,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .enums import CheckType, DeviceStatus, DeviceType, NotificationSeverity, ReceiptStatus
+from .paths import UPDATE_FILE_SUFFIXES
 
 __all__ = [
     "AckRequest",
@@ -149,6 +150,43 @@ class CheckFilesResponse(BaseModel):
     cf_mtime: str | None = None
     cfe_mtime: str | None = None
     xml_mtime: str | None = None
+
+
+class DeleteFileParams(BaseModel):
+    """Удаление файлов обновления на кассе (`POST /files/delete`, Э10, §11.3).
+
+    Удаляется только «свой» файл в рабочей папке агента: имя проверяется
+    (`_validate_file_name`), расширение — из списка `.cf/.cfe/.xml`. Пустой
+    `suffix` означает «удалить все три, если они есть».
+    """
+
+    file_name: str
+    suffix: str | None = None
+
+    @field_validator("file_name")
+    @classmethod
+    def check_file_name(cls, value: str) -> str:
+        return _validate_file_name(value)
+
+    @field_validator("suffix")
+    @classmethod
+    def check_suffix(cls, value: str | None) -> str | None:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return None
+        if not raw.startswith("."):
+            raw = f".{raw}"
+        if raw not in UPDATE_FILE_SUFFIXES:
+            raise ValueError("Расширение файла: .cf, .cfe или .xml")
+        return raw
+
+
+class DeleteFileResponse(BaseModel):
+    """Ответ `/files/delete`: что удалено, чего не было и где лежат файлы (Э10)."""
+
+    removed: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    work_dir: str
 
 
 class JobStateResponse(BaseModel):

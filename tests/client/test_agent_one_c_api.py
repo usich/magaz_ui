@@ -346,3 +346,68 @@ class TestDownloadAndMessageEndpoints:
         )
         assert response.status_code == 422
 
+
+
+class TestDeleteFilesEndpoint:
+    """Э10: `POST /files/delete` — удаление файлов обновления в рабочей папке (§11.3)."""
+
+    def test_deletes_update_files_and_keeps_logs(  # noqa: ANN001
+        self, one_c_client, work_dir: Path
+    ) -> None:
+        for suffix in (".cf", ".cfe", ".xml"):
+            (work_dir / f"update{suffix}").write_bytes(b"data")
+        log_path = work_dir / "log-merge.txt"
+        log_path.write_text("журнал", encoding="utf-8")
+
+        response = one_c_client.post(
+            "/files/delete", json={"file_name": "update"}, headers=HEADERS
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert sorted(body["removed"]) == ["update.cf", "update.cfe", "update.xml"]
+        assert body["missing"] == []
+        assert body["work_dir"] == str(work_dir)
+        assert log_path.is_file(), "логи 1С удаление не трогает"
+        assert not (work_dir / "update.cf").exists()
+
+    def test_suffix_narrows_the_target(  # noqa: ANN001
+        self, one_c_client, work_dir: Path
+    ) -> None:
+        (work_dir / "update.cf").write_bytes(b"data")
+
+        response = one_c_client.post(
+            "/files/delete",
+            json={"file_name": "update", "suffix": ".cfe"},
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["removed"] == []
+        assert body["missing"] == ["update.cfe"]
+        assert (work_dir / "update.cf").is_file(), "чужое расширение не удаляем"
+
+    def test_rejects_traversal_and_unknown_suffix(  # noqa: ANN001
+        self, one_c_client
+    ) -> None:
+        traversal = one_c_client.post(
+            "/files/delete", json={"file_name": "..\\1cv8"}, headers=HEADERS
+        )
+        bad_suffix = one_c_client.post(
+            "/files/delete",
+            json={"file_name": "update", "suffix": ".exe"},
+            headers=HEADERS,
+        )
+
+        assert traversal.status_code == 422, "I-2: имя файла без разделителей пути"
+        assert bad_suffix.status_code == 422, "удаляем только .cf/.cfe/.xml"
+
+    def test_requires_agent_token(self, one_c_client, work_dir: Path) -> None:  # noqa: ANN001
+        (work_dir / "update.cf").write_bytes(b"data")
+
+        response = one_c_client.post("/files/delete", json={"file_name": "update"})
+
+        assert response.status_code == 401
+        assert (work_dir / "update.cf").is_file(), "без токена ничего не удаляется"
+

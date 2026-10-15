@@ -521,3 +521,48 @@ class TestCheckNowEndpoint:
     def test_unknown_store_is_404(self, auth_client: TestClient) -> None:
         assert auth_client.post(f"{STORES_URL}/999/devices/check").status_code == 404
 
+
+
+class TestDevicePurge:
+    """Э10: «Удалить» убирает строку `store_devices` насовсем (§11.7)."""
+
+    def test_purge_deletes_row_and_bumps_version(  # noqa: ANN001
+        self, auth_client: TestClient, session: Session, engine: Engine, store: Store
+    ) -> None:
+        device = add_device(auth_client, store.id)
+        session.expire_all()
+        before = int(store.devices_version)
+
+        response = auth_client.delete(f"{STORES_URL}/{store.id}/devices/{device['id']}/purge")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["device_id"] == device["id"]
+        assert body["devices_version"] == before + 1, "касса получит новый список (§7.6)"
+        session.expire_all()
+        assert int(store.devices_version) == before + 1
+        remaining = auth_client.get(
+            f"{STORES_URL}/{store.id}/devices?include_inactive=true"
+        ).json()
+        assert [item["id"] for item in remaining] == [], "строка удалена, а не отключена"
+        assert (
+            auth_client.delete(
+                f"{STORES_URL}/{store.id}/devices/{device['id']}/purge"
+            ).status_code
+            == 404
+        )
+        assert "device_delete" in audit_actions(engine)
+
+    def test_deactivate_still_keeps_the_row(  # noqa: ANN001
+        self, auth_client: TestClient, store: Store
+    ) -> None:
+        """Мягкое удаление Э4Б не изменилось: «Отключить» оставляет строку (§11.7)."""
+        device = add_device(auth_client, store.id)
+
+        response = auth_client.delete(f"{STORES_URL}/{store.id}/devices/{device['id']}")
+
+        assert response.status_code == 200
+        assert response.json()["is_active"] is False
+        listed = auth_client.get(f"{STORES_URL}/{store.id}/devices?include_inactive=true").json()
+        assert [item["id"] for item in listed] == [device["id"]]
+

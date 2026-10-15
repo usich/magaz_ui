@@ -46,6 +46,7 @@ __all__ = [
     "count_devices",
     "create_device",
     "deactivate_device",
+    "delete_device",
     "devices_window_sec",
     "get_device",
     "list_devices",
@@ -372,6 +373,25 @@ def deactivate_device(session: Session, store: Store, device: StoreDevice) -> St
         logger.info("Магазин id=%s: устройство id=%s отключено из опроса", store.id, device.id)
     return device
 
+
+
+def delete_device(session: Session, store: Store, device: StoreDevice) -> int:
+    """Удалить устройство из списка магазина насовсем (Э10, §11.7).
+
+    Это «удалить», а не «отключить из опроса» (`deactivate_device`): строка
+    `store_devices` исчезает вместе с историей опроса. Список устройств меняется —
+    значит поднимаем `stores.devices_version`, и диспетчер досылает агенту новый
+    `POST /devices/config`: без этого касса продолжала бы опрашивать удалённое
+    устройство (§7.6, Д-2).
+    """
+    device_id = int(device.id)
+    session.delete(device)
+    session.flush()
+    version = bump_devices_version(session, store)
+    logger.info(
+        "Магазин id=%s: устройство id=%s удалено; версия списка %s", store.id, device_id, version
+    )
+    return version
 
 
 # --- Push списка и приём результатов (§5.1.2, §5.2.2) -----------------------

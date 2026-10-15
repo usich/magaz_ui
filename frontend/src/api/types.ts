@@ -383,6 +383,8 @@ export type ActionName =
   | 'run_update_db'
   | 'send_message'
   | 'notify'
+  /** Э10: удалить файлы обновления на кассе (`file_name`, необязательный `suffix`). */
+  | 'delete_file'
 
 export interface ActionPayload {
   action: ActionName
@@ -582,6 +584,39 @@ export interface CancelNotificationResponse {
   notification_id: number
   state: NotificationState
   canceled_jobs: number
+  message: string
+}
+
+/** Ответ `DELETE /admin/notifications/{id}` (Э10): что ушло вместе с уведомлением. */
+export interface NotificationDeleted {
+  notification_id: number
+  canceled_jobs: number
+  images_removed: number
+  message: string
+}
+
+/** Ответ `DELETE /admin/notifications/{id}/images/{name}` (Э10): тело уже без метки. */
+export interface NotificationImageDeleted {
+  notification_id: number
+  name: string
+  body: string
+  images: string[]
+}
+
+/** Ответ `DELETE /admin/stores/{id}/devices/{device_id}/purge` (Э10, §11.7). */
+export interface DeviceDeleted {
+  store_id: number
+  device_id: number
+  devices_version: number
+  message: string
+}
+
+/** Ответ `DELETE /admin/files/{store_id}` (Э10): снимки проверки убраны из матрицы. */
+export interface FileSnapshotDeleted {
+  store_id: number
+  store_name: string
+  filename: string | null
+  removed: number
   message: string
 }
 

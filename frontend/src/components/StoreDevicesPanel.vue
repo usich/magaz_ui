@@ -18,6 +18,7 @@ import { useToast } from 'primevue/usetoast'
 import { ApiError } from '@/api/client'
 import { devicesApi } from '@/api/endpoints'
 import type { DeviceCheckResponse, DeviceItem } from '@/api/types'
+import ConfirmDeleteDialog from '@/components/ConfirmDeleteDialog.vue'
 import DeviceFormDialog from '@/components/DeviceFormDialog.vue'
 import {
   checkTypeLabel,
@@ -79,6 +80,35 @@ function openEdit(device: DeviceItem): void {
 async function onSaved(): Promise<void> {
   await load()
   toast.add({ severity: 'success', summary: 'Устройство сохранено', life: 4000 })
+}
+
+/** Э10: «Удалить» — строка исчезает насовсем, поэтому сначала подтверждение. */
+const pendingDelete = ref<DeviceItem | null>(null)
+const isDeleting = ref(false)
+
+function askDelete(device: DeviceItem): void {
+  pendingDelete.value = device
+}
+
+async function confirmDelete(): Promise<void> {
+  const device = pendingDelete.value
+  if (!device) return
+  isDeleting.value = true
+  try {
+    await devicesApi.purge(props.storeId, device.id)
+    pendingDelete.value = null
+    await load()
+    toast.add({
+      severity: 'success',
+      summary: 'Устройство удалено из списка',
+      detail: `${device.name} (${device.ip_address})`,
+      life: 5000,
+    })
+  } catch (error) {
+    notifyError(error, 'Не удалось удалить устройство')
+  } finally {
+    isDeleting.value = false
+  }
 }
 
 function notifyError(error: unknown, fallback: string): void {
@@ -244,6 +274,14 @@ function formatTime(value: string | null): string {
                   @click="deactivate(device)"
                 />
                 <Button v-else label="Вернуть" size="small" text @click="restore(device)" />
+                <Button
+                  label="Удалить"
+                  size="small"
+                  text
+                  severity="danger"
+                  :data-test="`equipment-delete-${device.id}`"
+                  @click="askDelete(device)"
+                />
               </div>
             </td>
           </tr>
@@ -262,6 +300,20 @@ function formatTime(value: string | null): string {
       :store-id="storeId"
       :device="editing"
       @saved="onSaved"
+    />
+
+    <ConfirmDeleteDialog
+      :visible="pendingDelete !== null"
+      header="Удалить устройство из списка?"
+      :message="`Устройство «${pendingDelete?.name ?? ''}» (${pendingDelete?.ip_address ?? ''}) исчезнет из списка магазина, вернуть его будет нельзя.`"
+      :details="[
+        'История статусов и задержек по этому адресу будет потеряна',
+        'Касса получит новый список устройств и перестанет его опрашивать',
+        'Если нужна только пауза — используйте «Отключить»: строка и история останутся',
+      ]"
+      :loading="isDeleting"
+      @update:visible="(value: boolean) => { if (!value) pendingDelete = null }"
+      @confirm="confirmDelete"
     />
   </section>
 </template>

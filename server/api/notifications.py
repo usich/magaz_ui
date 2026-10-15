@@ -716,3 +716,128 @@ def get_notification_image(
         media_type=image.content_type,
         headers={"Cache-Control": "private, max-age=3600"},
     )
+
+
+# --- Удаление (Э10) ---------------------------------------------------------
+
+
+class NotificationDeleteOut(BaseModel):
+    """Ответ `DELETE /notifications/{id}`: что удалено вместе с уведомлением (§5.2.2)."""
+
+    notification_id: int
+    canceled_jobs: int = 0
+    images_removed: int = 0
+    message: str
+
+
+class NotificationImageDeleteOut(BaseModel):
+    """Ответ `DELETE /notifications/{id}/images/{name}`: тело уже без метки (§11.5)."""
+
+    notification_id: int
+    name: str
+    body: str
+    images: list[str] = Field(default_factory=list)
+
+
+@router.delete(
+    "/notifications/{notification_id}",
+    response_model=NotificationDeleteOut,
+    summary="Удалить уведомление",
+)
+def delete_notification_endpoint(
+    notification_id: int,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    context: Annotated[AppContext, Depends(get_context)],
+    session: Annotated[Session, Depends(get_db)],
+) -> NotificationDeleteOut:
+    """Удалить уведомление вместе с адресатами, отметками и картинками (§11.5, Э10).
+
+    Незавершённые задачи рассылки закрываются: офлайн-касса не получит уведомление
+    после удаления. Уже показанные окна отозвать нельзя — так же, как при отмене
+    (§7.4). В журнале аудита остаётся запись `notification_delete`.
+    """
+    notification = _get(session, notification_id)
+    summary = notification_service.delete_notification(
+        session, notification, base_dir=context.settings.notification_images_dir
+    )
+    audit_service.record(
+        session,
+        action="notification_delete",
+        actor=admin.username,
+        entity="notification",
+        entity_id=notification_id,
+        details={
+            "title": notification.title,
+            "canceled_jobs": summary["canceled_jobs"],
+            "images_removed": summary["images_removed"],
+        },
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    logger.info(
+        "Уведомление id=%s удалено администратором %s", notification_id, admin.username
+    )
+    return NotificationDeleteOut(
+        notification_id=notification_id,
+        canceled_jobs=summary["canceled_jobs"],
+        images_removed=summary["images_removed"],
+        message=(
+            "Уведомление удалено"
+            + (
+                f"; незавершённых задач закрыто: {summary['canceled_jobs']}"
+                if summary["canceled_jobs"]
+                else ""
+            )
+            + (
+                f"; картинок удалено: {summary['images_removed']}"
+                if summary["images_removed"]
+                else ""
+            )
+        ),
+    )
+
+
+@router.delete(
+    "/notifications/{notification_id}/images/{name}",
+    response_model=NotificationImageDeleteOut,
+    summary="Удалить картинку тела уведомления",
+)
+def delete_notification_image(
+    notification_id: int,
+    name: str,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    context: Annotated[AppContext, Depends(get_context)],
+    session: Annotated[Session, Depends(get_db)],
+) -> NotificationImageDeleteOut:
+    """Удалить одну картинку тела: файл, запись и метку `magaz-image:<имя>` (§4.6, Э10).
+
+    Тело уведомления остаётся согласованным: метка удалённой картинки уходит из
+    разметки, поэтому ни предпросмотр, ни касса больше её не ждут (§7.4).
+    """
+    notification = _get(session, notification_id)
+    try:
+        body = notification_service.delete_image(
+            session, notification, name=name, base_dir=context.settings.notification_images_dir
+        )
+    except notification_service.NotificationNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    audit_service.record(
+        session,
+        action="notification_image_delete",
+        actor=admin.username,
+        entity="notification",
+        entity_id=notification.id,
+        details={"name": name},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    return NotificationImageDeleteOut(
+        notification_id=notification.id,
+        name=name,
+        body=body,
+        images=[str(image.name) for image in notification.images],
+    )
+

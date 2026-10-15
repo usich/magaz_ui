@@ -10,19 +10,21 @@
  * CSV-выгрузка берётся ссылкой на сервер: файл скачивает браузер вместе с cookie
  * сессии, поэтому «экспорт» не зависит от того, как отрисован отчёт.
  */
-import { computed, onMounted } from 'vue'
-import { RouterLink } from 'vue-router'
+import { computed, onMounted, ref } from 'vue'
+import { RouterLink, useRouter } from 'vue-router'
 import Button from 'primevue/button'
 import Message from 'primevue/message'
 import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
 import type { NotificationReceiptRow, NotificationStoreReport } from '@/api/types'
+import ConfirmDeleteDialog from '@/components/ConfirmDeleteDialog.vue'
 import NotificationBody from '@/components/NotificationBody.vue'
 import {
   RECEIPT_LABELS,
   SEVERITY_LABELS,
   STATE_LABELS,
+  notificationImageUrl,
   receiptLabel,
   receiptTone,
   targetTypeLabel,
@@ -33,6 +35,7 @@ const props = defineProps<{ id: string }>()
 
 const notifications = useNotificationsStore()
 const toast = useToast()
+const router = useRouter()
 
 const notificationId = computed(() => Number(props.id))
 const report = computed(() => notifications.report)
@@ -58,6 +61,61 @@ async function cancel(): Promise<void> {
 /** Строка отчёта по сессии: отложенное видно отдельной строкой (§11.5, П-2). */
 function sessionRows(store: NotificationStoreReport): NotificationReceiptRow[] {
   return store.receipts
+}
+
+/** Э10: «Удалить уведомление» — после удаления отчёт показывать нечего. */
+const pendingDelete = ref(false)
+const isDeleting = ref(false)
+
+async function confirmDelete(): Promise<void> {
+  if (!item.value) return
+  isDeleting.value = true
+  try {
+    if (!(await notifications.remove(item.value.id))) {
+      toast.add({
+        severity: 'error',
+        summary: 'Уведомление не удалено',
+        detail: notifications.errorMessage,
+        life: 6000,
+      })
+      return
+    }
+    pendingDelete.value = false
+    toast.add({
+      severity: 'success',
+      summary: 'Уведомление удалено',
+      detail: 'Отчёт и картинки удалены вместе с ним',
+      life: 5000,
+    })
+    await router.push({ name: 'notifications' })
+  } finally {
+    isDeleting.value = false
+  }
+}
+
+/** Э10: удаление одной картинки — метка уходит из тела, файл — с сервера (§4.6). */
+const pendingImage = ref<string | null>(null)
+const isImageBusy = ref(false)
+
+async function confirmImageDelete(): Promise<void> {
+  const name = pendingImage.value
+  if (!name || !item.value) return
+  isImageBusy.value = true
+  try {
+    if (!(await notifications.removeImage(item.value.id, name))) {
+      toast.add({
+        severity: 'error',
+        summary: 'Картинка не удалена',
+        detail: notifications.errorMessage,
+        life: 6000,
+      })
+      return
+    }
+    pendingImage.value = null
+    toast.add({ severity: 'success', summary: 'Картинка удалена', detail: name, life: 4000 })
+  } finally {
+    isImageBusy.value = false
+  }
 }
 
 function formatTime(value: string | null): string {
@@ -114,8 +172,54 @@ function formatTime(value: string | null): string {
           data-test="notification-detail-cancel"
           @click="cancel"
         />
+        <Button
+          v-if="item"
+          label="Удалить уведомление"
+          icon="pi pi-trash"
+          size="small"
+          severity="danger"
+          text
+          data-test="notification-detail-delete"
+          @click="pendingDelete = true"
+        />
       </div>
     </header>
+
+    <!-- Э10: картинки тела — реальные файлы на сервере, их видно и можно убрать (§4.6) -->
+    <section
+      v-if="item?.images.length"
+      class="rounded-xl border border-slate-200 bg-white p-4"
+      data-test="notification-detail-images"
+    >
+      <h3 class="text-sm font-semibold">Картинки тела ({{ item.images.length }})</h3>
+      <p class="magaz-muted text-xs">
+        Касса скачивает их в свой кэш при доставке: удаление действует на сервере и на то, что ещё
+        не отправлено (§7.4).
+      </p>
+      <ul class="mt-3 flex flex-wrap gap-3">
+        <li
+          v-for="name in item.images"
+          :key="name"
+          class="w-40 rounded-lg border border-slate-200 p-2"
+          :data-test="`notification-detail-image-${name}`"
+        >
+          <img
+            :src="notificationImageUrl(item.id, name)"
+            :alt="name"
+            class="h-24 w-full object-contain"
+          />
+          <div class="magaz-mono mt-1 truncate text-[11px]" :title="name">{{ name }}</div>
+          <Button
+            label="Удалить"
+            size="small"
+            text
+            severity="danger"
+            :data-test="`notification-detail-image-delete-${name}`"
+            @click="pendingImage = name"
+          />
+        </li>
+      </ul>
+    </section>
 
     <Message
       v-if="notifications.errorMessage"
@@ -234,5 +338,32 @@ function formatTime(value: string | null): string {
       Статусы сессий: {{ Object.values(RECEIPT_LABELS).join(' · ') }}. «Отложено» не считается
       ознакомлением: окно вернётся к пользователю через {{ report?.snooze_min ?? 15 }} мин (§4.9, П-2).
     </p>
+    <ConfirmDeleteDialog
+      :visible="pendingDelete"
+      header="Удалить уведомление?"
+      :message="`«${item?.title ?? ''}» исчезнет вместе с отчётом «кто ознакомился».`"
+      :details="[
+        'Отметки «ознакомлен», «отложено» и адресаты магазинов будут удалены',
+        'Картинки тела удаляются с сервера вместе с файлами',
+        'Незавершённые задачи рассылки закроются: офлайн-кассы его не получат',
+        'Окна, уже показанные сотрудникам, отозвать нельзя — как и при отмене (§7.4)',
+      ]"
+      :loading="isDeleting"
+      @update:visible="(value: boolean) => (pendingDelete = value)"
+      @confirm="confirmDelete"
+    />
+
+    <ConfirmDeleteDialog
+      :visible="pendingImage !== null"
+      header="Удалить картинку из уведомления?"
+      :message="`Картинка «${pendingImage ?? ''}» будет удалена с сервера, а её метка — из тела уведомления.`"
+      :details="[
+        'Кассы, уже получившие уведомление, сохранят картинку в своём кэше (§7.4)',
+        'Повторно приложить её можно только созданием или правкой уведомления',
+      ]"
+      :loading="isImageBusy"
+      @update:visible="(value: boolean) => { if (!value) pendingImage = null }"
+      @confirm="confirmImageDelete"
+    />
   </div>
 </template>

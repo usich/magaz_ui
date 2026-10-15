@@ -16,6 +16,8 @@ import Message from 'primevue/message'
 import { useToast } from 'primevue/usetoast'
 
 import type { ActionOutcome } from '@/api/actions'
+import type { FileMatrixRow } from '@/api/types'
+import ConfirmDeleteDialog from '@/components/ConfirmDeleteDialog.vue'
 import { useFilesStore } from '@/stores/files'
 
 const files = useFilesStore()
@@ -87,6 +89,48 @@ function mark(exists: boolean): string {
 
 function cellClass(exists: boolean): string {
   return exists ? 'text-emerald-600' : 'text-rose-600'
+}
+
+/** Э10: «Удалить на кассе» — подтверждение, потому что файл уходит с диска кассы. */
+const pendingDelete = ref<FileMatrixRow | null>(null)
+const isDeleting = ref(false)
+
+function askDeleteOnStore(row: FileMatrixRow): void {
+  pendingDelete.value = row
+}
+
+async function confirmDeleteOnStore(): Promise<void> {
+  const row = pendingDelete.value
+  if (!row) return
+  isDeleting.value = true
+  try {
+    const outcome = await files.deleteOnStore(row.store_id)
+    if (outcome) {
+      pendingDelete.value = null
+    }
+    notifyOutcome(outcome, 'Удаление файлов на кассе поставлено в очередь')
+  } finally {
+    isDeleting.value = false
+  }
+}
+
+/** Э10: «Убрать из матрицы» — удаляется снимок проверки, файлы на кассе целы. */
+async function dropSnapshot(row: FileMatrixRow): Promise<void> {
+  if (await files.dropSnapshot(row.store_id)) {
+    toast.add({
+      severity: 'success',
+      summary: 'Снимок убран из матрицы',
+      detail: `${row.store_name}: строка снова «не проверялся», пока касса не пришлёт новый снимок`,
+      life: 5000,
+    })
+    return
+  }
+  toast.add({
+    severity: 'error',
+    summary: 'Снимок не удалён',
+    detail: files.errorMessage,
+    life: 6000,
+  })
 }
 
 /** Магазин без файла — красная строка (§11.3). */
@@ -200,6 +244,7 @@ function rowClass(hasFile: boolean): string {
             <th>cfe</th>
             <th>xml</th>
             <th>Проверено</th>
+            <th class="w-56">Действия</th>
           </tr>
         </thead>
         <tbody>
@@ -250,9 +295,30 @@ function rowClass(hasFile: boolean): string {
             <td class="magaz-muted whitespace-nowrap" data-test="file-checked-at">
               {{ row.checked ? formatDate(row.checked_at) : 'не проверялся' }}
             </td>
+            <td>
+              <div class="flex flex-wrap gap-1">
+                <Button
+                  label="Удалить на кассе"
+                  size="small"
+                  text
+                  severity="danger"
+                  :disabled="!row.is_active"
+                  :data-test="`file-delete-store-${row.store_id}`"
+                  @click="askDeleteOnStore(row)"
+                />
+                <Button
+                  label="Убрать из матрицы"
+                  size="small"
+                  text
+                  :disabled="!row.checked"
+                  :data-test="`file-drop-snapshot-${row.store_id}`"
+                  @click="dropSnapshot(row)"
+                />
+              </div>
+            </td>
           </tr>
           <tr v-if="!files.rows.length && !files.isLoading">
-            <td colspan="8" class="magaz-muted py-6 text-center" data-test="files-empty">
+            <td colspan="9" class="magaz-muted py-6 text-center" data-test="files-empty">
               Магазинов нет: добавьте их на странице «Магазины».
             </td>
           </tr>
@@ -295,6 +361,20 @@ function rowClass(hasFile: boolean): string {
         />
       </template>
     </Dialog>
+
+    <ConfirmDeleteDialog
+      :visible="pendingDelete !== null"
+      header="Удалить файлы обновления на кассе?"
+      :message="`С кассы магазина «${pendingDelete?.store_name ?? ''}» будут удалены файлы «${files.filename}» (.cf/.cfe/.xml).`"
+      :details="[
+        'Удаляются только файлы обновления в рабочей папке агента: логи 1С и файлы базы не трогаются',
+        'После удаления снимок проверки обновляется сам: матрица сразу покажет «файла нет»',
+        'Файл придётся скачать заново («Разослать ссылку»), если он ещё нужен',
+      ]"
+      :loading="isDeleting"
+      @update:visible="(value: boolean) => { if (!value) pendingDelete = null }"
+      @confirm="confirmDeleteOnStore"
+    />
   </div>
 </template>
 

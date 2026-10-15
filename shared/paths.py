@@ -10,11 +10,15 @@ import re
 from pathlib import PurePosixPath, PureWindowsPath
 
 __all__ = [
+    "UPDATE_FILE_SUFFIXES",
     "is_safe_archive_member",
     "safe_basename",
     "validate_file_name",
     "validate_ipv4_address",
 ]
+
+#: Расширения файлов обновления (§4.5, Э10): только их можно удалять на кассе
+UPDATE_FILE_SUFFIXES: tuple[str, ...] = (".cf", ".cfe", ".xml")
 
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 

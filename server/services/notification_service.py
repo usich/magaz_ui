@@ -33,7 +33,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from server.db.models import (
@@ -80,6 +80,8 @@ __all__ = [
     "apply_receipts",
     "cancel_notification",
     "create_notification",
+    "delete_image",
+    "delete_notification",
     "detect_image_content_type",
     "get_notification",
     "image_directory",
@@ -1180,3 +1182,112 @@ def report_csv(data: Mapping[str, object]) -> str:
                 ]
             )
     return "\ufeff" + buffer.getvalue()
+
+
+# --- Удаление (Э10) ---------------------------------------------------------
+
+
+def delete_image(
+    session: Session,
+    notification: Notification,
+    *,
+    name: str,
+    base_dir: Path,
+) -> str:
+    """Удалить картинку тела: файл, запись и метку `magaz-image:<имя>` (§11.5, Э10).
+
+    Возвращает новое тело уведомления. Кассы, которые уведомление уже получили,
+    картинку сохранят в своём локальном кэше: удаление действует на сервере и на
+    то, что ещё не доставлено (§7.4) — окно уведомления рисует картинку без сети.
+    """
+    image = next((item for item in _images_of(session, notification) if item.name == name), None)
+    if image is None:
+        raise NotificationNotFoundError(
+            f"Картинка {name!r} у уведомления id={notification.id} не найдена"
+        )
+    path = image_file_path(base_dir, notification.id, name)
+    if path.is_file():
+        try:
+            path.unlink()
+        except OSError:  # pragma: no cover - файл занят или каталог только для чтения
+            logger.warning(
+                "Файл картинки %s уведомления id=%s удалить не удалось", name, notification.id
+            )
+    if image in notification.images:
+        notification.images.remove(image)
+    session.delete(image)
+    session.flush()
+
+    remaining = [item.name for item in _images_of(session, notification)]
+    if notification.body_format == richtext.BODY_FORMAT_HTML:
+        notification.body = richtext.sanitize_html(
+            notification.body, allowed_images=set(remaining)
+        )
+        session.flush()
+    logger.info("Картинка %s удалена у уведомления id=%s", name, notification.id)
+    return notification.body
+
+
+def delete_notification(
+    session: Session, notification: Notification, *, base_dir: Path
+) -> dict[str, int]:
+    """Удалить уведомление целиком: задачи, картинки, отметки, адресаты (§11.5, Э10).
+
+    Порядов удаления: сначала закрываются незавершённые задачи рассылки (чтобы
+    офлайн-касса не получила уведомление после удаления), затем снимаются файлы
+    картинок, отметки «ознакомлен», адресаты и само уведомление.
+
+    Уже показанные на кассах окна не отзываются — это то же ограничение, что и у
+    отмены (§7.4): сервер не управляет тем, что уже нарисовано в сессии Windows.
+    """
+    canceled = 0
+    for command in _notify_commands(
+        session, notification.id, statuses=command_service.ACTIVE_STATUSES
+    ):
+        command_service.set_status(session, command, CommandStatus.CANCELED)
+        command_service.add_log(session, command, "Уведомление удалено администратором")
+        canceled += 1
+
+    names = [str(image.name) for image in _images_of(session, notification)]
+    for name in names:
+        path = image_file_path(base_dir, notification.id, name)
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+        except OSError:  # pragma: no cover - файл занят
+            logger.warning(
+                "Файл картинки %s уведомления id=%s удалить не удалось", name, notification.id
+            )
+    directory = image_directory(base_dir, notification.id)
+    if directory.is_dir():
+        try:
+            directory.rmdir()
+        except OSError:
+            logger.warning(
+                "Каталог картинок уведомления id=%s остался (в нём есть чужие файлы)",
+                notification.id,
+            )
+
+    targets = select(NotificationTarget.id).where(
+        NotificationTarget.notification_id == notification.id
+    )
+    session.execute(
+        delete(NotificationReceipt).where(NotificationReceipt.target_id.in_(targets))
+    )
+    session.execute(
+        delete(NotificationTarget).where(NotificationTarget.notification_id == notification.id)
+    )
+    session.execute(
+        delete(NotificationImage).where(NotificationImage.notification_id == notification.id)
+    )
+    session.delete(notification)
+    session.flush()
+    logger.info(
+        "Уведомление id=%s удалено; задач закрыто: %s, картинок: %s",
+        notification.id,
+        canceled,
+        len(names),
+    )
+    return {"canceled_jobs": canceled, "images_removed": len(names)}
+
