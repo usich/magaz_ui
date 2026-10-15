@@ -441,3 +441,85 @@ class TestImagesOnCreate:
         assert row["body_format"] == "html"
         assert row["delete_after_read"] is True
 
+
+AGENT_IMAGES_URL = "/api/v1/agent/notifications"
+
+
+class TestAgentImageEndpoint:
+    """Касса скачивает картинку сама: токен агента и только своя адресация (§7.4, Э9).
+
+    Окно уведомления на кассе показывает картинки из локального кэша, а скачивает их
+    агент этим запросом — один раз, пока сеть есть (§7.4).
+    """
+
+    def test_agent_downloads_image(self, auth_client: TestClient, agent_headers: dict) -> None:
+        created = create_notification(
+            auth_client,
+            body_format="html",
+            body='<img src="magaz-image:shema.png">',
+            images=[
+                {"name": "shema.png", "data_base64": base64.b64encode(PNG_1PX).decode("ascii")}
+            ],
+        )
+        notification_id = created["notification"]["id"]
+
+        response = auth_client.get(
+            f"{AGENT_IMAGES_URL}/{notification_id}/images/shema.png", headers=agent_headers
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.content == PNG_1PX
+        assert response.headers["content-type"] == "image/png"
+
+    def test_without_agent_token_is_401(self, client: TestClient, auth_client: TestClient) -> None:
+        created = create_notification(auth_client)
+
+        response = client.get(f"{AGENT_IMAGES_URL}/{created['notification']['id']}/images/nope.png")
+
+        assert response.status_code == 401
+
+    def test_foreign_store_is_404(
+        self, auth_client: TestClient, agent_headers: dict, session: Session
+    ) -> None:
+        """Картинка уведомления, адресованного другому магазину, не отдаётся."""
+        other = Store(
+            name="Магазин №9",
+            ip_address="10.20.30.41",
+            cluster_name="srv-1c",
+            database_name="trade",
+            version_1c="8.3.24.1548",
+            user_name_1c="Администратор",
+            agent_token="other-store-token",
+        )
+        session.add(other)
+        session.commit()
+        created = create_notification(
+            auth_client,
+            target_type="stores",
+            store_ids=[other.id],
+            body_format="html",
+            body='<img src="magaz-image:chuzhaya.png">',
+            images=[
+                {"name": "chuzhaya.png", "data_base64": base64.b64encode(PNG_1PX).decode("ascii")}
+            ],
+        )
+
+        response = auth_client.get(
+            f"{AGENT_IMAGES_URL}/{created['notification']['id']}/images/chuzhaya.png",
+            headers=agent_headers,
+        )
+
+        assert response.status_code == 404
+        assert "не отправлялось" in response.text
+
+    def test_unknown_image_is_404(self, auth_client: TestClient, agent_headers: dict) -> None:
+        created = create_notification(auth_client)
+
+        response = auth_client.get(
+            f"{AGENT_IMAGES_URL}/{created['notification']['id']}/images/nope.png",
+            headers=agent_headers,
+        )
+
+        assert response.status_code == 404
+
+

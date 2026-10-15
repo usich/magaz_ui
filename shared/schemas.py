@@ -232,6 +232,9 @@ class NotificationPendingItem(BaseModel):
     #: Э9: формат тела и картинки — окно кассы рисует разметку само (§7.4)
     body_format: str = "plain"
     images: list[str] = Field(default_factory=list)
+    #: Э9: `true` — после «Ознакомлен» уведомление убирается с кассы, `false` — остаётся
+    #: справочником; решение принимает касса, сервер только передаёт признак (§7.4)
+    delete_after_read: bool = False
     severity: NotificationSeverity
     requires_ack: bool
     repeat_every_min: int | None = None

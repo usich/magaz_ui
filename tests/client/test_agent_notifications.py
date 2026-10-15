@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -375,5 +377,207 @@ class TestReceiptsAndMsgChannel:
 
         assert monitor.interval_sec == 7.0, "период сверки — настройка кассы (§7.2)"
 
+#: Настоящий PNG 1×1: касса получает файл целиком, а не «похожие байты» (§7.4, Э9)
+PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
 
+class TestNotificationImagesAndArchive:
+    """Э9: картинки в локальном кэше и «справочник» прочитанного (§4.6, §7.4)."""
+
+    def test_pending_carries_markup_and_images(self, tmp_path: Path) -> None:
+        """Очередь хранит разметку, имена картинок и признак «удалять после прочтения»."""
+        queue = build_queue(tmp_path)
+        queue.accept(
+            notify_request(
+                body_format="html",
+                body='<p>Схема зала</p><img src="magaz-image:shema.png">',
+                images=["shema.png", "../secrets.key"],
+                delete_after_read=True,
+            )
+        )
+
+        item = queue.pending_for(SESSION)[0]
+
+        assert item.body_format == "html"
+        assert item.images == ["shema.png"], "небезопасное имя в кэш не попадает"
+        assert item.delete_after_read is True
+
+    def test_archive_keeps_only_read_and_kept(self, tmp_path: Path) -> None:
+        """В «справочнике» — прочитанное и не помеченное «удалять после прочтения»."""
+        queue = build_queue(tmp_path)
+        queue.accept(notify_request(id=5, title="Как закрыть смену"))
+        queue.accept(notify_request(id=6, title="Разовая рассылка", delete_after_read=True))
+        queue.acknowledge(5, SESSION)
+        queue.acknowledge(6, SESSION)
+
+        archive = queue.archive_for(SESSION)
+
+        assert [item.id for item in archive] == [5]
+        assert archive[0].title == "Как закрыть смену"
+        assert archive[0].delete_after_read is False
+
+    def test_archive_is_empty_until_acknowledged(self, tmp_path: Path) -> None:
+        queue = build_queue(tmp_path)
+        queue.accept(notify_request())
+
+        assert queue.archive_for(SESSION) == []
+
+    def test_image_cache_stores_and_reads(self, tmp_path: Path) -> None:
+        cache = notifications.NotificationImageCache(tmp_path / "images")
+
+        assert cache.has(5, "shema.png") is False
+        path = cache.store(5, "shema.png", PNG_1PX)
+
+        assert path is not None
+        assert path.parent.name == "5"
+        assert cache.has(5, "shema.png") is True
+        assert cache.read(5, "shema.png") == PNG_1PX
+        assert cache.read(5, "net.png") is None
+
+    def test_image_cache_rejects_unsafe_name(self, tmp_path: Path) -> None:
+        """Имя из тела проверяется и на кассе: файлы не читаются вне каталога кэша."""
+        cache = notifications.NotificationImageCache(tmp_path / "images")
+
+        assert cache.path(5, "../secrets.key") is None
+        assert cache.store(5, "../secrets.key", PNG_1PX) is None
+        assert cache.read(5, "../secrets.key") is None
+
+    def test_media_type_by_extension(self) -> None:
+        assert notifications.image_media_type("a.png") == "image/png"
+        assert notifications.image_media_type("foto.JPEG") == "image/jpeg"
+        assert notifications.image_media_type("a.bin") == "application/octet-stream"
+
+
+
+
+
+
+    def test_downloader_fetches_missing_and_skips_cached(self, tmp_path: Path) -> None:
+        """Скачиваем только то, чего нет в кэше: без сети картинка уже на месте."""
+        requested: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(request.url.path)
+            return httpx.Response(200, content=PNG_1PX)
+
+        cache = notifications.NotificationImageCache(tmp_path / "images")
+        cache.store(5, "est.png", PNG_1PX)
+        downloader = notifications.ImageDownloader(
+            make_config(work_dir=str(tmp_path)),
+            cache=cache,
+            transport=httpx.MockTransport(handler),
+        )
+
+        stored = asyncio.run(downloader.fetch(5, ["est.png", "net.png"]))
+
+        assert stored == 1
+        assert requested == ["/api/v1/agent/notifications/5/images/net.png"]
+        assert cache.read(5, "net.png") == PNG_1PX
+
+    def test_downloader_tolerates_refusal_and_offline(self, tmp_path: Path) -> None:
+        """Отказ сервера и обрыв сети — не ошибка доставки: уведомление уже в очереди."""
+        cache = notifications.NotificationImageCache(tmp_path / "images")
+
+        def refuse(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"detail": "нет картинки"})
+
+        refused = notifications.ImageDownloader(
+            make_config(work_dir=str(tmp_path)),
+            cache=cache,
+            transport=httpx.MockTransport(refuse),
+        )
+        assert asyncio.run(refused.fetch(5, ["net.png"])) == 0
+
+        def broken(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("сеть недоступна", request=request)
+
+        offline = notifications.ImageDownloader(
+            make_config(work_dir=str(tmp_path)),
+            cache=cache,
+            transport=httpx.MockTransport(broken),
+        )
+        assert asyncio.run(offline.fetch(5, ["net.png"])) == 0
+        assert cache.has(5, "net.png") is False
+
+
+class TestImagesAndArchiveApi:
+    """Локальные точки для окна кассы: картинка из кэша и «справочник» (§7.4, Э9)."""
+
+    def test_notify_downloads_images_into_cache(self, tmp_path: Path) -> None:
+        """`POST /notify` тянет картинки фоном — окно покажет их без сети."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/images/shema.png"):
+                return httpx.Response(200, content=PNG_1PX)
+            return httpx.Response(200, json={"ok": True})
+
+        app, _, _ = build_agent(tmp_path, transport=httpx.MockTransport(handler))
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/notify",
+                json=notify_request(images=["shema.png"]).model_dump(mode="json"),
+                headers=HEADERS,
+            )
+            assert response.status_code == 200
+            cache = app.state.agent_image_cache
+            for _ in range(100):
+                if cache.has(5, "shema.png"):
+                    break
+                time.sleep(0.05)
+
+        assert cache.read(5, "shema.png") == PNG_1PX
+
+    def test_image_endpoint_serves_cache(self, tmp_path: Path) -> None:
+        app, _, _ = build_agent(tmp_path)
+
+        with TestClient(app) as client:
+            app.state.agent_image_cache.store(5, "shema.png", PNG_1PX)
+            response = client.get("/notifications/5/images/shema.png")
+
+        assert response.status_code == 200
+        assert response.content == PNG_1PX
+        assert response.headers["content-type"] == "image/png"
+
+    def test_image_endpoint_is_404_without_cache(self, tmp_path: Path) -> None:
+        app, _, _ = build_agent(tmp_path)
+
+        with TestClient(app) as client:
+            assert client.get("/notifications/5/images/net.png").status_code == 404
+
+    def test_archive_endpoint_lists_read_notifications(self, tmp_path: Path) -> None:
+        app, _, _ = build_agent(tmp_path)
+        ref = {"session_id": "1", "session_user": "user1"}
+
+        with TestClient(app) as client:
+            client.post(
+                "/notify",
+                json=notify_request(title="Как закрыть смену").model_dump(mode="json"),
+                headers=HEADERS,
+            )
+            empty = client.get(
+                "/notifications/archive", params={"session": "1", "user": "user1"}
+            ).json()
+            client.post("/notifications/5/ack", json=ref)
+            archive = client.get(
+                "/notifications/archive", params={"session": "1", "user": "user1"}
+            ).json()["notifications"]
+
+        assert empty["notifications"] == []
+        assert [item["id"] for item in archive] == [5]
+        assert archive[0]["title"] == "Как закрыть смену"
+
+    def test_new_endpoints_are_loopback_only(self, tmp_path: Path) -> None:
+        app, _, _ = build_agent(tmp_path)
+        remote = TestClient(app, client=("10.10.5.77", 50123))
+
+        with remote:
+            assert (
+                remote.get(
+                    "/notifications/archive", params={"session": "1", "user": "user1"}
+                ).status_code
+                == 403
+            )
+            assert remote.get("/notifications/5/images/a.png").status_code == 403

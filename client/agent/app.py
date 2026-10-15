@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from client.agent import credentials, devices, downloader, messenger, notifications
@@ -214,6 +214,13 @@ def create_agent_app(
         bool(config.server_url)
         if notifications_monitor is None
         else bool(notifications_monitor)
+    )
+    #: Э9: кэш картинок тела уведомлений рядом с очередью (`notifications-images/`)
+    image_cache = notifications.NotificationImageCache(
+        Path(config.notifications_path).parent / notifications.IMAGE_CACHE_DIR_NAME
+    )
+    image_downloader = notifications.ImageDownloader(
+        config, cache=image_cache, transport=notifications_transport
     )
 
     @asynccontextmanager
@@ -584,6 +591,13 @@ def create_agent_app(
         # Дублирующий канал `msg.exe` — сразу, не дожидаясь цикла расписания
         if payload.use_msg_exe and str(payload.severity) in notifications.MSG_SEVERITIES:
             spawn(notification_monitor.send_msg_duplicates(), name="agent-notify-msg")
+        # Э9: картинки тела скачиваются фоном — касса не ждёт сеть, а окно покажет их
+        # из локального кэша, когда пользователь откроет уведомление (§7.4)
+        if payload.images:
+            spawn(
+                image_downloader.fetch(int(payload.id), list(payload.images)),
+                name="agent-notify-images",
+            )
         return result
 
     @app.get(
@@ -605,6 +619,52 @@ def create_agent_app(
         ref = SessionRef(session_id=session, session_user=user)
         items = notifications_queue.pending_for(ref)
         return {"notifications": [item.model_dump(mode="json") for item in items]}
+
+    @app.get(
+        "/notifications/archive",
+        dependencies=[Depends(require_loopback)],
+        summary="Прочитанные уведомления — справочник окна кассы",
+        tags=["notifications"],
+    )
+    def notifications_archive(
+        session: str = Query(min_length=1, description="Идентификатор сессии Windows"),
+        user: str = Query(min_length=1, description="Логин Windows в сессии"),
+    ) -> dict[str, object]:
+        """Что остаётся на кассе после «Ознакомлен» (`delete_after_read=false`, §7.4, Э9).
+
+        Вкладка «Справочник» в окне уведомлений: прочитанное не исчезает, если админ
+        так решил, — кассир возвращается к инструкции, когда нужно.
+        """
+        ref = SessionRef(session_id=session, session_user=user)
+        items = notifications_queue.archive_for(ref)
+        return {"notifications": [item.model_dump(mode="json") for item in items]}
+
+    @app.get(
+        "/notifications/{notification_id}/images/{name}",
+        dependencies=[Depends(require_loopback)],
+        summary="Картинка тела уведомления из локального кэша",
+        tags=["notifications"],
+    )
+    def notification_image(notification_id: int, name: str) -> Response:
+        """Отдать картинку уведомления из кэша кассы (§7.4, Э9).
+
+        Трей рисует окно без сети: картинка пришла один раз с сервера (агент качает
+        её фоном при `POST /notify`) и с тех пор лежит файлом рядом с очередью.
+        """
+        data = image_cache.read(notification_id, name)
+        if data is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"Картинка {name!r} уведомления id={notification_id} "
+                    "на кассе не найдена"
+                ),
+            )
+        return Response(
+            content=data,
+            media_type=notifications.image_media_type(name),
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
 
     @app.post(
         "/notifications/{notification_id}/shown",
@@ -747,4 +807,5 @@ def create_agent_app(
     #: Э5: расписание уведомлений и очередь подтверждений (диагностика и тесты)
     app.state.agent_notifications = notification_monitor
     app.state.agent_notification_queue = notifications_queue
+    app.state.agent_image_cache = image_cache
     return app

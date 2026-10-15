@@ -47,6 +47,7 @@ from client.agent import messenger
 from client.agent.config import AgentConfig
 from client.agent.processes import DEFAULT_PROVIDER, ProcessProvider
 from shared.enums import NotificationSeverity, ReceiptStatus
+from shared.richtext import BODY_FORMAT_HTML, BODY_FORMAT_PLAIN, is_safe_image_name
 from shared.schemas import (
     AgentSession,
     NotificationPendingItem,
@@ -60,12 +61,18 @@ from shared.timeutil import parse_iso_z, to_iso_z, utcnow
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ARCHIVE_LIMIT",
     "DEFAULT_SNOOZE_MIN",
+    "IMAGE_API_PATH",
+    "IMAGE_CACHE_DIR_NAME",
+    "IMAGE_MEDIA_TYPES",
     "MAX_QUEUE",
     "MSG_SEVERITIES",
     "RECEIPTS_STATUS_PATH",
     "RETRY_DELAY_SEC",
     "SESSION_STALE_HOURS",
+    "ImageDownloader",
+    "NotificationImageCache",
     "NotificationMonitor",
     "NotificationQueue",
     "NotificationsFile",
@@ -79,6 +86,27 @@ __all__ = [
 
 #: §5.2.2: пакет подтверждений «ознакомлен»/«отложено» на сервер
 RECEIPTS_STATUS_PATH = "/api/v1/agent/receipts"
+#: §7.4, Э9: откуда касса скачивает картинку тела уведомления (токен агента)
+IMAGE_API_PATH = "/api/v1/agent/notifications/{notification_id}/images/{name}"
+#: §7.4, Э9: сколько прочитанных уведомлений отдаём в «справочник» окна кассы
+ARCHIVE_LIMIT = 30
+#: §7.4, Э9: каталог локального кэша картинок рядом с `notifications.json`
+IMAGE_CACHE_DIR_NAME = "notifications-images"
+#: Расширение → тип картинки: тот же набор, что принимает сервер (§4.6)
+IMAGE_MEDIA_TYPES: dict[str, str] = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
+DEFAULT_IMAGE_MEDIA_TYPE = "application/octet-stream"
+
+
+def image_media_type(name: str) -> str:
+    """Тип картинки по расширению — для отдачи из локального кэша (§7.4)."""
+    extension = str(name).rsplit(".", 1)[-1].lower()
+    return IMAGE_MEDIA_TYPES.get(extension, DEFAULT_IMAGE_MEDIA_TYPE)
 #: §4.9: интервал возврата отложенного, если сервер его не прислал
 DEFAULT_SNOOZE_MIN = 15
 #: §4.6/§7.4: уровни, для которых служба дублирует показ через `msg.exe`
@@ -117,6 +145,17 @@ class QueuedNotification(BaseModel):
     queued_at: str | None = None
     #: Дублирующий канал `msg.exe` уже отработал: повторно не зовём (§7.4)
     msg_sent: bool = False
+    #: Э9: `plain` — простой текст, `html` — разметка из редактора (§4.6)
+    body_format: str = BODY_FORMAT_PLAIN
+    #: Э9: имена картинок тела — их касса скачивает в локальный кэш (§7.4)
+    images: list[str] = Field(default_factory=list)
+    #: Э9: `true` — прочитанное исчезает из окна, `false` — остаётся справочником
+    delete_after_read: bool = False
+
+    @property
+    def is_html(self) -> bool:
+        """Тело пришло размеченным: окно кассы рисует его, а не показывает теги."""
+        return str(self.body_format) == BODY_FORMAT_HTML
 
     def is_overdue(self, *, now: datetime | None = None) -> bool:
         """Дедлайн прошёл — показывать больше не нужно (§4.8 `expired`)."""
@@ -318,6 +357,11 @@ class NotificationQueue:
             snooze_min=max(1, int(request.snooze_min or DEFAULT_SNOOZE_MIN)),
             store_id=request.store_id,
             queued_at=to_iso_z(utcnow()),
+            # Э9: разметка, картинки и признак «удалять после прочтения» едут от
+            # сервера до окна кассы без изменений (§4.6, §7.4)
+            body_format=request.body_format,
+            images=[name for name in request.images if is_safe_image_name(name)],
+            delete_after_read=bool(request.delete_after_read),
         )
         existing = self.find(queued.id)
         if existing is not None:
@@ -442,12 +486,47 @@ class NotificationQueue:
                     requires_ack=bool(item.requires_ack),
                     repeat_every_min=item.repeat_every_min,
                     snooze_until=state.snooze_until if state is not None else None,
+                    # Э9: окно кассы рисует разметку и картинки из своего кэша (§7.4)
+                    body_format=item.body_format,
+                    images=list(item.images),
+                    delete_after_read=bool(item.delete_after_read),
                 )
             )
 
         if changed:
             self.save()
         return visible
+
+    def archive_for(self, ref: SessionRef) -> list[NotificationPendingItem]:
+        """Что уже прочитано в этой сессии, но остаётся справочником (`GET /notifications/archive`, §7.4, Э9).
+
+        Уведомление с `delete_after_read=false` не исчезает с кассы: кассир может
+        вернуться к инструкции («как закрыть смену») в любой момент. Свежие — первыми,
+        и не больше `ARCHIVE_LIMIT`: окно кассы — не архив, а подсказка под рукой.
+        """
+        items: list[NotificationPendingItem] = []
+        for item in sorted(self._data.notifications, key=lambda entry: int(entry.id), reverse=True):
+            if bool(item.delete_after_read):
+                continue
+            state = self.state(item.id, ref.session_id)
+            if state is None or not state.is_acknowledged:
+                continue
+            items.append(
+                NotificationPendingItem(
+                    id=item.id,
+                    title=item.title,
+                    body=item.body,
+                    severity=item.severity,
+                    requires_ack=bool(item.requires_ack),
+                    repeat_every_min=item.repeat_every_min,
+                    body_format=item.body_format,
+                    images=list(item.images),
+                    delete_after_read=False,
+                )
+            )
+            if len(items) >= ARCHIVE_LIMIT:
+                break
+        return items
 
     @staticmethod
     def _expire(state: SessionState | None) -> bool:
@@ -706,6 +785,130 @@ class ReceiptSender:
             )
             return False
         return True
+
+
+class NotificationImageCache:
+    """Кэш картинок тела уведомления на кассе (§7.4, Э9).
+
+    Картинка скачивается с сервера один раз и дальше живёт файлом: окно уведомления
+    показывает её и без сети, а перезапуск службы ничего не перекачивает. Файлы лежат
+    рядом с очередью (`notifications-images/<id>/<имя>`), имя проверяется тем же
+    правилом, что и на сервере (`shared.richtext`).
+    """
+
+    def __init__(self, base_dir: str | Path) -> None:
+        self.base_dir = Path(base_dir)
+
+    def directory(self, notification_id: int) -> Path:
+        """Каталог картинок одного уведомления."""
+        return self.base_dir / str(int(notification_id))
+
+    def path(self, notification_id: int, name: str) -> Path | None:
+        """Путь к файлу картинки; `None` — имя небезопасно и в кэш не пускаем."""
+        if not is_safe_image_name(name):
+            return None
+        return self.directory(notification_id) / name
+
+    def has(self, notification_id: int, name: str) -> bool:
+        """Картинка уже скачана — второй раз в сеть не идём."""
+        path = self.path(notification_id, name)
+        return bool(path and path.is_file())
+
+    def store(self, notification_id: int, name: str, data: bytes) -> Path | None:
+        """Положить картинку в кэш; `None` — имя небезопасно или данных нет."""
+        path = self.path(notification_id, name)
+        if path is None or not data:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def read(self, notification_id: int, name: str) -> bytes | None:
+        """Байты картинки из кэша; `None` — файла нет (удалён вручную, не скачан)."""
+        path = self.path(notification_id, name)
+        if path is None or not path.is_file():
+            return None
+        return path.read_bytes()
+
+
+class ImageDownloader:
+    """Скачивание картинок уведомления с сервера в локальный кэш (§7.4, Э9).
+
+    Агент ходит на сервер своим токеном (`X-Agent-Token`) — как и за подтверждениями.
+    Недоступность сервера не сбой доставки: уведомление уже в очереди, а картинка
+    догоняет кассу, когда пользователь открывает окно, — но только если есть сеть.
+    """
+
+    def __init__(
+        self,
+        config: AgentConfig,
+        *,
+        cache: NotificationImageCache,
+        client: httpx.AsyncClient | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        self.config = config
+        self.cache = cache
+        self._client = client
+        self._transport = transport
+        self.timeout = float(timeout)
+
+    def url(self, notification_id: int, name: str) -> str:
+        """Полный адрес картинки на сервере (токен агента, §7.4)."""
+        base = (self.config.server_url or "").rstrip("/")
+        path = IMAGE_API_PATH.format(notification_id=int(notification_id), name=name)
+        return f"{base}{path}"
+
+    async def fetch(self, notification_id: int, names: Sequence[str]) -> int:
+        """Скачать недостающие картинки; возвращает число сохранённых файлов."""
+        if not self.config.server_url or not self.config.agent_token:
+            logger.debug("Адрес сервера или токен агента не заданы — картинки не качаем")
+            return 0
+        stored = 0
+        for name in names:
+            if self.cache.has(notification_id, name):
+                continue
+            data = await self._download(notification_id, name)
+            if data is None:
+                continue
+            if self.cache.store(notification_id, name, data) is not None:
+                stored += 1
+        if stored:
+            logger.info("Картинок уведомления id=%s скачано: %s", notification_id, stored)
+        return stored
+
+    async def _download(self, notification_id: int, name: str) -> bytes | None:
+        """Одна картинка: сетевые сбои и отказы сервера — просто «не скачали»."""
+        url = self.url(notification_id, name)
+        headers = {"X-Agent-Token": self.config.agent_token or "", "Accept": "image/*"}
+        try:
+            if self._client is not None:
+                response = await self._client.get(url, headers=headers)
+            else:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(self.timeout),
+                    transport=self._transport,
+                    trust_env=False,
+                ) as client:
+                    response = await client.get(url, headers=headers)
+        except httpx.HTTPError as exc:
+            logger.debug(
+                "Картинка %s уведомления id=%s не скачана (%s)",
+                name,
+                notification_id,
+                exc.__class__.__name__,
+            )
+            return None
+        if response.status_code >= 400:
+            logger.warning(
+                "Сервер не отдал картинку %s (уведомление id=%s): %s",
+                name,
+                notification_id,
+                response.status_code,
+            )
+            return None
+        return response.content
 
 
 class NotificationMonitor:

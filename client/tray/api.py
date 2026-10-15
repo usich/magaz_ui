@@ -73,6 +73,34 @@ class TrayAgentClient:
         raw_items: Sequence[dict] = payload.get("notifications", [])
         return [NotificationPendingItem.model_validate(item) for item in raw_items]
 
+    def archive(self, ref: SessionRef) -> list[NotificationPendingItem]:
+        """`GET /notifications/archive` — прочитанное, что остаётся справочником (§7.4, Э9).
+
+        Вкладка «Справочник» в окне уведомлений: админ мог пометить рассылку как
+        «не удалять после прочтения», и кассир возвращается к инструкции, когда нужно.
+        """
+        response = self._request(
+            "GET",
+            "/notifications/archive",
+            params={"session": ref.session_id, "user": ref.session_user},
+        )
+        payload = response.json() or {}
+        raw_items: Sequence[dict] = payload.get("notifications", [])
+        return [NotificationPendingItem.model_validate(item) for item in raw_items]
+
+    def image(self, notification_id: int, name: str) -> bytes | None:
+        """`GET /notifications/{id}/images/{name}` — картинка тела из кэша кассы (§7.4, Э9).
+
+        `None` — картинки нет (ещё не скачана, удалена или служба недоступна): окно
+        покажет подпись `alt` вместо изображения, а не «упадёт».
+        """
+        try:
+            response = self._client.get(f"/notifications/{notification_id}/images/{name}")
+            response.raise_for_status()
+        except httpx.HTTPError:
+            return None
+        return response.content
+
     # --- Действия пользователя ---------------------------------------------
 
     def shown(self, notification_id: int, ref: SessionRef) -> bool:

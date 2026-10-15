@@ -25,7 +25,16 @@ import pytest
 
 from client.tray import __main__ as tray_main
 from client.tray.api import DEFAULT_AGENT_URL, AgentUnreachable, TrayAgentClient
-from client.tray.presenter import KIND_TOAST, KIND_WINDOW, TrayPresenter
+from client.tray.presenter import (
+    KIND_TOAST,
+    KIND_WINDOW,
+    TAB_ALL,
+    TAB_ARCHIVE,
+    TrayPresenter,
+    build_tabs,
+    items_for_tab,
+    panel_geometry,
+)
 from client.tray.session import SESSION_ENV, UNKNOWN_SESSION_ID, USER_ENV, current_session_id, current_session_user, session_ref
 from shared.enums import NotificationSeverity
 from shared.schemas import NotificationPendingItem, SessionRef
@@ -75,6 +84,9 @@ class FakeClient:
         self.shown_calls: list[int] = []
         self.ack_calls: list[int] = []
         self.snooze_calls: list[tuple[int, int | None]] = []
+        self.archive_items: list[NotificationPendingItem] = []
+        self.archive_calls = 0
+        self.image_bytes: bytes | None = None
         self.closed = False
 
     def pending(self, ref: SessionRef) -> list[NotificationPendingItem]:
@@ -101,6 +113,17 @@ class FakeClient:
             self.snooze_calls.append((notification_id, snooze_min))
         return self.receipts_ok
 
+    def archive(self, ref: SessionRef) -> list[NotificationPendingItem]:
+        """`GET /notifications/archive` — справочник прочитанного (§7.4, Э9)."""
+        _ = ref
+        self.archive_calls += 1
+        return list(self.archive_items)
+
+    def image(self, notification_id: int, name: str) -> bytes | None:
+        """Картинка из кэша кассы; `None` — служба её не отдала (§7.4, Э9)."""
+        _ = notification_id, name
+        return self.image_bytes
+
     def close(self) -> None:
         self.closed = True
 
@@ -113,6 +136,8 @@ class FakeWindows:
         self.windows: list[int] = []
         self.topmost: list[bool] = []
         self.unread: list[int] = []
+        self.archive: list[int] = []
+        self.hidden = True
         self.quit_called = False
 
     def toast(self, item: NotificationPendingItem, *, seconds: int = 3) -> None:
@@ -127,7 +152,19 @@ class FakeWindows:
     def set_unread(self, items: list[NotificationPendingItem]) -> None:
         self.unread.append(len(items))
 
+    def set_archive(self, items: list[NotificationPendingItem]) -> None:
+        self.archive = [item.id for item in items]
+
+    @property
+    def is_open(self) -> bool:
+        """Окно показано: только тогда трей читает «справочник» (§7.4, Э9)."""
+        return not self.hidden
+
+    def hide(self) -> None:
+        self.hidden = True
+
     def show_unread(self, items: list[NotificationPendingItem]) -> None:
+        self.hidden = False
         for item in items:
             self.window(item)
 
@@ -592,3 +629,85 @@ class TestProxyIsIgnored:
         client = TrayAgentClient(base_url=stub_agent_url, timeout_sec=3.0)
 
         assert client.pending(SessionRef(session_id="1", session_user="dev")) == []
+
+
+class TestTrayPanel:
+    """Окно уведомлений: вкладки, «справочник» и геометрия «не больше 15 %» (§7.4, Э9)."""
+
+    def test_tabs_count_unread_and_archive(self) -> None:
+        unread = [
+            make_pending(1, severity=NotificationSeverity.IMPORTANT),
+            make_pending(2, severity=NotificationSeverity.IMPORTANT),
+            make_pending(3, severity=NotificationSeverity.CRITICAL),
+        ]
+        archive = [make_pending(4)]
+
+        tabs = build_tabs(unread, archive)
+
+        assert [(tab.key, tab.count) for tab in tabs] == [
+            (TAB_ALL, 3),
+            ("info", 0),
+            ("important", 2),
+            ("critical", 1),
+            (TAB_ARCHIVE, 1),
+        ]
+        assert tabs[-1].is_archive is True
+        assert tabs[0].is_archive is False
+
+    def test_items_for_tab_filters_by_severity_and_archive(self) -> None:
+        unread = [
+            make_pending(1, severity=NotificationSeverity.INFO),
+            make_pending(2, severity=NotificationSeverity.CRITICAL),
+        ]
+        archive = [make_pending(9)]
+
+        assert [item.id for item in items_for_tab(TAB_ALL, unread, archive)] == [1, 2]
+        assert [item.id for item in items_for_tab("critical", unread, archive)] == [2]
+        assert [item.id for item in items_for_tab("important", unread, archive)] == []
+        assert [item.id for item in items_for_tab(TAB_ARCHIVE, unread, archive)] == [9]
+
+    def test_panel_is_top_right_and_within_15_percent(self) -> None:
+        x, y, width, height = panel_geometry(1920, 1080)
+
+        assert y >= 0
+        assert x + width <= 1920, "окно прижато к правому краю (§7.4)"
+        assert x >= 1920 - width - 12
+        assert width * height <= 0.15 * 1920 * 1080, "не больше 15 % площади экрана"
+
+    def test_panel_fits_small_screen(self) -> None:
+        x, y, width, height = panel_geometry(1024, 768)
+
+        assert 0 <= x and x + width <= 1024
+        assert 0 <= y and y + height <= 768
+        assert width * height <= 0.15 * 1024 * 768
+
+    def test_presenter_tabs_use_archive(self) -> None:
+        presenter = TrayPresenter()
+        presenter.decide([make_pending(1, severity=NotificationSeverity.INFO)])
+        presenter.set_archive([make_pending(2)])
+
+        counts = {tab.key: tab.count for tab in presenter.tabs()}
+
+        assert counts[TAB_ALL] == 1
+        assert counts["info"] == 1
+        assert counts[TAB_ARCHIVE] == 1
+        assert [item.id for item in presenter.archive] == [2]
+
+    def test_agent_reads_archive_only_when_panel_is_open(self) -> None:
+        """Закрытое окно не дёргает службу: справочник читается по требованию (§7.4, Э9)."""
+        client = FakeClient([make_pending(1, severity=NotificationSeverity.IMPORTANT)])
+        client.archive_items = [make_pending(2)]
+        windows = FakeWindows()
+        agent = tray_main.TrayAgent(client, presenter=TrayPresenter(), windows=windows)
+
+        agent.poll_once()
+
+        assert client.archive_calls == 0, "окно свёрнуто — службу не беспокоим"
+        assert windows.unread[-1] == 1, "счётчик непрочитанных всё равно обновляется"
+
+        windows.show_unread([])
+        agent.poll_once()
+
+        assert client.archive_calls == 1
+        assert windows.archive == [2]
+

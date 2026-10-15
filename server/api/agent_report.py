@@ -16,12 +16,13 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from server.config import API_PREFIX
-from server.core.dependencies import get_admin_store, get_db
+from server.core.context import AppContext
+from server.core.dependencies import get_admin_store, get_context, get_db
 from server.db.models import Command, Store
 from server.services import command_service, device_service, notification_service
 from shared.enums import CommandStatus
@@ -261,4 +262,60 @@ def agent_receipts(
         updated=summary["updated"],
         ignored=summary["ignored"],
         expired=summary["expired"],
+    )
+
+
+# --- Картинки тела уведомления для кассы (Э9, §7.4) --------------------------
+
+
+@router.get(
+    "/notifications/{notification_id}/images/{name}",
+    summary="Картинка тела уведомления для кассы",
+)
+def agent_notification_image(
+    notification_id: int,
+    name: str,
+    store: Annotated[Store, Depends(get_admin_store)],
+    context: Annotated[AppContext, Depends(get_context)],
+    session: Annotated[Session, Depends(get_db)],
+) -> Response:
+    """Отдать картинку тела агенту кассы (Э9, §7.4).
+
+    Касса скачивает картинки **один раз** в свой локальный кэш: дальше окно
+    уведомления рисует их без сети — схемы зала и фото приходят позже самого
+    уведомления, а интернет на кассе бывает не всегда.
+
+    Точка закрыта токеном агента и проверкой адресации: картинку получает только
+    тот магазин, которому уведомление отправлено. «Чужое» уведомление отвечает
+    `404`, а не `403` — статус не должен подтверждать, что такое уведомление есть.
+    """
+    try:
+        notification = notification_service.get_notification(session, notification_id)
+    except notification_service.NotificationNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    if not any(int(target.store_id) == store.id for target in notification.targets):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Уведомление id={notification_id} магазину id={store.id} не отправлялось",
+        )
+
+    image = next((item for item in notification.images if item.name == name), None)
+    if image is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Картинка {name!r} у уведомления id={notification_id} не найдена",
+        )
+    path = notification_service.image_file_path(
+        context.settings.notification_images_dir, notification.id, name
+    )
+    if not path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Файл картинки не найден: восстановите его из резервной копии",
+        )
+    return Response(
+        content=notification_service.image_payload(image, path.read_bytes()),
+        media_type=image.content_type,
+        headers={"Cache-Control": "private, max-age=3600"},
     )
