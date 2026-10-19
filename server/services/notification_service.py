@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session, selectinload
 from server.db.models import (
     Command,
     Notification,
+    NotificationCategory,
     NotificationImage,
     NotificationReceipt,
     NotificationTarget,
@@ -54,13 +55,21 @@ from shared.enums import (
     ReceiptStatus,
     TargetType,
 )
-from shared.schemas import NotifyRequest, ReceiptBatch, ReceiptItem
+from shared.schemas import (
+    NotificationCategoryRef,
+    NotifyRequest,
+    ReceiptBatch,
+    ReceiptItem,
+)
 from shared.timeutil import parse_iso_z, to_iso_z, utcnow
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CATEGORY_COLORS",
+    "CATEGORY_NAME_MAX_LENGTH",
     "CSV_HEADER",
+    "DEFAULT_CATEGORY_COLOR",
     "DEFAULT_LIST_LIMIT",
     "IMAGES_MAX_PER_NOTIFICATION",
     "IMAGE_CONTENT_TYPES",
@@ -73,21 +82,28 @@ __all__ = [
     "STATUS_FILTERS",
     "STATUS_LABELS",
     "TARGET_TYPES",
+    "NotificationCategoryNotFoundError",
+    "NotificationCategoryValidationError",
     "NotificationNotFoundError",
     "NotificationValidationError",
     "add_image",
     "add_images",
     "apply_receipts",
     "cancel_notification",
+    "category_ref",
+    "create_category",
     "create_notification",
+    "delete_category",
     "delete_image",
     "delete_notification",
     "detect_image_content_type",
+    "get_category",
     "get_notification",
     "image_directory",
     "image_file_path",
     "image_payload",
     "keep_known_images",
+    "list_categories",
     "list_notifications",
     "mark_delivered",
     "normalize_params",
@@ -100,11 +116,27 @@ __all__ = [
     "snooze_min",
     "state",
     "target_stores",
+    "update_category",
 ]
 
 #: §4.9: через сколько минут возвращается отложенное уведомление (П-2)
 SNOOZE_SETTING = "notification_snooze_min"
 DEFAULT_SNOOZE_MIN = 15
+#: 1.22: палитра плашек категорий (§11.5) — тёмная тема кассы рассчитана на эти цвета
+CATEGORY_COLORS: tuple[str, ...] = (
+    "#64748b",  # серый — «без акцента»
+    "#2563eb",  # синий
+    "#0ea5e9",  # голубой
+    "#10b981",  # зелёный
+    "#f59e0b",  # янтарный
+    "#ef4444",  # красный
+    "#8b5cf6",  # фиолетовый
+    "#ec4899",  # розовый
+)
+#: Цвет категории по умолчанию: нейтральный, читается и на тёмном, и на светлом
+DEFAULT_CATEGORY_COLOR = CATEGORY_COLORS[0]
+#: Имя категории — как колонка `notification_categories.name` (§4.6)
+CATEGORY_NAME_MAX_LENGTH = 100
 #: §11.5: сколько уведомлений отдаём в список по умолчанию
 DEFAULT_LIST_LIMIT = 200
 #: Максимальная длина заголовка — как колонка `notifications.title` (§4.6)
@@ -204,6 +236,19 @@ def _clean_repeat(value: object) -> int | None:
     return minutes
 
 
+def _clean_category_id(value: object) -> int | None:
+    """Разобрать id категории уведомления (1.22, §4.6); `None` — без категории."""
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise NotificationValidationError("Некорректный id категории уведомления") from exc
+    if number <= 0:
+        return None
+    return number
+
+
 def _clean_store_ids(value: object) -> list[int]:
     """Разобрать список id магазинов: список, строка «1,2» или «1;2» (§11.4)."""
     if value in (None, "", []):
@@ -283,7 +328,7 @@ def normalize_params(raw: Mapping[str, object] | None) -> dict[str, object]:
         # справочником на кассе (§4.6, §7.4)
         "delete_after_read": bool(data.get("delete_after_read", False)),
         "target_type": target_type,
-        "use_msg_exe": bool(data.get("use_msg_exe", True)),
+        "category_id": _clean_category_id(data.get("category_id")),
         "repeat_every_min": _clean_repeat(data.get("repeat_every_min")),
         "deadline_at": parse_iso_z(deadline) if deadline else None,
         "store_ids": store_ids,
@@ -347,7 +392,7 @@ def create_notification(  # noqa: PLR0913 - параметры уведомле�
     cluster: str | None = None,
     deadline_at: datetime | None = None,
     repeat_every_min: int | None = None,
-    use_msg_exe: bool = True,
+    category_id: int | None = None,
     created_by: str | None = None,
 ) -> Notification:
     """Создать уведомление и строки `notification_targets` (§4.6–4.7).
@@ -368,7 +413,7 @@ def create_notification(  # noqa: PLR0913 - параметры уведомле�
         target_value=_target_value(kind, stores, cluster),
         deadline_at=deadline_at,
         repeat_every_min=_clean_repeat(repeat_every_min),
-        use_msg_exe=bool(use_msg_exe),
+        category_id=_clean_category_id(category_id),
         is_active=True,
         created_by=created_by,
     )
@@ -590,6 +635,9 @@ def push_payload(session: Session, store: Store, notification: Notification) -> 
     (`images`) и признак «удалять после прочтения»: окно кассы рисует разметку
     само, картинки скачивает один раз в локальный кэш, а прочитанное либо
     оставляет справочником, либо убирает (§4.6, §7.4).
+
+    1.22: вместе с уведомлением едет категория (`id`, `name`, `color`) — касса
+    группирует список и рисует плашку, не зная ничего о каталоге категорий (§7.4).
     """
     return NotifyRequest(
         id=notification.id,
@@ -597,14 +645,25 @@ def push_payload(session: Session, store: Store, notification: Notification) -> 
         body=notification.body,
         body_format=str(notification.body_format or richtext.BODY_FORMAT_PLAIN),
         severity=str(notification.severity),
+        category=category_ref(notification.category),
         requires_ack=bool(notification.requires_ack),
         delete_after_read=bool(notification.delete_after_read),
         images=[image.name for image in notification.images],
         deadline_at=to_iso_z(notification.deadline_at),
         repeat_every_min=notification.repeat_every_min,
-        use_msg_exe=bool(notification.use_msg_exe),
         snooze_min=snooze_min(session),
         store_id=store.id,
+    )
+
+
+def category_ref(category: NotificationCategory | None) -> NotificationCategoryRef | None:
+    """Категория для кассы: `None` — уведомление без категории (1.22, §7.4)."""
+    if category is None:
+        return None
+    return NotificationCategoryRef(
+        id=int(category.id),
+        name=str(category.name),
+        color=str(category.color or DEFAULT_CATEGORY_COLOR),
     )
 
 
@@ -1290,4 +1349,167 @@ def delete_notification(
         len(names),
     )
     return {"canceled_jobs": canceled, "images_removed": len(names)}
+
+
+# --- Категории уведомлений (1.22, §4.6, §11.5) ------------------------------
+
+
+class NotificationCategoryNotFoundError(LookupError):
+    """Категория не найдена: API отвечает `404` (§11.5)."""
+
+
+class NotificationCategoryValidationError(ValueError):
+    """Некорректные данные категории: имя пустое, дубль или неизвестный цвет."""
+
+
+def _clean_category_name(value: object) -> str:
+    """Имя категории: непустое, обрезанное, не длиннее колонки (§4.6)."""
+    name = str(value or "").strip()
+    if not name:
+        raise NotificationCategoryValidationError("Имя категории не может быть пустым")
+    if len(name) > CATEGORY_NAME_MAX_LENGTH:
+        raise NotificationCategoryValidationError(
+            f"Имя категории длиннее {CATEGORY_NAME_MAX_LENGTH} символов"
+        )
+    return name
+
+
+def _clean_category_color(value: object) -> str:
+    """Цвет плашки: `#RRGGBB` из палитры (§11.5).
+
+    Свободный цвет не принимаем: плашки рисуются на тёмном фоне кассы и на
+    светлом дашборде, поэтому палитра ограничена читаемыми оттенками.
+    """
+    color = str(value or "").strip().lower()
+    if not color:
+        return DEFAULT_CATEGORY_COLOR
+    if color not in CATEGORY_COLORS:
+        raise NotificationCategoryValidationError(
+            "Цвет должен быть из палитры: " + ", ".join(CATEGORY_COLORS)
+        )
+    return color
+
+
+def _clean_sort_order(value: object) -> int:
+    """Порядок в списках: целое, `0` — «как заведено»."""
+    if value in (None, ""):
+        return 0
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise NotificationCategoryValidationError("Порядок должен быть целым числом") from exc
+
+
+def list_categories(
+    session: Session, *, include_inactive: bool = False
+) -> list[NotificationCategory]:
+    """Категории в порядке админа: сортировка по `sort_order`, затем по имени (1.22).
+
+    `include_inactive` нужен админке: отключённая категория пропадает из выбора
+    при создании уведомления, но её видно в справочнике категорий.
+    """
+    stmt = select(NotificationCategory).order_by(
+        NotificationCategory.sort_order, NotificationCategory.name
+    )
+    if not include_inactive:
+        stmt = stmt.where(NotificationCategory.is_active.is_(True))
+    return list(session.scalars(stmt).all())
+
+
+def get_category(session: Session, category_id: int) -> NotificationCategory:
+    """Категория по id или `NotificationCategoryNotFoundError` (§11.5)."""
+    category = session.get(NotificationCategory, int(category_id))
+    if category is None:
+        raise NotificationCategoryNotFoundError(f"Категория id={category_id} не найдена")
+    return category
+
+
+def _category_name_taken(
+    session: Session, name: str, *, exclude_id: int | None = None
+) -> bool:
+    """Занято ли имя категории — сравнение без учёта регистра (§4.6).
+
+    Сравниваем в Python, а не `LOWER()` в SQL: SQLite не умеет `lower()` для
+    кириллицы, поэтому «Закупки» и «закупки» там считались бы разными именами.
+    """
+    target = name.strip().casefold()
+    stmt = select(NotificationCategory.id, NotificationCategory.name)
+    if exclude_id is not None:
+        stmt = stmt.where(NotificationCategory.id != int(exclude_id))
+    for row in session.execute(stmt).all():
+        if str(row.name).strip().casefold() == target:
+            return True
+    return False
+
+
+def create_category(  # noqa: PLR0913 - поля категории §4.6
+    session: Session,
+    *,
+    name: str,
+    color: str = DEFAULT_CATEGORY_COLOR,
+    sort_order: int = 0,
+    created_by: str | None = None,
+) -> NotificationCategory:
+    """Завести категорию уведомлений (1.22, §11.5).
+
+    Имя уникально (`uq_notification_categories_name`) — админка ловит дубль по
+    `NotificationCategoryValidationError` и отвечает `409`.
+    """
+    clean_name = _clean_category_name(name)
+    if _category_name_taken(session, clean_name):
+        raise NotificationCategoryValidationError(f"Категория «{clean_name}» уже есть")
+    category = NotificationCategory(
+        name=clean_name,
+        color=_clean_category_color(color),
+        sort_order=_clean_sort_order(sort_order),
+        is_active=True,
+        created_by=created_by,
+    )
+    session.add(category)
+    session.flush()
+    logger.info("Категория уведомлений id=%s «%s» создана", category.id, category.name)
+    return category
+
+
+def update_category(  # noqa: PLR0913 - поля категории §4.6
+    session: Session,
+    category: NotificationCategory,
+    *,
+    name: str | None = None,
+    color: str | None = None,
+    sort_order: int | None = None,
+    is_active: bool | None = None,
+) -> NotificationCategory:
+    """Изменить категорию: имя, цвет, порядок и признак активности (§11.5).
+
+    Переданные `None`-поля не меняются: так обновление одного цвета не затирает
+    имя и порядок, которые админка не отправляла.
+    """
+    if name is not None:
+        clean_name = _clean_category_name(name)
+        if _category_name_taken(session, clean_name, exclude_id=category.id):
+            raise NotificationCategoryValidationError(f"Категория «{clean_name}» уже есть")
+        category.name = clean_name
+    if color is not None:
+        category.color = _clean_category_color(color)
+    if sort_order is not None:
+        category.sort_order = _clean_sort_order(sort_order)
+    if is_active is not None:
+        category.is_active = bool(is_active)
+    session.flush()
+    logger.info("Категория уведомлений id=%s обновлена", category.id)
+    return category
+
+
+def delete_category(session: Session, category: NotificationCategory) -> int:
+    """Мягко удалить категорию: `is_active=false`, уведомления не трогаем (1.22).
+
+    Жёсткое удаление запрещено сознательно: у уже разосланных уведомлений
+    категория — часть истории и отчёта (§11.5). Отключённая категория пропадает
+    из выбора, но остаётся у старых уведомлений.
+    """
+    category.is_active = False
+    session.flush()
+    logger.info("Категория уведомлений id=%s отключена (мягкое удаление)", category.id)
+    return int(category.id)
 

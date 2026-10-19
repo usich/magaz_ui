@@ -40,7 +40,7 @@ from server.core.dependencies import (
     get_db,
     require_active_admin,
 )
-from server.db.models import AdminUser, Notification, NotificationImage
+from server.db.models import AdminUser, Notification, NotificationCategory, NotificationImage
 from server.services import audit_service, command_service, notification_service
 from shared import richtext
 from shared.enums import CommandKind, NotificationSeverity, TargetType
@@ -77,6 +77,44 @@ class NotificationImageIn(BaseModel):
     data_base64: str
 
 
+class NotificationCategoryIn(BaseModel):
+    """Тело `POST/PUT /notification-categories` (§11.5, спека 1.22).
+
+    Цвет — из палитры сервиса (`notification_service.CATEGORY_COLORS`): окно
+    кассы и дашборд должны показывать одинаково читаемые плашки.
+    """
+
+    name: str
+    color: str = ""
+    sort_order: int = 0
+    is_active: bool | None = None
+
+
+class NotificationCategoryOut(BaseModel):
+    """Категория уведомления в ответах админки (§11.5, спека 1.22)."""
+
+    id: int
+    name: str
+    color: str
+    sort_order: int = 0
+    is_active: bool = True
+    created_by: str | None = None
+    created_at: str | None = None
+
+    @classmethod
+    def from_model(cls, category: NotificationCategory) -> "NotificationCategoryOut":
+        """Собрать строку списка категорий (§11.5)."""
+        return cls(
+            id=int(category.id),
+            name=str(category.name),
+            color=str(category.color),
+            sort_order=int(category.sort_order),
+            is_active=bool(category.is_active),
+            created_by=category.created_by,
+            created_at=to_iso_z(category.created_at),
+        )
+
+
 class NotificationCreateIn(BaseModel):
     """Тело `POST /notifications` (§11.5, §5.2.2)."""
 
@@ -85,6 +123,8 @@ class NotificationCreateIn(BaseModel):
     #: Э9: `plain` — как было, `html` — разметка из редактора (санитайз на сервере)
     body_format: str = richtext.BODY_FORMAT_PLAIN
     severity: str = str(NotificationSeverity.INFO)
+    #: 1.22: информационная категория («Продажи», «Закупки»); `None` — без категории
+    category_id: int | None = None
     requires_ack: bool = False
     #: Э9: «удалять после прочтения» — по умолчанию нет (остаётся справочником)
     delete_after_read: bool = False
@@ -96,7 +136,6 @@ class NotificationCreateIn(BaseModel):
     cluster: str | None = None
     deadline_at: str | None = None
     repeat_every_min: int | None = None
-    use_msg_exe: bool = True
 
 
 class NotificationOut(BaseModel):
@@ -110,12 +149,13 @@ class NotificationOut(BaseModel):
     delete_after_read: bool = False
     images: list[str] = Field(default_factory=list)
     severity: str
+    #: 1.22: категория уведомления для плашки и группировки в списке (§11.5)
+    category: NotificationCategoryOut | None = None
     requires_ack: bool
     target_type: str
     target_value: str | None = None
     deadline_at: str | None = None
     repeat_every_min: int | None = None
-    use_msg_exe: bool
     is_active: bool
     state: str
     created_by: str | None = None
@@ -134,12 +174,16 @@ class NotificationOut(BaseModel):
             delete_after_read=bool(notification.delete_after_read),
             images=[image.name for image in notification.images],
             severity=str(notification.severity),
+            category=(
+                NotificationCategoryOut.from_model(notification.category)
+                if notification.category is not None
+                else None
+            ),
             requires_ack=bool(notification.requires_ack),
             target_type=str(notification.target_type),
             target_value=notification.target_value,
             deadline_at=to_iso_z(notification.deadline_at),
             repeat_every_min=notification.repeat_every_min,
-            use_msg_exe=bool(notification.use_msg_exe),
             is_active=bool(notification.is_active),
             state=notification_service.state(notification),
             created_by=notification.created_by,
@@ -354,6 +398,7 @@ def create_notification(
         body=str(params["body"]),
         body_format=str(params["body_format"]),
         severity=str(params["severity"]),
+        category_id=params["category_id"],  # type: ignore[arg-type]
         requires_ack=bool(params["requires_ack"]),
         delete_after_read=bool(params["delete_after_read"]),
         target_type=str(params["target_type"]),
@@ -361,7 +406,6 @@ def create_notification(
         cluster=params["cluster"],  # type: ignore[arg-type]
         deadline_at=params["deadline_at"],  # type: ignore[arg-type]
         repeat_every_min=params["repeat_every_min"],  # type: ignore[arg-type]
-        use_msg_exe=bool(params["use_msg_exe"]),
         created_by=admin.username,
     )
     jobs = _create_jobs(session, notification, author=admin.username)
@@ -840,4 +884,169 @@ def delete_notification_image(
         body=body,
         images=[str(image.name) for image in notification.images],
     )
+
+
+# --- Категории уведомлений (1.22, §11.5) ------------------------------------
+
+
+class NotificationCategoryDeleteOut(BaseModel):
+    """Ответ мягкого удаления категории (§11.5)."""
+
+    category_id: int
+    message: str
+
+
+def _category_or_404(session: Session, category_id: int) -> NotificationCategory:
+    """Категория по id или `404` (§11.5)."""
+    try:
+        return notification_service.get_category(session, category_id)
+    except notification_service.NotificationCategoryNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+
+
+@router.get(
+    "/notification-categories",
+    response_model=list[NotificationCategoryOut],
+    summary="Список категорий уведомлений",
+)
+def list_notification_categories(
+    session: Annotated[Session, Depends(get_db)],
+    include_inactive: Annotated[bool, Query()] = False,
+) -> list[NotificationCategoryOut]:
+    """Категории для формы и справочника (§11.5, спека 1.22).
+
+    По умолчанию отдаются только активные: именно их предлагает форма создания
+    уведомления. `include_inactive=true` — для раздела «Категории», где админ
+    видит и отключённые (§11.5).
+    """
+    return [
+        NotificationCategoryOut.from_model(category)
+        for category in notification_service.list_categories(
+            session, include_inactive=include_inactive
+        )
+    ]
+
+
+@router.post(
+    "/notification-categories",
+    response_model=NotificationCategoryOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Создать категорию уведомлений",
+)
+def create_notification_category(
+    payload: NotificationCategoryIn,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+    request: Request,
+) -> NotificationCategoryOut:
+    """Завести категорию («Продажи», «Закупки») (§11.5, спека 1.22).
+
+    Дубль имени — `409`: админ видит, что категория уже есть, а не получает
+    вторую с тем же названием. Некорректный цвет — `422`.
+    """
+    try:
+        category = notification_service.create_category(
+            session,
+            name=payload.name,
+            color=payload.color,
+            sort_order=payload.sort_order,
+            created_by=admin.username,
+        )
+    except notification_service.NotificationCategoryValidationError as exc:
+        raise _category_error(exc) from exc
+    audit_service.record(
+        session,
+        action="notification_category_create",
+        actor=admin.username,
+        entity="notification_category",
+        entity_id=category.id,
+        details={"name": category.name, "color": category.color},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    return NotificationCategoryOut.from_model(category)
+
+
+@router.put(
+    "/notification-categories/{category_id}",
+    response_model=NotificationCategoryOut,
+    summary="Изменить категорию уведомлений",
+)
+def update_notification_category(
+    category_id: int,
+    payload: NotificationCategoryIn,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+    request: Request,
+) -> NotificationCategoryOut:
+    """Переименовать категорию, сменить цвет, порядок или включить обратно (§11.5)."""
+    category = _category_or_404(session, category_id)
+    try:
+        notification_service.update_category(
+            session,
+            category,
+            name=payload.name,
+            color=payload.color,
+            sort_order=payload.sort_order,
+            is_active=payload.is_active,
+        )
+    except notification_service.NotificationCategoryValidationError as exc:
+        raise _category_error(exc) from exc
+    audit_service.record(
+        session,
+        action="notification_category_update",
+        actor=admin.username,
+        entity="notification_category",
+        entity_id=category.id,
+        details={"name": category.name, "is_active": bool(category.is_active)},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    return NotificationCategoryOut.from_model(category)
+
+
+@router.delete(
+    "/notification-categories/{category_id}",
+    response_model=NotificationCategoryDeleteOut,
+    summary="Отключить категорию уведомлений",
+)
+def delete_notification_category(
+    category_id: int,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+    request: Request,
+) -> NotificationCategoryDeleteOut:
+    """Мягко отключить категорию: `is_active=false` (§11.5, спека 1.22).
+
+    Жёсткого удаления нет: у уже разосланных уведомлений категория — часть
+    истории и отчёта. Отключённая категория пропадает из выбора, но остаётся у
+    старых уведомлений.
+    """
+    category = _category_or_404(session, category_id)
+    name = str(category.name)
+    notification_service.delete_category(session, category)
+    audit_service.record(
+        session,
+        action="notification_category_delete",
+        actor=admin.username,
+        entity="notification_category",
+        entity_id=category_id,
+        details={"name": name},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    return NotificationCategoryDeleteOut(
+        category_id=category_id,
+        message=f"Категория «{name}» отключена: у уже созданных уведомлений она сохранится",
+    )
+
+
+def _category_error(exc: Exception) -> HTTPException:
+    """Ошибка категории: дубль имени — `409`, остальное — `422` (§11.5)."""
+    text = str(exc)
+    if "уже есть" in text:
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=text)
+    return HTTPException(status_code=HTTP_422, detail=text)
 

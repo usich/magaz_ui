@@ -6,7 +6,8 @@
 * `Command`             → §4.3 `commands`;
 * `JobLog`              → §4.4 `job_logs`;
 * `FileCheck`           → §4.5 `file_checks`;
-* `Notification`        → §4.6 `notifications`;
+* `Notification`        → §4.6 `notifications` (+ `category_id` из 1.22);
+* `NotificationCategory`→ §4.6 `notification_categories` (спека 1.22);
 * `NotificationTarget`  → §4.7 `notification_targets`;
 * `NotificationReceipt` → §4.8 `notification_receipts`;
 * `Setting`             → §4.9 `settings`;
@@ -46,6 +47,7 @@ __all__ = [
     "FileCheck",
     "JobLog",
     "Notification",
+    "NotificationCategory",
     "NotificationReceipt",
     "NotificationTarget",
     "Setting",
@@ -300,6 +302,37 @@ class StoreDevice(TimestampMixin, Base):
         return f"<StoreDevice id={self.id} ip={self.ip_address!r} status={self.last_status!r}>"
 
 
+class NotificationCategory(TimestampMixin, Base):
+    """Категория уведомления — «Продажи», «Закупки» и т. п. (§4.6, спека 1.22).
+
+    Категории заводит админ в разделе уведомлений: они не заменяют важность, а
+    дополняют её — касса умеет группировать список и по важности, и по категории.
+    Удаление — мягкое (`is_active=false`): у уже разосланных уведомлений
+    категория остаётся в истории и отчёте (§11.5).
+    """
+
+    __tablename__ = "notification_categories"
+    __table_args__ = (UniqueConstraint("name", name="uq_notification_categories_name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    #: Цвет плашки в окне кассы и админке: `#RRGGBB` из палитры (§11.5)
+    color: Mapped[str] = mapped_column(
+        String(9), default="#64748b", server_default="#64748b", nullable=False
+    )
+    #: Порядок в списках: админ расставляет категории в нужной ему последовательности
+    sort_order: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False, index=True
+    )
+    created_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    def __repr__(self) -> str:  # pragma: no cover - отладка
+        return f"<NotificationCategory id={self.id} name={self.name!r}>"
+
+
 class Notification(TimestampMixin, Base):
     """Уведомление пользователям магазинов (§4.6, ФН3, П-2)."""
 
@@ -314,6 +347,12 @@ class Notification(TimestampMixin, Base):
         String(8), default="plain", server_default="plain", nullable=False
     )
     severity: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    #: 1.22: информационная категория («Продажи», «Закупки»); `NULL` — без категории
+    category_id: Mapped[int | None] = mapped_column(
+        ForeignKey("notification_categories.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     requires_ack: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False
     )
@@ -321,9 +360,6 @@ class Notification(TimestampMixin, Base):
     target_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     repeat_every_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    use_msg_exe: Mapped[bool] = mapped_column(
-        Boolean, default=True, server_default=true(), nullable=False
-    )
     #: Э9: «удалять после прочтения». `false` (по умолчанию) — прочитанное
     #: остаётся на кассе справочником, `true` — исчезает после «Ознакомлен»
     delete_after_read: Mapped[bool] = mapped_column(
@@ -334,6 +370,7 @@ class Notification(TimestampMixin, Base):
     )
     created_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
+    category: Mapped["NotificationCategory | None"] = relationship()
     targets: Mapped[list["NotificationTarget"]] = relationship(
         back_populates="notification",
         cascade="all, delete-orphan",

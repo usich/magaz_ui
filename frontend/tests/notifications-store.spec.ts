@@ -55,7 +55,7 @@ function makeNotification(overrides: Record<string, unknown> = {}): Record<strin
     target_value: null,
     deadline_at: null,
     repeat_every_min: null,
-    use_msg_exe: true,
+    category: null,
     is_active: true,
     state: 'active',
     created_by: 'admin',
@@ -194,7 +194,7 @@ describe('стор уведомлений', () => {
       requires_ack: true,
       target_type: 'stores',
       store_ids: [5, 6],
-      use_msg_exe: true,
+      category_id: null,
     })
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
@@ -217,7 +217,7 @@ describe('стор уведомлений', () => {
       severity: 'info',
       requires_ack: false,
       target_type: 'all',
-      use_msg_exe: true,
+      category_id: null,
     })
 
     expect(response).toBeNull()

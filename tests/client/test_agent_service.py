@@ -134,7 +134,10 @@ class TestDeployContract:
 
         assert 'name="MagazTrayAgent"' in spec
         assert "console=False" in spec, "чёрное окно на экране кассира недопустимо"
-        assert "pystray" in spec and "tkinter" in spec
+        assert "PySide6.QtWidgets" in spec, "интерфейс трея — Qt (спека 1.22)"
+        assert "pystray" in spec and "tkinter" in spec, (
+            "прежние библиотеки должны быть исключены из сборки"
+        )
 
     def test_install_script_registers_service_and_task(self) -> None:
         script = read_deploy("install_agent.bat")

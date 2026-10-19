@@ -28,6 +28,7 @@ from server.core.context import AppContext, build_app_context
 from server.core.dispatcher import CommandDispatcher
 from server.core.health_monitor import HealthMonitor
 from server.core.logging_setup import configure_logging
+from server.db.migrations import run_migrations
 from server.services import settings_service
 from shared.version import APP_NAME, APP_VERSION
 
@@ -67,6 +68,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     monitor: HealthMonitor | None = None
     dispatcher: CommandDispatcher | None = None
     try:
+        # Автоприменение миграций: идемпотентный `alembic upgrade head`. Защищает
+        # от `no such column`, когда к рабочей БД ещё не подошла миграция, но
+        # таблицы уже есть (иначе `_assert_schema_ready` пропустит, а первый
+        # запрос упадёт). Отключается настройкой `MAGAZ_AUTO_MIGRATE=false`.
+        if settings.auto_migrate:
+            run_migrations(settings)
         _assert_schema_ready(context)
         with context.db.session() as session:
             added = settings_service.ensure_defaults(session)

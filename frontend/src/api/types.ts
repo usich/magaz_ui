@@ -452,6 +452,26 @@ export interface NotificationTotals {
   percent: number
 }
 
+/** Категория уведомления — «Продажи», «Закупки» (1.22, §4.6, §11.5). */
+export interface NotificationCategory {
+  id: number
+  name: string
+  /** Цвет плашки `#RRGGBB` из палитры сервера. */
+  color: string
+  sort_order: number
+  is_active: boolean
+  created_by: string | null
+  created_at: string | null
+}
+
+/** Тело создания/изменения категории (`POST/PUT /admin/notification-categories`). */
+export interface NotificationCategoryPayload {
+  name: string
+  color?: string
+  sort_order?: number
+  is_active?: boolean | null
+}
+
 export interface NotificationItem {
   id: number
   title: string
@@ -463,12 +483,13 @@ export interface NotificationItem {
   /** Э9: имена картинок тела; готовый адрес строит потребитель (§7.4). */
   images: string[]
   severity: NotificationSeverity
+  /** 1.22: категория уведомления; `null` — без категории. */
+  category: NotificationCategory | null
   requires_ack: boolean
   target_type: NotificationTargetType
   target_value: string | null
   deadline_at: string | null
   repeat_every_min: number | null
-  use_msg_exe: boolean
   is_active: boolean
   state: NotificationState
   created_by: string | null
@@ -532,7 +553,8 @@ export interface NotificationCreatePayload {
   cluster?: string | null
   deadline_at?: string | null
   repeat_every_min?: number | null
-  use_msg_exe: boolean
+  /** 1.22: категория уведомления; `null` — без категории. */
+  category_id?: number | null
 }
 
 export interface NotificationCreateResponse {

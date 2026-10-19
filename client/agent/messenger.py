@@ -29,7 +29,6 @@ __all__ = [
     "TASKKILL_EXE",
     "kill_1c_processes",
     "send_windows_message",
-    "show_notification_message",
 ]
 
 #: Утилита показа сообщений и цель «все сессии этой машины» (перенос v2)
@@ -46,23 +45,6 @@ async def kill_1c_processes(*, provider: ProcessProvider | None = None) -> bool:
     args = [TASKKILL_EXE, *KILL_1CV8_ARGS]
     logger.info("Завершение процессов 1С: %s", " ".join(args))
     return await active.run_quiet(args)
-
-
-async def show_notification_message(
-    message: str, *, provider: ProcessProvider | None = None
-) -> bool:
-    """Показать уведомление во всех сессиях через `msg.exe` (ФН3, §7.4).
-
-    Отличие от `/send-message` принципиальное: здесь **нет** `taskkill` —
-    уведомление (даже `critical`) не имеет права прерывать работу с 1С. Это
-    дублирующий канал: если TrayAgent в сессии не запущен, окно покажет служба.
-    Отсутствие `msg.exe` (урезанные сборки Windows, Session 0) — не ошибка.
-    """
-    active = provider or DEFAULT_PROVIDER
-    shown = await active.run_quiet([MSG_EXE, MSG_TARGET, message])
-    if not shown:
-        logger.warning("Уведомление не продублировано: утилита msg.exe недоступна")
-    return shown
 
 
 async def send_windows_message(

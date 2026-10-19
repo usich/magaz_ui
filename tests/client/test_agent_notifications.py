@@ -339,39 +339,6 @@ class TestReceiptsAndMsgChannel:
         assert asyncio.run(monitor.flush()) == 1
         assert monitor.queue.dirty_states() == []
 
-    def test_msg_duplicate_once_and_without_killing_1c(self, tmp_path: Path) -> None:
-        monitor, _, provider = build_monitor(tmp_path)
-        monitor.queue.accept(notify_request(severity="critical"))
-
-        first = asyncio.run(monitor.send_msg_duplicates())
-        second = asyncio.run(monitor.send_msg_duplicates())
-
-        assert (first, second) == (1, 0), "дублирующий канал срабатывает один раз (§7.4)"
-        assert provider.commands == [
-            [
-                "msg",
-                "*/localhost",
-                "[CRITICAL] Смена закрывается\n\nСохраните смену и отключите кассу",
-            ]
-        ], "argv без shell (I-1)"
-        assert "taskkill" not in provider.commands[0], (
-            "уведомление не завершает 1С — это не /send-message (FR-8)"
-        )
-
-    def test_info_is_not_duplicated(self, tmp_path: Path) -> None:
-        monitor, _, provider = build_monitor(tmp_path)
-        monitor.queue.accept(notify_request(severity="info"))
-
-        assert asyncio.run(monitor.send_msg_duplicates()) == 0
-        assert provider.commands == [], "`info` ждёт пользователя, а не окно msg.exe (§7.4)"
-
-    def test_msg_disabled_by_config(self, tmp_path: Path) -> None:
-        monitor, _, provider = build_monitor(tmp_path, msg_enabled=False)
-        monitor.queue.accept(notify_request(severity="critical"))
-
-        assert asyncio.run(monitor.send_msg_duplicates()) == 0
-        assert provider.commands == []
-
     def test_poll_interval_comes_from_config(self, tmp_path: Path) -> None:
         monitor, _, _ = build_monitor(tmp_path, notifications_poll_sec=7)
 

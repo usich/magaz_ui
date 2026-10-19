@@ -468,7 +468,7 @@ def _create_notification_job(
         stores=stores,
         deadline_at=params.get("deadline_at"),
         repeat_every_min=params.get("repeat_every_min"),
-        use_msg_exe=bool(params.get("use_msg_exe", True)),
+        category_id=params.get("category_id"),
         created_by=author,
     )
     return notification.id, {"notification_id": notification.id}

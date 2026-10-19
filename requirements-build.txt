@@ -7,6 +7,7 @@
 pyinstaller==6.16.0
 # Служба Windows `MagazAgent` и команды install/start/stop/remove (§7.1)
 pywin32==311
-# Иконка TrayAgent в сессии пользователя (§7.4): pystray + Pillow для картинки
-pystray==0.19.5
-pillow==11.3.0
+# Интерфейс TrayAgent в сессии пользователя (спека 1.22, §7.4): Qt с настоящим
+# размытием фона (acrylic) и скруглениями. Прежняя пара pystray + tkinter удалена
+# вместе с дублирующим каналом msg.exe — окна рисует один стек Qt
+PySide6==6.10.0

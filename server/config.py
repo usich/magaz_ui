@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     database_url: str = ""
     sql_echo: bool = False
 
+    #: Автоприменение Alembic-миграций при старте (`alembic upgrade head` в
+    #: `lifespan`). Идемпотентно; защищает от «no such column», когда к рабочей
+    #: БД ещё не подошла миграция. В тестах выключено — там схему создаёт
+    #: `Base.metadata.create_all`.
+    auto_migrate: bool = True
+
     #: Секреты: пусто → ключи читаются/создаются в `server/data` (§8.3)
     secret_key: str = ""
     cookie_secret: str = ""

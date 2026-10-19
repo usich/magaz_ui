@@ -25,9 +25,9 @@ TrayAgent **не ходит в сеть**: он знает лишь `127.0.0.1:8
 пакет остаётся на диске (`reported=false`) и досылается следующим циклом, в том
 числе после перезапуска службы (§7.4).
 
-`msg.exe */localhost` для `important`/`critical` (если `msg_enabled`) —
-дублирующий канал службы для `important`/`critical`: он сработает, даже если
-TrayAgent в сессии не запущен (§7.4).
+**Спека 1.22:** дублирующий канал `msg.exe */localhost` удалён. Он рисовал
+«деревянное» системное окно по центру экрана, а единственный канал показа —
+тост TrayAgent в правом верхнем углу (§7.4).
 """
 
 from __future__ import annotations
@@ -43,13 +43,13 @@ from pathlib import Path
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from client.agent import messenger
 from client.agent.config import AgentConfig
 from client.agent.processes import DEFAULT_PROVIDER, ProcessProvider
 from shared.enums import NotificationSeverity, ReceiptStatus
 from shared.richtext import BODY_FORMAT_HTML, BODY_FORMAT_PLAIN, is_safe_image_name
 from shared.schemas import (
     AgentSession,
+    NotificationCategoryRef,
     NotificationPendingItem,
     NotifyRequest,
     ReceiptBatch,
@@ -67,7 +67,6 @@ __all__ = [
     "IMAGE_CACHE_DIR_NAME",
     "IMAGE_MEDIA_TYPES",
     "MAX_QUEUE",
-    "MSG_SEVERITIES",
     "RECEIPTS_STATUS_PATH",
     "RETRY_DELAY_SEC",
     "SESSION_STALE_HOURS",
@@ -109,11 +108,6 @@ def image_media_type(name: str) -> str:
     return IMAGE_MEDIA_TYPES.get(extension, DEFAULT_IMAGE_MEDIA_TYPE)
 #: §4.9: интервал возврата отложенного, если сервер его не прислал
 DEFAULT_SNOOZE_MIN = 15
-#: §4.6/§7.4: уровни, для которых служба дублирует показ через `msg.exe`
-MSG_SEVERITIES: tuple[str, ...] = (
-    str(NotificationSeverity.IMPORTANT),
-    str(NotificationSeverity.CRITICAL),
-)
 #: Сколько уведомлений держим в очереди: касса — не архив, но и не теряет важное
 MAX_QUEUE = 50
 #: Через сколько часов сессия считается «ушедшей» и не попадает в состав (§4.8)
@@ -138,19 +132,18 @@ class QueuedNotification(BaseModel):
     requires_ack: bool = False
     deadline_at: str | None = None
     repeat_every_min: int | None = None
-    use_msg_exe: bool = True
     #: §4.9, П-2: интервал возврата отложенного — приходит от сервера
     snooze_min: int = DEFAULT_SNOOZE_MIN
     store_id: int | None = None
     queued_at: str | None = None
-    #: Дублирующий канал `msg.exe` уже отработал: повторно не зовём (§7.4)
-    msg_sent: bool = False
     #: Э9: `plain` — простой текст, `html` — разметка из редактора (§4.6)
     body_format: str = BODY_FORMAT_PLAIN
     #: Э9: имена картинок тела — их касса скачивает в локальный кэш (§7.4)
     images: list[str] = Field(default_factory=list)
     #: Э9: `true` — прочитанное исчезает из окна, `false` — остаётся справочником
     delete_after_read: bool = False
+    #: 1.22: категория для группировки и плашки в окне кассы (§7.4)
+    category: NotificationCategoryRef | None = None
 
     @property
     def is_html(self) -> bool:
@@ -353,7 +346,6 @@ class NotificationQueue:
             requires_ack=bool(request.requires_ack),
             deadline_at=request.deadline_at,
             repeat_every_min=request.repeat_every_min,
-            use_msg_exe=bool(request.use_msg_exe),
             snooze_min=max(1, int(request.snooze_min or DEFAULT_SNOOZE_MIN)),
             store_id=request.store_id,
             queued_at=to_iso_z(utcnow()),
@@ -362,10 +354,11 @@ class NotificationQueue:
             body_format=request.body_format,
             images=[name for name in request.images if is_safe_image_name(name)],
             delete_after_read=bool(request.delete_after_read),
+            # 1.22: категория едет до окна — касса группирует по ней список (§7.4)
+            category=request.category,
         )
         existing = self.find(queued.id)
         if existing is not None:
-            queued.msg_sent = existing.msg_sent
             index = self._data.notifications.index(existing)
             self._data.notifications[index] = queued
         else:
@@ -490,6 +483,8 @@ class NotificationQueue:
                     body_format=item.body_format,
                     images=list(item.images),
                     delete_after_read=bool(item.delete_after_read),
+                    # 1.22: категория нужна окну для группировки и плашки (§7.4)
+                    category=item.category,
                 )
             )
 
@@ -522,6 +517,8 @@ class NotificationQueue:
                     body_format=item.body_format,
                     images=list(item.images),
                     delete_after_read=False,
+                    # 1.22: категория нужна окну и для справочника (§7.4)
+                    category=item.category,
                 )
             )
             if len(items) >= ARCHIVE_LIMIT:
@@ -689,37 +686,6 @@ class NotificationQueue:
     def has_pending_work(self) -> bool:
         """Есть ли что досылать — расписание спрашивает это перед отправкой."""
         return bool(self.dirty_states())
-
-    # --- Дублирующий канал `msg.exe` (§7.4) ---------------------------------
-
-    def msg_candidates(self, *, now: datetime | None = None) -> list[QueuedNotification]:
-        """Что дублировать через `msg.exe`: `important`/`critical`, один раз (§7.4)."""
-        moment = now or utcnow()
-        return [
-            item
-            for item in self._data.notifications
-            if str(item.severity) in MSG_SEVERITIES
-            and item.use_msg_exe
-            and not item.msg_sent
-            and not item.is_overdue(now=moment)
-        ]
-
-    def mark_msg_sent(self, notification_id: int) -> None:
-        """Запомнить, что дублирующий канал для уведомления уже отработал."""
-        item = self.find(notification_id)
-        if item is None:
-            return
-        item.msg_sent = True
-        self.save()
-
-
-def msg_text(item: QueuedNotification) -> str:
-    """Текст для `msg.exe`: заголовок и тело одним сообщением (§7.4).
-
-    `msg.exe` рисует обычное окно Windows, поэтому уровень важности попадает в
-    первую строку: пользователь видит, насколько это срочно.
-    """
-    return f"[{str(item.severity).upper()}] {item.title}\n\n{item.body}"
 
 
 class ReceiptSender:
@@ -1011,30 +977,12 @@ class NotificationMonitor:
         """Один проход расписания (§7.4)."""
         removed = self.queue.prune_sessions()
         expired = self.queue.expire_overdue()
-        duplicated = await self.send_msg_duplicates()
         flushed = await self.flush()
         return {
             "sessions_removed": removed,
             "expired": expired,
-            "msg_sent": duplicated,
             "flushed": flushed,
         }
-
-    async def send_msg_duplicates(self) -> int:
-        """Дублирующий канал `msg.exe */localhost` для `important`/`critical` (§7.4).
-
-        Результат пишется в лог, а уведомление помечается обработанным: «нет
-        сеансов» — нормальная ситуация для выключенного ПК, и звать `msg.exe`
-        бесконечно нельзя. Показ в сессии всё равно делает TrayAgent.
-        """
-        if not self.config.msg_enabled:
-            return 0
-        sent = 0
-        for item in self.queue.msg_candidates():
-            await messenger.show_notification_message(msg_text(item), provider=self.provider)
-            self.queue.mark_msg_sent(item.id)
-            sent += 1
-        return sent
 
     async def flush(self) -> int:
         """Дослать подтверждения; сервер не принял — они остаются в очереди (§7.4)."""

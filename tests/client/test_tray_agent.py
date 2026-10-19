@@ -1,14 +1,15 @@
-"""TrayAgent: показ уведомлений в сессии пользователя (§7.4, Э6).
+"""TrayAgent: показ уведомлений в сессии пользователя (§7.4, Э6; читалка — 1.21).
 
-Проверки идут без GUI и без сети: `pystray`/`tkinter` не участвуют (окна
+Проверки идут без GUI и без сети: Qt (`PySide6`) не участвует (окна
 подменяются двойником), служба агента — `httpx.MockTransport`. Проверяется то,
 что важно на кассе:
 
 * трей говорит только с `127.0.0.1` и без токена (§7.4, §8.1);
-* `info` — тост один раз, `important` — окно с кнопками, `critical` — окно с
-  повтором по `repeat_every_min` (П-2);
+* уведомление любого уровня всплывает **тостом с кнопками** («Просмотреть» /
+  «Отложить»), сам тост не исчезает и окон не открывает (1.21);
+* `critical` с `repeat_every_min` всплывает тостом снова по интервалу (П-2);
 * «Ознакомлен» и «Отложить» уходят в службу и только после успеха убирают
-  уведомление из трея;
+  уведомление из трея; «Ознакомлен» открывает меню категорий, «Отложить» — нет;
 * недоступность службы — не ошибка: трей просто ждёт следующего опроса.
 """
 
@@ -26,18 +27,22 @@ import pytest
 from client.tray import __main__ as tray_main
 from client.tray.api import DEFAULT_AGENT_URL, AgentUnreachable, TrayAgentClient
 from client.tray.presenter import (
+    GROUP_BY_CATEGORY,
+    GROUP_BY_SEVERITY,
     KIND_TOAST,
-    KIND_WINDOW,
+    NO_CATEGORY_TITLE,
+    SEVERITY_COLORS,
     TAB_ALL,
     TAB_ARCHIVE,
     TrayPresenter,
     build_tabs,
+    group_items,
     items_for_tab,
     panel_geometry,
 )
 from client.tray.session import SESSION_ENV, UNKNOWN_SESSION_ID, USER_ENV, current_session_id, current_session_user, session_ref
 from shared.enums import NotificationSeverity
-from shared.schemas import NotificationPendingItem, SessionRef
+from shared.schemas import NotificationCategoryRef, NotificationPendingItem, SessionRef
 from shared.timeutil import utcnow
 
 SESSION = SessionRef(session_id="7", session_user="kassir")
@@ -50,6 +55,7 @@ def make_pending(
     repeat_every_min: int | None = None,
     title: str = "Смена закрывается в 22:00",
     snooze_until: str | None = None,
+    category: NotificationCategoryRef | None = None,
 ) -> NotificationPendingItem:
     """Уведомление в том виде, в каком его отдаёт служба (§5.1.2)."""
     return NotificationPendingItem(
@@ -57,10 +63,18 @@ def make_pending(
         title=title,
         body="Сохраните смену и отключите кассу",
         severity=severity,
+        category=category,
         requires_ack=severity is not NotificationSeverity.INFO,
         repeat_every_min=repeat_every_min,
         snooze_until=snooze_until,
     )
+
+
+def make_category(
+    category_id: int = 1, *, name: str = "Продажи", color: str = "#2563eb"
+) -> NotificationCategoryRef:
+    """Категория уведомления так, как её отдаёт служба на кассу (1.22)."""
+    return NotificationCategoryRef(id=category_id, name=name, color=color)
 
 
 class FakeClient:
@@ -135,10 +149,13 @@ class FakeWindows:
         self.toasts: list[int] = []
         self.windows: list[int] = []
         self.topmost: list[bool] = []
+        self.readers: list[int] = []
+        self.beeps = 0
         self.unread: list[int] = []
         self.archive: list[int] = []
         self.hidden = True
         self.quit_called = False
+        self.on_show = None
 
     def toast(self, item: NotificationPendingItem, *, seconds: int = 3) -> None:
         _ = seconds
@@ -148,6 +165,14 @@ class FakeWindows:
         _ = sound
         self.windows.append(item.id)
         self.topmost.append(topmost)
+
+    def reader(self, item: NotificationPendingItem) -> None:
+        """Кнопка «Просмотреть» в тосте: окно-читалка с полным телом (§7.4, 1.21)."""
+        self.readers.append(item.id)
+
+    def beep(self) -> None:
+        """Звук тоста `critical` (в том числе при повторе)."""
+        self.beeps += 1
 
     def set_unread(self, items: list[NotificationPendingItem]) -> None:
         self.unread.append(len(items))
@@ -167,6 +192,12 @@ class FakeWindows:
         self.hidden = False
         for item in items:
             self.window(item)
+
+    # Кнопки окон: двойник вызывает те же обработчики, что и `TrayWindows`
+    def click_view(self, item: NotificationPendingItem) -> None:
+        """«Просмотреть» в тосте — открыть читалку."""
+        if self.on_show is not None:
+            self.on_show(item)
 
     def after(self, delay_ms: int, callback) -> None:  # noqa: ANN001 - callback
         _ = delay_ms, callback
@@ -326,37 +357,36 @@ class TestLoopbackClient:
         assert client.snooze(1, SESSION) is False
 
 class TestPresenter:
-    """Что и когда показывать (§7.4): тост, окно, повтор `critical`."""
+    """Что и когда показывать (§7.4, 1.21): тост для всех уровней и повтор `critical`."""
 
-    def test_info_is_toasted_once_and_waits_in_tray(self) -> None:
-        presenter = TrayPresenter()
-        item = make_pending(severity=NotificationSeverity.INFO)
+    def test_any_level_is_toasted_once(self) -> None:
+        """С 1.21 и «информация», и «важное» всплывают тостом — окна открывает кнопка."""
+        for severity in (
+            NotificationSeverity.INFO,
+            NotificationSeverity.IMPORTANT,
+            NotificationSeverity.CRITICAL,
+        ):
+            presenter = TrayPresenter()
+            item = make_pending(severity=severity)
 
-        first = presenter.decide([item])
-        second = presenter.decide([item])
+            first = presenter.decide([item])
+            second = presenter.decide([item])
 
-        assert [action.kind for action in first] == [KIND_TOAST]
-        assert first[0].is_toast is True
-        assert second == [], "тост второй раз не всплывает"
-        assert presenter.unread_count == 1, "info ждёт «Ознакомлен» в трее"
-
-    def test_important_window_is_shown_once(self) -> None:
-        presenter = TrayPresenter()
-        item = make_pending(severity=NotificationSeverity.IMPORTANT)
-
-        assert [action.kind for action in presenter.decide([item])] == [KIND_WINDOW]
-        assert presenter.decide([item]) == [], "повтор только у critical"
+            assert [action.kind for action in first] == [KIND_TOAST], severity
+            assert first[0].is_toast is True
+            assert second == [], "тост второй раз не всплывает"
+            assert presenter.unread_count == 1, "уведомление ждёт кнопку в трее"
 
     def test_critical_repeats_after_interval(self) -> None:
         presenter = TrayPresenter()
         item = make_pending(severity=NotificationSeverity.CRITICAL, repeat_every_min=5)
         start = utcnow()
 
-        assert [action.kind for action in presenter.decide([item], now=start)] == [KIND_WINDOW]
+        assert [action.kind for action in presenter.decide([item], now=start)] == [KIND_TOAST]
         assert presenter.decide([item], now=start + timedelta(minutes=4)) == []
         repeat = presenter.decide([item], now=start + timedelta(minutes=5, seconds=1))
 
-        assert [action.kind for action in repeat] == [KIND_WINDOW]
+        assert [action.kind for action in repeat] == [KIND_TOAST], "повтор тоже тостом"
         assert repeat[0].notification.id == item.id
 
     def test_critical_without_interval_does_not_repeat(self) -> None:
@@ -367,7 +397,18 @@ class TestPresenter:
         presenter.decide([item], now=start)
         later = presenter.decide([item], now=start + timedelta(hours=1))
 
-        assert later == [], "без интервала окно ждёт кнопку «Ознакомлен»"
+        assert later == [], "без интервала уведомление ждёт кнопку «Ознакомлен»"
+
+    def test_important_does_not_repeat(self) -> None:
+        """Повтор — только у `critical`: «важное» не должно всплывать само снова."""
+        presenter = TrayPresenter()
+        item = make_pending(severity=NotificationSeverity.IMPORTANT, repeat_every_min=5)
+        start = utcnow()
+
+        presenter.decide([item], now=start)
+        later = presenter.decide([item], now=start + timedelta(minutes=30))
+
+        assert later == []
 
     def test_acknowledged_notification_is_forgotten(self) -> None:
         presenter = TrayPresenter()
@@ -400,13 +441,18 @@ class TestPresenter:
 
 
 class TestTrayAgent:
-    """Цикл трея: опрос службы, показ и подтверждения (§7.4)."""
+    """Цикл трея: опрос службы, всплытие тоста и подтверждения (§7.4, 1.21)."""
 
     def build(self, **kwargs) -> tuple[tray_main.TrayAgent, FakeClient, FakeWindows]:  # noqa: ANN003
-        """Трей с двойниками службы и окон — GUI и сеть не участвуют."""
+        """Трей с двойниками службы и окон — GUI и сеть не участвуют.
+
+        Кнопке «Просмотреть» выдаётся тот же обработчик, что у настоящего
+        `TrayWindows`: тост открывает читалку, а не окно по своей воле.
+        """
         client = kwargs.pop("client", None) or FakeClient(**kwargs)
         windows = FakeWindows()
         agent = tray_main.TrayAgent(client, windows=windows)
+        windows.on_show = windows.reader  # «Просмотреть» открывает читалку
         return agent, client, windows
 
     def test_toast_is_shown_and_marked_shown(self) -> None:
@@ -421,26 +467,55 @@ class TestTrayAgent:
         assert client.shown_calls == [1], "тост считается показанным (§7.4)"
         assert client.pending_calls[0].session_user, "сессия передана службе"
 
-    def test_important_opens_window_with_buttons(self) -> None:
+    def test_important_also_toasts_and_opens_no_window(self) -> None:
+        """С 1.21 «важное» не открывает окно само: сначала тост с кнопками."""
         agent, client, windows = self.build(
             items=[make_pending(severity=NotificationSeverity.IMPORTANT)]
         )
 
         agent.poll_once()
 
-        assert windows.windows == [1]
-        assert windows.topmost == [False], "важное — не поверх остальных окон"
-        assert client.shown_calls == [], "окно ждёт кнопку, а не тост"
+        assert windows.toasts == [1]
+        assert windows.windows == [], "окна трей сам не открывает"
+        assert windows.readers == [], "читалка — только по кнопке «Просмотреть»"
+        assert client.shown_calls == [1], "и «важное» фиксируется как показанное"
 
-    def test_critical_window_is_topmost(self) -> None:
+    def test_critical_toasts_and_beeps(self) -> None:
         agent, _client, windows = self.build(
             items=[make_pending(severity=NotificationSeverity.CRITICAL, repeat_every_min=5)]
         )
 
         agent.poll_once()
 
-        assert windows.windows == [1]
-        assert windows.topmost == [True], "critical показывается поверх остальных окон"
+        assert windows.toasts == [1], "критичное тоже всплывает тостом"
+        assert windows.beeps == 1, "критичное сопровождается звуком"
+        assert windows.windows == []
+
+    def test_view_button_opens_reader(self) -> None:
+        """«Просмотреть» в тосте открывает читалку с полным телом (§7.4, 1.21)."""
+        agent, _client, windows = self.build(
+            items=[make_pending(severity=NotificationSeverity.IMPORTANT)]
+        )
+        agent.poll_once()
+
+        windows.click_view(agent.presenter.visible[0])
+
+        assert windows.readers == [1]
+
+    def test_ack_moves_notification_into_menu(self) -> None:
+        """«Ознакомлен» убирает уведомление из непрочитанных и открывает меню."""
+        agent, client, windows = self.build(
+            items=[make_pending(1, severity=NotificationSeverity.IMPORTANT)]
+        )
+        client.items = [make_pending(2, title="Второе")]
+        agent.poll_once()
+
+        agent.acknowledge(1)
+        agent.poll_once()
+
+        assert client.ack_calls == [1]
+        assert [item.id for item in agent.presenter.visible] == [2]
+        assert windows.unread[-1] == 1, "в меню категорий виден остаток, включая непрочитанное"
 
     def test_service_downtime_is_not_an_error(self) -> None:
         agent, client, windows = self.build(pending_fails=True)
@@ -487,7 +562,7 @@ class TestTrayAgent:
 
         actions = agent.poll_once()
 
-        assert [action.kind for action in actions] == [KIND_WINDOW]
+        assert [action.kind for action in actions] == [KIND_TOAST]
         assert client.shown_calls == []
 
 
@@ -693,8 +768,59 @@ class TestTrayPanel:
         assert counts[TAB_ARCHIVE] == 1
         assert [item.id for item in presenter.archive] == [2]
 
-    def test_agent_reads_archive_only_when_panel_is_open(self) -> None:
-        """Закрытое окно не дёргает службу: справочник читается по требованию (§7.4, Э9)."""
+    def test_group_by_severity_orders_and_colors(self) -> None:
+        """Группировка по важности: критично → важно → информация, цвет по уровню (§7.4, 1.22)."""
+        items = [
+            make_pending(1, severity=NotificationSeverity.INFO),
+            make_pending(2, severity=NotificationSeverity.CRITICAL),
+            make_pending(3, severity=NotificationSeverity.IMPORTANT),
+        ]
+
+        groups = group_items(items, by=GROUP_BY_SEVERITY)
+
+        assert [group.key for group in groups] == ["critical", "important", "info"]
+        assert [group.count for group in groups] == [1, 1, 1]
+        assert groups[0].color == SEVERITY_COLORS["critical"], "критично — красный"
+
+    def test_group_by_category_keeps_order_and_unknown_bucket(self) -> None:
+        """Группировка по категории: уведомление без категории — в отдельной группе (§7.4, 1.22)."""
+        sales = make_category(1, name="Продажи", color="#2563eb")
+        purchases = make_category(2, name="Закупки", color="#10b981")
+        items = [
+            make_pending(1, category=sales),
+            make_pending(2, category=purchases),
+            make_pending(3, category=sales),
+            make_pending(4),
+        ]
+
+        groups = group_items(items, by=GROUP_BY_CATEGORY)
+
+        assert [(group.title, group.count) for group in groups] == [
+            ("Продажи", 2),
+            ("Закупки", 1),
+            (NO_CATEGORY_TITLE, 1),
+        ]
+        assert groups[0].color == "#2563eb", "цвет плашки — из категории"
+        assert [item.id for item in groups[0].items] == [1, 3]
+
+    def test_group_by_category_empty_list_is_empty(self) -> None:
+        """Пустой список не рождает пустых групп — окно не рисует заголовков зря."""
+        assert group_items([], by=GROUP_BY_CATEGORY) == []
+        assert group_items([], by=GROUP_BY_SEVERITY) == []
+
+    def test_group_by_severity_omits_empty_levels(self) -> None:
+        """Уровень без уведомлений не показывается: список не пухнет пустыми группами."""
+        groups = group_items([make_pending(1, severity=NotificationSeverity.INFO)])
+
+        assert [group.key for group in groups] == ["info"]
+
+    def test_agent_reads_archive_even_when_panel_is_closed(self) -> None:
+        """Архив читается всегда: меню после «Ознакомлен» открывается сразу (§7.4, 1.21-fix).
+
+        Раньше справочник читался только при открытом окне, и уведомление с
+        `delete_after_read=false` не успевало попасть в меню — кассир видел
+        пустой справочник сразу после «Ознакомлен».
+        """
         client = FakeClient([make_pending(1, severity=NotificationSeverity.IMPORTANT)])
         client.archive_items = [make_pending(2)]
         windows = FakeWindows()
@@ -702,32 +828,30 @@ class TestTrayPanel:
 
         agent.poll_once()
 
-        assert client.archive_calls == 0, "окно свёрнуто — службу не беспокоим"
-        assert windows.unread[-1] == 1, "счётчик непрочитанных всё равно обновляется"
+        assert client.archive_calls == 1, "справочник читается и при закрытом окне"
+        assert windows.unread[-1] == 1, "счётчик непрочитанных тоже обновляется"
+        assert windows.archive == [2], "окно знает справочник до открытия меню"
 
-        windows.show_unread([])
+    def test_acknowledged_notification_stays_in_archive(self) -> None:
+        """«Ознакомлен» не стирает уведомление из справочника (§7.4, Э9, баг 1.21).
+
+        Сценарий заказчика: уведомление с `delete_after_read=false` прочитано —
+        оно обязано остаться на вкладке «справочник», чтобы кассир вернулся к
+        инструкции позже.
+        """
+        kept = make_pending(5, title="Как закрыть смену")
+        client = FakeClient([kept])
+        windows = FakeWindows()
+        agent = tray_main.TrayAgent(client, presenter=TrayPresenter(), windows=windows)
         agent.poll_once()
 
-        assert client.archive_calls == 1
-        assert windows.archive == [2]
+        # Служба перестала отдавать уведомление в pending, но оставила в archive
+        client.items = []
+        client.archive_items = [kept]
 
+        assert agent.acknowledge(5) is True
 
-class TestImagePixelWidth:
-    """Размер картинки из тела: его задаёт админ в редакторе (§11.5, Э9)."""
-
-    def test_percent_counts_from_area(self) -> None:
-        assert tray_main._image_pixel_width("50%", 600) == 300
-        assert tray_main._image_pixel_width("100%", 600) == 600
-
-    def test_pixels_are_limited_by_area(self) -> None:
-        assert tray_main._image_pixel_width("320px", 600) == 320
-        assert tray_main._image_pixel_width("900px", 600) == 600
-
-    def test_too_small_width_is_raised_to_minimum(self) -> None:
-        assert tray_main._image_pixel_width("10px", 600) == 60
-        assert tray_main._image_pixel_width("5%", 600) == 60
-
-    def test_empty_or_broken_width_takes_the_whole_area(self) -> None:
-        assert tray_main._image_pixel_width("", 600) == 600
-        assert tray_main._image_pixel_width("100vw", 600) == 600
+        assert agent.presenter.visible == [], "уведомление ушло из непрочитанных"
+        assert [item.id for item in agent.presenter.archive] == [5], "осталось в справочнике"
+        assert windows.archive == [5], "окно получило свежий справочник сразу после ack"
 

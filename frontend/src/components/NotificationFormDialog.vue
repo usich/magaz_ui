@@ -3,18 +3,20 @@
  * Форма уведомления (§11.5, ФН3, Э5): «Создать уведомление».
  *
  * Здесь же задаётся адресация («все / кластер / список магазинов»), необходимость
- * «Ознакомлен», дедлайн, интервал повтора для `critical` и дублирование через
- * `msg.exe` (§4.6). Интервал возврата отложенного здесь не настраивается: это
- * настройка сервера `notification_snooze_min` (§4.9, П-2), она едет на кассу
- * вместе с уведомлением.
+ * «Ознакомлен», дедлайн, интервал повтора для `critical` и категория (1.22, §4.6).
+ * Интервал возврата отложенного здесь не настраивается: это настройка сервера
+ * `notification_snooze_min` (§4.9, П-2), она едет на кассу вместе с уведомлением.
  *
  * Э9: текст набирается в редакторе (`RichTextEditor`) — с разметкой и картинками,
  * а «Просмотреть» показывает то же сообщение, что увидит кассир
  * (`NotificationBody`). Картинки уезжают одним запросом вместе с созданием: файл
  * должен лежать на сервере до первой доставки (§7.4), поэтому черновики редактора
  * уходят в `images`, а в теле остаются метки `magaz-image:<имя>`.
+ *
+ * Категория (1.22): группы «Продажи», «Закупки» — их заводит админ в разделе
+ * «Категории»; касса по ним группирует список уведомлений (§7.4).
  */
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
 import InputText from 'primevue/inputtext'
@@ -65,13 +67,18 @@ const form = reactive({
   cluster: '',
   deadline: '',
   repeat_every_min: '',
-  use_msg_exe: true,
+  category_id: null as number | null,
 })
 const formError = ref('')
 const isPreviewOpen = ref(false)
 
 const needsStores = computed(() => form.target_type === 'stores')
 const needsCluster = computed(() => form.target_type === 'cluster')
+
+onMounted(async () => {
+  // Категории нужны форме (1.22): список берётся один раз и обновляется разделом «Категории»
+  if (!notifications.categories.length) await notifications.loadCategories()
+})
 
 /** Тело без разметки: у HTML-тела в пустом `<p></p>` текста нет (§4.6). */
 const bodyPlainText = computed(() =>
@@ -92,7 +99,7 @@ function reset(): void {
   form.cluster = props.clusterOptions[0] ?? ''
   form.deadline = ''
   form.repeat_every_min = ''
-  form.use_msg_exe = true
+  form.category_id = null
   formError.value = ''
   isPreviewOpen.value = false
 }
@@ -145,7 +152,8 @@ async function submit(): Promise<void> {
     cluster: needsCluster.value ? form.cluster.trim() : null,
     deadline_at: deadlineIso(),
     repeat_every_min: repeat,
-    use_msg_exe: form.use_msg_exe,
+    // 1.22: категория необязательна — `null` значит «без категории» (§4.6)
+    category_id: form.category_id,
   })
 
   if (!response) {
@@ -309,13 +317,23 @@ function onDraftsUpdate(value: NotificationImageDraft[]): void {
         />
       </label>
 
+      <label class="space-y-1">
+        <span class="magaz-muted text-xs">Категория (необязательно)</span>
+        <select
+          v-model="form.category_id"
+          class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+          data-test="notify-form-category"
+        >
+          <option :value="null">без категории</option>
+          <option v-for="item in notifications.categories" :key="item.id" :value="item.id">
+            {{ item.name }}
+          </option>
+        </select>
+      </label>
+
       <label class="magaz-muted flex items-center gap-2 text-sm">
         <input v-model="form.requires_ack" type="checkbox" data-test="notify-form-ack" />
         требовать «Ознакомлен»
-      </label>
-      <label class="magaz-muted flex items-center gap-2 text-sm">
-        <input v-model="form.use_msg_exe" type="checkbox" data-test="notify-form-msg" />
-        дублировать важные через `msg.exe`
       </label>
       <label class="magaz-muted flex items-center gap-2 text-sm">
         <input

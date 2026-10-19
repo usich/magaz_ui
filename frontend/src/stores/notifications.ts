@@ -12,8 +12,10 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 import { ApiError } from '@/api/client'
-import { notificationsApi } from '@/api/endpoints'
+import { categoriesApi, notificationsApi } from '@/api/endpoints'
 import type {
+  NotificationCategory,
+  NotificationCategoryPayload,
   NotificationCreatePayload,
   NotificationCreateResponse,
   NotificationFilters,
@@ -218,6 +220,92 @@ export const useNotificationsStore = defineStore('notifications', () => {
   /** Интервал возврата отложенного — настройка сервера (§4.9, П-2). */
   const snoozeMin = computed(() => list.value?.snooze_min ?? 15)
 
+  // --- Категории уведомлений (спека 1.22, §11.5) ---------------------------
+
+  /** Активные категории: их предлагает форма создания уведомления. */
+  const categories = ref<NotificationCategory[]>([])
+  /** Все категории, включая отключённые: их показывает раздел «Категории». */
+  const allCategories = ref<NotificationCategory[]>([])
+  const isLoadingCategories = ref(false)
+
+  /**
+   * Палитра плашек (1.22, §11.5) — та же, что `notification_service.CATEGORY_COLORS`
+   * на сервере: сервер отвергает чужой цвет (`422`), поэтому UI предлагает выбор
+   * только из этого списка. Захардкожена осознанно: меняется вместе с сервером.
+   */
+  const CATEGORY_COLORS = [
+    '#64748b',
+    '#2563eb',
+    '#0ea5e9',
+    '#10b981',
+    '#f59e0b',
+    '#ef4444',
+    '#8b5cf6',
+    '#ec4899',
+  ] as const
+
+  /** Прочитать категории: `all` — вместе с отключёнными (для раздела «Категории»). */
+  async function loadCategories(all = false): Promise<void> {
+    isLoadingCategories.value = true
+    try {
+      const items = await categoriesApi.list(all)
+      if (all) {
+        allCategories.value = items
+        categories.value = items.filter((item) => item.is_active)
+      } else {
+        categories.value = items
+      }
+      errorMessage.value = ''
+    } catch (error) {
+      errorMessage.value =
+        error instanceof ApiError ? error.message : 'Не удалось получить категории'
+    } finally {
+      isLoadingCategories.value = false
+    }
+  }
+
+  /** Завести категорию; `null` — ошибку (в том числе дубль имени) показывает UI. */
+  async function createCategory(payload: NotificationCategoryPayload): Promise<boolean> {
+    try {
+      await categoriesApi.create(payload)
+      await loadCategories(true)
+      errorMessage.value = ''
+      return true
+    } catch (error) {
+      errorMessage.value = error instanceof ApiError ? error.message : 'Категория не создана'
+      return false
+    }
+  }
+
+  /** Изменить категорию: имя, цвет, порядок или включить отключённую обратно. */
+  async function updateCategory(
+    id: number,
+    payload: NotificationCategoryPayload,
+  ): Promise<boolean> {
+    try {
+      await categoriesApi.update(id, payload)
+      await loadCategories(true)
+      errorMessage.value = ''
+      return true
+    } catch (error) {
+      errorMessage.value = error instanceof ApiError ? error.message : 'Категория не изменена'
+      return false
+    }
+  }
+
+  /** Мягко отключить категорию: у уже созданных уведомлений она сохранится (§11.5). */
+  async function removeCategory(id: number): Promise<boolean> {
+    try {
+      await categoriesApi.remove(id)
+      await loadCategories(true)
+      errorMessage.value = ''
+      return true
+    } catch (error) {
+      errorMessage.value = error instanceof ApiError ? error.message : 'Категория не отключена'
+      return false
+    }
+  }
+
   /**
    * Счётчики вкладок по важности (Э9, §11.5).
    *
@@ -367,12 +455,20 @@ export const useNotificationsStore = defineStore('notifications', () => {
     severityTabs,
     pendingReceipts,
     snoozeMin,
+    categories,
+    allCategories,
+    isLoadingCategories,
+    CATEGORY_COLORS,
     load,
     loadReport,
     create,
     cancel,
     remove,
     removeImage,
+    loadCategories,
+    createCategory,
+    updateCategory,
+    removeCategory,
     csvUrl,
   }
 })

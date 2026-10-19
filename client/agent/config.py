@@ -96,7 +96,6 @@ class AgentConfig(BaseModel):
     base_1c_path: str = DEFAULT_BASE_1C_PATH
     default_file_name: str = DEFAULT_FILE_NAME
     one_c_profile: OneCProfile = Field(default_factory=OneCProfile)
-    msg_enabled: bool = True
     notifications_poll_sec: int = 20
     work_dir: str | None = None
 

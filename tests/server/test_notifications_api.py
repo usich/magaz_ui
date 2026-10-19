@@ -700,3 +700,141 @@ class TestDeleteNotification:
         assert "notification_delete" in actions
         assert auth_client.delete(f"{NOTIFICATIONS_URL}/{notification_id}").status_code == 404
 
+
+CATEGORIES_URL = "/api/v1/admin/notification-categories"
+
+
+def create_category(client: TestClient, **overrides: object) -> dict:
+    """Завести категорию через API — так же, как это делает админ (1.22, §11.5)."""
+    payload: dict = {"name": "Продажи", "color": "#2563eb", "sort_order": 1}
+    payload.update(overrides)
+    response = client.post(CATEGORIES_URL, json=payload)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+class TestNotificationCategories:
+    """Категории уведомлений (спека 1.22, §11.5): CRUD, проверки и привязка."""
+
+    def test_create_and_list_categories(self, auth_client: TestClient) -> None:
+        """Категория создаётся с цветом из палитры и видна в списке (§11.5, 1.22)."""
+        created = create_category(auth_client)
+
+        assert created["name"] == "Продажи"
+        assert created["color"] == "#2563eb"
+        assert created["is_active"] is True
+
+        items = auth_client.get(CATEGORIES_URL).json()
+        assert [item["name"] for item in items] == ["Продажи"]
+
+    def test_duplicate_name_is_conflict(self, auth_client: TestClient) -> None:
+        """Дубль имени — `409`: админ не заводит вторую «Продажи» (§11.5)."""
+        create_category(auth_client, name="Закупки")
+
+        response = auth_client.post(CATEGORIES_URL, json={"name": "закупки"})
+
+        assert response.status_code == 409, response.text
+        assert "уже есть" in response.json()["detail"]
+
+    def test_unknown_color_is_rejected(self, auth_client: TestClient) -> None:
+        """Цвет — только из палитры: плашки читаются и на тёмном, и на светлом (§11.5)."""
+        response = auth_client.post(
+            CATEGORIES_URL, json={"name": "Продажи", "color": "#123456"}
+        )
+
+        assert response.status_code == 422, response.text
+
+    def test_update_category(self, auth_client: TestClient) -> None:
+        """Категорию можно переименовать и сменить цвет (§11.5, 1.22)."""
+        created = create_category(auth_client)
+
+        response = auth_client.put(
+            f"{CATEGORIES_URL}/{created['id']}",
+            json={"name": "Продажи и маркетинг", "color": "#10b981"},
+        )
+
+        assert response.status_code == 200, response.text
+        updated = response.json()
+        assert updated["name"] == "Продажи и маркетинг"
+        assert updated["color"] == "#10b981"
+
+    def test_soft_delete_hides_from_active_list(self, auth_client: TestClient) -> None:
+        """Мягкое удаление: категория уходит из выбора, но остаётся в справочнике (§11.5)."""
+        created = create_category(auth_client)
+
+        response = auth_client.delete(f"{CATEGORIES_URL}/{created['id']}")
+
+        assert response.status_code == 200, response.text
+        assert auth_client.get(CATEGORIES_URL).json() == []
+        all_items = auth_client.get(CATEGORIES_URL, params={"include_inactive": True}).json()
+        assert [item["name"] for item in all_items] == ["Продажи"]
+        assert all_items[0]["is_active"] is False
+
+    def test_delete_missing_category_is_404(self, auth_client: TestClient) -> None:
+        """Неизвестная категория — `404` (§11.5)."""
+        assert auth_client.delete(f"{CATEGORIES_URL}/999").status_code == 404
+
+    def test_notification_carries_category(  # noqa: ANN001
+        self, auth_client: TestClient, store: Store
+    ) -> None:
+        """Уведомление создаётся с категорией, и она видна в списке (§11.5, 1.22)."""
+        category = create_category(auth_client)
+
+        created = create_notification(
+            auth_client,
+            category_id=category["id"],
+            target_type="stores",
+            store_ids=[store.id],
+        )
+
+        assert created["notification"]["category"]["name"] == "Продажи"
+        assert created["notification"]["category"]["color"] == "#2563eb"
+
+        items = auth_client.get(NOTIFICATIONS_URL).json()["items"]
+        assert items[0]["category"]["id"] == category["id"]
+
+    def test_notification_without_category(  # noqa: ANN001
+        self, auth_client: TestClient, store: Store
+    ) -> None:
+        """Без категории уведомление создаётся как раньше: `category=null` (§11.5)."""
+        created = create_notification(
+            auth_client, target_type="stores", store_ids=[store.id]
+        )
+
+        assert created["notification"]["category"] is None
+
+    def test_push_payload_brings_category_to_agent(  # noqa: ANN001
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """Категория уезжает на кассу вместе с уведомлением (§7.4, 1.22)."""
+        category = create_category(auth_client)
+        created = create_notification(
+            auth_client,
+            category_id=category["id"],
+            target_type="stores",
+            store_ids=[store.id],
+        )
+        notification = notification_service.get_notification(
+            session, created["notification"]["id"]
+        )
+
+        payload = notification_service.push_payload(session, store, notification)
+
+        assert payload.category is not None
+        assert payload.category.name == "Продажи"
+        assert payload.category.color == "#2563eb"
+
+    def test_categories_require_authorization(self, make_client) -> None:  # noqa: ANN001
+        """Эндпоинт защищён по умолчанию: без сессии — `401` (§8.1)."""
+        client = make_client()
+
+        assert client.get(CATEGORIES_URL).status_code == 401
+        assert client.post(CATEGORIES_URL, json={"name": "Продажи"}).status_code == 401
+
+    def test_create_records_audit(self, auth_client: TestClient, session: Session) -> None:
+        """Создание категории попадает в аудит (§4.10)."""
+        create_category(auth_client)
+
+        actions = [row.action for row in session.scalars(select(AuditLog)).all()]
+        assert "notification_category_create" in actions
+

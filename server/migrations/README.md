@@ -12,6 +12,19 @@ alembic revision --autogenerate -m "что изменено"   # новая ми
 alembic downgrade -1                 # откат последней (SQLite: batch-режим включён)
 ```
 
+## Автоприменение при старте сервера
+
+Сервер применяет ожидающие миграции сам: в `lifespan` (`server/main.py`) перед
+проверкой схемы вызывается `server/db/migrations.run_migrations` — идемпотентный
+`alembic upgrade head`. Это защищает от «no such column», когда к рабочей БД ещё
+не подошла миграция. Управляется настройкой `MAGAZ_AUTO_MIGRATE` (по умолчанию
+`true`; `false` — вернуть ручной шаг). В тестах автоприменение выключено
+(`tests/server/conftest.py`): там схему создаёт `Base.metadata.create_all`.
+
+URL для миграций при автоприменении передаётся через `magaz.url_override`
+(`server/migrations/env.py`): `get_database_url` сначала смотрит его, затем — в
+настройки приложения, поэтому автоприменение и CLI `alembic` ходят в одну БД.
+
 Строка подключения берётся из `server/config.py` (`MAGAZ_DATABASE_URL`), поэтому
 `alembic.ini` содержит только заглушку — правки в нём не нужны.
 

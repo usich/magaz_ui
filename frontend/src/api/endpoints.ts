@@ -26,6 +26,8 @@ import type {
   JobFilters,
   JobsPage,
   LoginPayload,
+  NotificationCategory,
+  NotificationCategoryPayload,
   NotificationCreatePayload,
   NotificationCreateResponse,
   NotificationDeleted,
@@ -341,5 +343,29 @@ export const notificationsApi = {
    */
   imageUrl: (id: number, name: string) =>
     `${API_BASE}/admin/notifications/${id}/images/${encodeURIComponent(name)}`,
+}
+
+/** Категории уведомлений (`/admin/notification-categories`, спека 1.22, §11.5). */
+export const categoriesApi = {
+  /**
+   * Категории уведомлений (1.22, §11.5): «Продажи», «Закупки» и прочие.
+   *
+   * По умолчанию сервер отдаёт только активные — их предлагает форма создания
+   * уведомления. `includeInactive` нужен разделу «Категории»: там админ видит и
+   * отключённые, чтобы вернуть категорию или переименовать её.
+   */
+  list: (includeInactive = false) =>
+    api.get<NotificationCategory[]>(
+      `/admin/notification-categories${includeInactive ? '?include_inactive=true' : ''}`,
+    ),
+  create: (payload: NotificationCategoryPayload) =>
+    api.post<NotificationCategory>('/admin/notification-categories', payload),
+  update: (id: number, payload: NotificationCategoryPayload) =>
+    api.put<NotificationCategory>(`/admin/notification-categories/${id}`, payload),
+  /** Мягкое удаление: `is_active=false`, уведомления сохраняют категорию (§11.5). */
+  remove: (id: number) =>
+    api.delete<{ category_id: number; message: string }>(
+      `/admin/notification-categories/${id}`,
+    ),
 }
 

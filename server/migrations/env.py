@@ -32,7 +32,17 @@ target_metadata = Base.metadata
 
 
 def get_database_url() -> str:
-    """URL из настроек приложения (единая точка правды)."""
+    """URL для миграций.
+
+    Приоритет у явно переданного вызывающим кода значения (`magaz.url_override`,
+    его задаёт `server/db/migrations.run_migrations` при автоприменении на старте
+    сервера). Иначе — URL из настроек приложения (единая точка правды для CLI
+    `alembic upgrade head`). Заглушка из `alembic.ini` никогда не используется:
+    править ini не нужно, и сервер, и миграции смотрят в одну БД.
+    """
+    override = config.get_main_option("magaz.url_override")
+    if override:
+        return override
     return get_settings().database_url
 
 

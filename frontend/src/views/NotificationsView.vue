@@ -283,6 +283,14 @@ function formatTime(value: string | null): string {
               >
                 {{ row.title }}
               </RouterLink>
+              <span
+                v-if="row.category"
+                class="ml-2 inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium text-white align-middle"
+                :style="{ backgroundColor: row.category.color }"
+                :data-test="`notification-category-${row.id}`"
+              >
+                {{ row.category.name }}
+              </span>
               <div class="magaz-muted text-xs">{{ bodyText(row) }}</div>
               <div
                 v-if="row.body_format === 'html' || row.images.length || row.delete_after_read"

@@ -37,6 +37,7 @@ __all__ = [
     "JobStateResponse",
     "MergeParams",
     "MessageParams",
+    "NotificationCategoryRef",
     "NotificationPendingItem",
     "NotifyRequest",
     "ReceiptReport",
@@ -242,6 +243,8 @@ class NotifyRequest(BaseModel):
     #: Э9: `plain` — простой текст, `html` — разметка из редактора (§4.6)
     body_format: str = "plain"
     severity: NotificationSeverity = NotificationSeverity.INFO
+    #: 1.22: информационная категория («Продажи», «Закупки»); `None` — без категории
+    category: "NotificationCategoryRef | None" = None
     requires_ack: bool = False
     #: Э9: прочитанное уведомление исчезает с кассы или остаётся справочником
     delete_after_read: bool = False
@@ -249,7 +252,6 @@ class NotifyRequest(BaseModel):
     images: list[str] = Field(default_factory=list)
     deadline_at: str | None = None
     repeat_every_min: int | None = None
-    use_msg_exe: bool = True
     snooze_min: int = 15
     store_id: int | None = None
 
@@ -259,6 +261,19 @@ class NotifyRequest(BaseModel):
         if not value.strip():
             raise ValueError("Значение не может быть пустым")
         return value
+
+
+class NotificationCategoryRef(BaseModel):
+    """Категория уведомления в том виде, в каком её видит касса (1.22, §7.4).
+
+    Только то, что нужно окну: имя для плашки и цвет. Ни `sort_order`, ни
+    `is_active` на кассе не нужны — порядок задаёт админка, а неактивные
+    категории в списке уже не появляются.
+    """
+
+    id: int
+    name: str
+    color: str = "#64748b"
 
 
 class NotificationPendingItem(BaseModel):
@@ -274,6 +289,8 @@ class NotificationPendingItem(BaseModel):
     #: справочником; решение принимает касса, сервер только передаёт признак (§7.4)
     delete_after_read: bool = False
     severity: NotificationSeverity
+    #: 1.22: категория для группировки и плашки; `None` — уведомление без категории
+    category: NotificationCategoryRef | None = None
     requires_ack: bool
     repeat_every_min: int | None = None
     snooze_until: str | None = None

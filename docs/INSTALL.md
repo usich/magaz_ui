@@ -59,7 +59,11 @@ python -m venv .venv
 deploy\run_server.bat
 ```
 
-* `alembic upgrade head` создаёт `server\data\magaz.db` и применяет миграции (§4);
+* `alembic upgrade head` создаёт `server\data\magaz.db` и применяет миграции (§4).
+  **Необязателен**: сервер применяет миграции сам при старте (`MAGAZ_AUTO_MIGRATE`,
+  по умолчанию `true`) — идемпотентный `alembic upgrade head` в `lifespan`. Команда
+  оставлена как явный ручной шаг: она сразу создаёт БД и не даёт сюрпризов при первом
+  подъёме сервера;
 * `create-admin` спросит пароль интерактивно — так он не остаётся в истории команд;
 * `info` показывает версию, путь к БД, состояние `frontend\dist` и адрес для агентов;
 * SPA отдаётся сервером: `GET /` открывает дашборд, `GET /api/docs` — OpenAPI (§5.2.1).
@@ -73,6 +77,7 @@ deploy\run_server.bat
 |---|---|---|
 | `MAGAZ_HOST`, `MAGAZ_PORT` | `0.0.0.0`, `8080` | адрес и порт дашборда |
 | `MAGAZ_DATABASE_URL` | `sqlite:///server/data/magaz.db` | SQLite; для PostgreSQL — своя строка |
+| `MAGAZ_AUTO_MIGRATE` | `true` | применять `alembic upgrade head` при старте сервера (идемпотентно) |
 | `MAGAZ_PUBLIC_SERVER_URL` | пусто | адрес, который попадает в блок конфига агента (§11.2) |
 | `MAGAZ_COOKIE_SECURE` | `false` | `true` при работе через HTTPS-туннель (§8.2) |
 | `MAGAZ_SERVE_SPA` | `true` | отдавать SPA из `frontend\dist` |
@@ -162,8 +167,10 @@ deploy\run_server.bat
 `notifications.json`, если он нужен для отчёта, — `docs\RUNBOOK.md`).
 
 **Сервер.** Остановить процесс → скопировать `server\data` целиком (`magaz.db`,
-`secrets.key`, `cookie_secret.key`) → заменить код и `frontend\dist` → запустить →
-`alembic upgrade head`, если в поставке есть новые миграции.
+`secrets.key`, `cookie_secret.key`) → заменить код и `frontend\dist` → запустить
+новые миграции применятся сами при старте сервера (`MAGAZ_AUTO_MIGRATE`); отдельный
+ручной `alembic upgrade head` после обновления не обязателен — это запасной шаг на
+случай отключённого автоприменения.
 
 ---
 

@@ -36,7 +36,7 @@ function makeNotification(overrides: Record<string, unknown> = {}): Record<strin
     target_value: null,
     deadline_at: null,
     repeat_every_min: null,
-    use_msg_exe: true,
+    category: null,
     is_active: true,
     state: 'active',
     created_by: 'admin',

@@ -626,9 +626,6 @@ def create_agent_app(
         появится, когда пользователь войдёт (§7.4).
         """
         result = notifications_queue.accept(payload)
-        # Дублирующий канал `msg.exe` — сразу, не дожидаясь цикла расписания
-        if payload.use_msg_exe and str(payload.severity) in notifications.MSG_SEVERITIES:
-            spawn(notification_monitor.send_msg_duplicates(), name="agent-notify-msg")
         # Э9: картинки тела скачиваются фоном — касса не ждёт сеть, а окно покажет их
         # из локального кэша, когда пользователь откроет уведомление (§7.4)
         if payload.images:

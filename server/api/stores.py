@@ -242,7 +242,6 @@ def build_agent_config_block(store: Store, *, server_url: str) -> AgentConfigOut
             "password_enc": None,
             "credentials_version": store.credentials_version,
         },
-        "msg_enabled": True,
         "notifications_poll_sec": 20,
         "work_dir": None,
         "devices_version": store.devices_version,
