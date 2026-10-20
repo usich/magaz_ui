@@ -244,15 +244,34 @@ def _connection_args(params: Base1CParams) -> list[str]:
 def build_merge_command(params: MergeParams, log_path: Path, paths: OneCPaths) -> list[str]:
     """Слияние основной конфигурации (FR-3) или расширения (FR-4).
 
-    Перенос v2 без изменений логики: `/MergeCfg <file>.cf -force -Settings <file>.xml`
-    (`full_merge.xml` при `full_merge=true`); для расширения — `/Extension <name>
-    /MergeCfg <file>.cfe -force` и **без** `-Settings`.
+    Оба случая идут через `/MergeCfg <файл> [-Extension <имя>] -force -Settings <файл>.xml`.
+    Для основной конфигурации settings-файл: `full_merge.xml` при `full_merge=true`,
+    иначе `<file_name>.xml`. Для расширения — всегда `full_merge.xml` по умолчанию,
+    а при частичном слиянии (`settings_file_name` задан) — `<settings_file_name>.xml`.
+    Порядок `-Extension <имя>` сразу после файла и `-force -Settings` подтверждён
+    рабочим вызовом на 8.3.27 (успешное слияние).
     """
     args = [str(paths.executable(params.version_1c)), "CONFIG", *_connection_args(params)]
 
     if params.extension_name:
         source_file = paths.update_file(params.file_name, ".cfe")
-        args += ["/Extension", params.extension_name, "/MergeCfg", str(source_file), "-force"]
+        if params.settings_file_name:
+            setting_file = paths.update_file(params.settings_file_name, ".xml")
+        else:
+            setting_file = paths.settings_full_merge
+        # Расширение объединяется `/MergeCfg <file>.cfe -Extension <имя> -force
+        # -Settings <file>.xml` (проверено на 8.3.27). По умолчанию settings —
+        # `full_merge.xml`; при частичном слиянии (`settings_file_name`) —
+        # `<settings_file_name>.xml`.
+        args += [
+            "/MergeCfg",
+            str(source_file),
+            "-Extension",
+            params.extension_name,
+            "-force",
+            "-Settings",
+            str(setting_file),
+        ]
     else:
         source_file = paths.update_file(params.file_name, ".cf")
         setting_file = paths.merge_settings(params.file_name, full_merge=params.full_merge)

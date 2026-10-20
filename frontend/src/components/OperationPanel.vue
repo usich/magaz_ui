@@ -55,6 +55,7 @@ const merge = reactive({
   file_name: props.defaultFileName,
   full_merge: false,
   extension_name: '',
+  settings_file_name: '',
 })
 const update = reactive({ is_fast_update: false, extension_name: '' })
 const message = reactive({ text_message: '' })
@@ -198,7 +199,24 @@ async function run(
           </label>
           <label class="flex items-center gap-2 text-sm">
             <Checkbox v-model="merge.full_merge" binary input-id="full-merge" />
-            <span>Слияние с <span class="magaz-mono">full_merge.xml</span></span>
+            <span v-if="merge.extension_name.trim()">
+              Частичное слияние (задать файл настроек)
+            </span>
+            <span v-else>Слияние с <span class="magaz-mono">full_merge.xml</span></span>
+          </label>
+          <label
+            v-if="merge.extension_name.trim() && merge.full_merge"
+            class="block space-y-1"
+          >
+            <span class="magaz-muted text-xs">
+              Имя файла настроек (без расширения)
+            </span>
+            <InputText
+              v-model="merge.settings_file_name"
+              class="w-full"
+              placeholder="частичное_слияние"
+              :pt="{ root: { 'data-test': 'merge-settings-file' } }"
+            />
           </label>
           <Button
             label="Запустить слияние"
@@ -215,6 +233,9 @@ async function run(
                   full_merge: merge.full_merge,
                   ...(merge.extension_name.trim()
                     ? { extension_name: merge.extension_name.trim() }
+                    : {}),
+                  ...(merge.full_merge && merge.settings_file_name.trim()
+                    ? { settings_file_name: merge.settings_file_name.trim() }
                     : {}),
                 },
                 'Слияние поставлено в очередь',

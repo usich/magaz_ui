@@ -84,12 +84,19 @@ class TestAuthentication:
             ("get", JOBS_URL),
             ("get", f"{JOBS_URL}/1"),
             ("get", FILES_URL),
+            ("delete", f"{JOBS_URL}/1"),
+            ("post", f"{JOBS_URL}/bulk-delete"),
         ],
     )
     def test_endpoints_require_session(
         self, client: TestClient, method: str, url: str
     ) -> None:
-        response = client.post(url, json={}) if method == "post" else client.get(url)
+        if method == "get":
+            response = client.get(url)
+        elif method == "delete":
+            response = client.delete(url)
+        else:
+            response = client.post(url, json={})
         assert response.status_code == 401
 
 
@@ -411,6 +418,61 @@ class TestJobsApi:
 
     def test_unknown_job_is_not_found(self, auth_client: TestClient) -> None:
         assert auth_client.get(f"{JOBS_URL}/4242").status_code == 404
+
+
+class TestJobsDelete:
+    """`DELETE /jobs/{id}` и `POST /jobs/bulk-delete` — удаление задач (§11.6, Э10)."""
+
+    def test_delete_single_job_removes_it_with_journal(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        created = auth_client.post(
+            actions_url(store.id), json={"action": "check_files", "params": {"filename": "update"}}
+        ).json()
+        job_id = created["job"]["id"]
+        assert jobs(session), "до удаления задача есть"
+
+        response = auth_client.delete(f"{JOBS_URL}/{job_id}")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["deleted"] is True
+        assert jobs(session) == [], "задача исчезла из БД"
+        assert auth_client.get(f"{JOBS_URL}/{job_id}").status_code == 404
+        assert "job_delete" in audit_actions(session), "действие зафиксировано в аудите"
+
+    def test_delete_unknown_job_is_not_found(self, auth_client: TestClient) -> None:
+        assert auth_client.delete(f"{JOBS_URL}/4242").status_code == 404
+
+    def test_bulk_delete_removes_selected_and_skips_unknown(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        first = auth_client.post(
+            actions_url(store.id), json={"action": "check_files", "params": {"filename": "update"}}
+        ).json()["job"]["id"]
+        second = auth_client.post(
+            actions_url(store.id),
+            json={"action": "run_update_db", "params": {"is_fast_update": True}},
+        ).json()["job"]["id"]
+        third = auth_client.post(
+            actions_url(store.id), json={"action": "send_message", "params": {"text_message": "x"}}
+        ).json()["job"]["id"]
+        assert len(jobs(session)) == 3
+
+        response = auth_client.post(
+            f"{JOBS_URL}/bulk-delete", json={"ids": [first, third, 4242]}
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["deleted"] == 2
+        assert body["total"] == 3, "несуществующий id тоже учтён в запросе"
+        remaining = [item.id for item in jobs(session)]
+        assert remaining == [second], "удалены только выбранные"
+        assert "job_bulk_delete" in audit_actions(session)
+
+    def test_bulk_delete_empty_ids_is_422(self, auth_client: TestClient) -> None:
+        response = auth_client.post(f"{JOBS_URL}/bulk-delete", json={"ids": []})
+        assert response.status_code == 422
 
 
 class TestFilesMatrix:

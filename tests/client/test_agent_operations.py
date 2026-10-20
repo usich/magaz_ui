@@ -245,6 +245,50 @@ class TestDownloaderYandexDisk:
         assert path == work_dir / "update.zip"
         assert path is not None and path.read_bytes() == b"package"
 
+    async def test_name_from_href_when_disk_omits_name(self, work_dir: Path) -> None:
+        """Регресс «касса»: Яндекс.Диск не вернул поле `name`, но положил реальное
+        имя файла в `href` (query-параметр `filename`). Имя обязано браться оттуда,
+        иначе скачивание уходило в ошибку «ссылка не получена» (агент-лог).
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "cloud-api.yandex.net":
+                href = (
+                    "https://downloader.disk.yandex.ru/disk/hash?uid=0"
+                    "&filename=%D0%91%D0%93_%D0%A2%D0%BE%D1%80%D0%B3%D0%BE%D0%B2%D0%BE%D1%8F_mag-01072026.cfe"
+                    "&disposition=attachment"
+                )
+                # name отсутствует — как в реальном ответе API для /d/<id>
+                return httpx.Response(200, json={"method": "GET", "href": href})
+            return httpx.Response(200, content=b"package")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            path = await downloader.download_file_from_yandex_disk(
+                "https://disk.yandex.ru/d/ukPxhdZu6Ax4WQ", work_dir=work_dir, client=client
+            )
+
+        assert path == work_dir / "БГ_Торговоя_mag-01072026.cfe"
+        assert path is not None and path.read_bytes() == b"package"
+
+    async def test_unsafe_href_filename_is_sanitized_to_basename(self, work_dir: Path) -> None:
+        """I-2: имя из `href` проходит через `safe_basename` — `..\\..\\evil.exe`
+        (URL-закодированный) превращается в `evil.exe` и остаётся в рабочей папке,
+        как и при имени из поля `name` (см. `test_traversal_name_stays_inside_work_dir`)."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "cloud-api.yandex.net":
+                href = "https://downloader.disk.yandex.ru/disk/hash?filename=..%5C..%5Cevil.exe"
+                return httpx.Response(200, json={"href": href})
+            return httpx.Response(200, content=b"package")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            path = await downloader.download_file_from_yandex_disk(
+                "https://disk.yandex.ru/d/abc", work_dir=work_dir, client=client
+            )
+
+        assert path == work_dir / "evil.exe"
+        assert path is not None and path.parent == work_dir
+
     async def test_traversal_name_stays_inside_work_dir(self, work_dir: Path) -> None:
         """I-2: `..\\..\\evil.exe` из внешнего API не выходит за рабочую папку."""
         async with self._client(name="..\\..\\evil.exe") as client:
@@ -271,6 +315,38 @@ class TestDownloaderYandexDisk:
             )
 
         assert path is None
+
+    async def test_own_client_ignores_env_proxy(self, work_dir: Path, monkeypatch) -> None:  # noqa: ANN001
+        """Регресс «ловушки прокси»: когда скачиватель сам создаёт httpx-клиент,
+        он обязан идти мимо системного прокси (туннеля) — `trust_env=False`.
+
+        Без этого на кассе с прокси-туннелем реальное скачивание с Яндекс.Диска
+        не доводится до конца (`download_status="failed"`), как было в `AgentClient`
+        и `TrayAgentClient` (README, отклонение №2; см. `TestProxyIsIgnored`).
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "cloud-api.yandex.net":
+                return httpx.Response(
+                    200, json={"href": "https://down.example/file", "name": "update.zip"}
+                )
+            return httpx.Response(200, content=b"package")
+
+        captured: dict = {}
+        real_client = httpx.AsyncClient
+
+        def fake_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+            captured.update(kwargs)
+            return real_client(transport=httpx.MockTransport(handler), *args, **kwargs)
+
+        monkeypatch.setattr("client.agent.downloader.httpx.AsyncClient", fake_client)
+
+        path = await downloader.download_file_from_yandex_disk(
+            "https://disk.yandex.ru/d/abc", work_dir=work_dir
+        )
+
+        assert captured.get("trust_env") is False, "внутренний клиент не должен брать прокси из окружения"
+        assert path == work_dir / "update.zip"
 
 
 class TestMessenger:

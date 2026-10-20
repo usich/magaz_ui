@@ -62,7 +62,7 @@ from server.services import (
     settings_service,
 )
 from shared.enums import CommandKind, CommandStatus, JobLogLevel
-from shared.schemas import CheckFilesResponse, CredentialsPush
+from shared.schemas import CheckFilesResponse, CredentialsPush, NotifyCancelRequest
 from shared.timeutil import utcnow
 
 logger = logging.getLogger(__name__)
@@ -122,6 +122,18 @@ def expected_file_kind(url_file: str) -> str | None:
     name = path.replace("\\", "/").rsplit("/", 1)[-1]
     _, _, suffix = name.rpartition(".")
     return FILE_KIND_BY_SUFFIX.get(f".{suffix.casefold()}")
+
+
+def _stem_of_downloaded(name: str) -> str | None:
+    """Имя без расширения для реально скачанного файла (например `update.cf` → `update`).
+
+    Возвращает `None`, если файл не является пакетом обновления (`.cf`/`.cfe`/
+    `.xml`) — такой файл `/check-files` увидеть не может, ждать его бессмысленно.
+    """
+    _, dot, suffix = name.rpartition(".")
+    if not dot or f".{suffix.casefold()}" not in FILE_KIND_BY_SUFFIX:
+        return None
+    return name[: len(name) - len(suffix) - 1]
 
 
 def _downloaded(response: CheckFilesResponse, kind: str | None) -> bool:
@@ -430,6 +442,8 @@ class CommandDispatcher:
                 await self._send_delete_files(session, store, command, client, report)
             elif kind == str(CommandKind.NOTIFY):
                 await self._send_notify(session, store, command, client, report)
+            elif kind == str(CommandKind.NOTIFY_CANCEL):
+                await self._send_notify_cancel(session, store, command, client, report)
             else:
                 self._finish(
                     session,
@@ -660,6 +674,48 @@ class CommandDispatcher:
             report=report,
         )
 
+    async def _send_notify_cancel(
+        self,
+        session: Any,  # noqa: ANN401 - Session
+        store: Store,
+        command: Command,
+        client: AgentClient,
+        report: DispatchReport,
+    ) -> None:
+        """`POST /notify/cancel`: убрать отменённое уведомление из очереди кассы (1.23, §7.4).
+
+        Админ отменил/удалил уведомление: касса должна перестать его показывать.
+        Задача ставится только магазинам, куда уведомление уже доставлено, поэтому
+        `notification_id` здесь обязателен; недоступная касса оставляет задачу в
+        очереди и получает отзыв, когда вернётся в сеть (FR-16).
+        """
+        try:
+            notification_id = int((command.params or {}).get("notification_id") or 0)
+        except (TypeError, ValueError):
+            notification_id = 0
+
+        if notification_id <= 0:
+            self._finish(
+                session,
+                command,
+                CommandStatus.ERROR,
+                message="В задаче отзыва нет id уведомления — отправлять нечего",
+                report=report,
+                level=JobLogLevel.ERROR,
+            )
+            return
+
+        payload = NotifyCancelRequest(notification_id=notification_id)
+        await client.notify_cancel(payload)
+        self._register_send(session, command, report)
+        self._finish(
+            session,
+            command,
+            CommandStatus.SUCCESS,
+            message=f"Уведомление id={notification_id} отозвано с кассы",
+            report=report,
+        )
+
     # --- Опрос отправленных задач -------------------------------------------
 
     async def _poll(
@@ -787,6 +843,35 @@ class CommandDispatcher:
         async with self._client(store) as client:
             response = await client.check_files(filename)
             report.polled += 1
+
+        # Имя из ссылки может не совпадать с реально скачанным файлом: для
+        # ссылок Яндекс.Диска basename — это id ресурса (`.../d/ukPxhdZu6Ax4WQ`),
+        # а не имя пакета. Агент сам знает имя из `last-download.json` и сообщает
+        # его в `downloaded` — переспросим по нему (§11.3, FR-1).
+        if not _downloaded(response, file_kind) and response.downloaded:
+            real_stem = _stem_of_downloaded(response.downloaded)
+            if real_stem and real_stem != filename:
+                filename = real_stem
+                file_kind = expected_file_kind(response.downloaded)
+                async with self._client(store) as client:
+                    response = await client.check_files(filename)
+                    report.polled += 1
+
+        # Урок Э3 (наблюдение №7) — «нельзя верить только `/check-*`», но и
+        # ждать файл бесконечно нельзя: скачивание на кассе могло провалиться
+        # (сетевой сбой, Диск не отдал ссылку). Агент пишет `status: failed` в
+        # `last-download.json` и сообщает его в `/check-files`. Закрываем задачу
+        # как `failed` с текстом ошибки, а не «висим» до таймаута (§11.4).
+        if str(response.download_status or "") == "failed":
+            reason = response.download_error or "неизвестная ошибка при скачивании"
+            self._finish(
+                session,
+                command,
+                CommandStatus.FAILED,
+                message=f"Скачивание файла с Яндекс.Диска не удалось: {reason}",
+                report=report,
+            )
+            return
 
         if not _downloaded(response, file_kind):
             report.waiting += 1
@@ -1044,9 +1129,20 @@ def build_1c_payload(store: Store, command: Command) -> dict[str, Any]:
         "version_1c": store.version_1c,
         "user_name": store.user_name_1c,
     }
-    for key in ("file_name", "full_merge", "extension_name", "is_fast_update"):
+    for key in (
+        "file_name",
+        "full_merge",
+        "extension_name",
+        "settings_file_name",
+        "is_fast_update",
+    ):
         if key in params and params[key] is not None:
             payload[key] = params[key]
+    # FR-4: имя расширения может жить в карточке магазина. Если в параметрах операции
+    # оно не задано явно, подставляем из карточки — так массовая операция сама
+    # знает расширение для каждого магазина.
+    if "extension_name" not in payload and store.extension_name:
+        payload["extension_name"] = store.extension_name
     return payload
 
 
@@ -1059,6 +1155,7 @@ def describe_kind(kind: str) -> str:
         str(CommandKind.RUN_UPDATE_DB): "Обновление конфигурации БД",
         str(CommandKind.SEND_MESSAGE): "Сообщение пользователям",
         str(CommandKind.NOTIFY): "Уведомление",
+        str(CommandKind.NOTIFY_CANCEL): "Отзыв уведомления",
     }.get(kind, kind)
 
 

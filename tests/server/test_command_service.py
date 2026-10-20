@@ -204,9 +204,49 @@ class TestQueries:
         assert [item.id for item in command_service.list_pending(session)] == [first.id]
 
 
+class TestDeleteCommands:
+    """Жёсткое удаление задач вместе с журналом (§11.6, Э10) — сервисный слой."""
+
+    def test_delete_command_removes_job_and_logs(self, session: Session) -> None:
+        store = add_store(session)
+        command = command_service.create_command(
+            session, store_id=store.id, kind=CommandKind.DOWNLOAD_FILE
+        )
+        command_service.add_log(session, command, "первая строка")
+        command_service.add_log(session, command, "вторая строка")
+        session.commit()
+        command_id = command.id
+
+        removed = command_service.delete_command(session, command_id)
+
+        assert removed is not None and removed.id == command_id
+        session.commit()
+        assert command_service.get_command(session, command_id) is None
+        logs = list(session.scalars(select(JobLog).where(JobLog.command_id == command_id)))
+        assert logs == [], "журнал ушёл вместе с задачей (каскад)"
+
+    def test_delete_command_unknown_returns_none(self, session: Session) -> None:
+        assert command_service.delete_command(session, 4242) is None
+
+    def test_delete_commands_counts_only_existing(self, session: Session) -> None:
+        store = add_store(session)
+        first = command_service.create_command(
+            session, store_id=store.id, kind=CommandKind.CHECK_FILES
+        )
+        second = command_service.create_command(
+            session, store_id=store.id, kind=CommandKind.CHECK_FILES
+        )
+        session.commit()
+
+        deleted = command_service.delete_commands(session, [first.id, 4242, second.id])
+
+        assert deleted == 2
+        session.commit()
+        assert command_service.list_commands(session) == []
+
+
 class TestUpdateConflicts:
     """Запрет одновременного обновления одной ИБ (§9.2 FR-28, П-5) — сервисный слой."""
-
     def _store(
         self, session: Session, *, name: str, ip: str, cluster: str, database: str
     ) -> Store:

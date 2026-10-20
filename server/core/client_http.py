@@ -33,6 +33,7 @@ from shared.schemas import (
     DevicesConfigPush,
     HealthResponse,
     MergeParams,
+    NotifyCancelRequest,
     NotifyRequest,
     UpdateParams,
 )
@@ -70,6 +71,8 @@ DEVICES_CONFIG_PATH = "/devices/config"
 DEVICES_CHECK_NOW_PATH = "/devices/check-now"
 #: §5.1.2: приём уведомления от сервера (ФН3, Э5)
 NOTIFY_PATH = "/notify"
+#: 1.23: отзыв уже доставленного уведомления с кассы
+NOTIFY_CANCEL_PATH = "/notify/cancel"
 #: Э10: удаление файлов обновления в рабочей папке кассы
 DELETE_FILES_PATH = "/files/delete"
 
@@ -381,6 +384,22 @@ class AgentClient:
         if not isinstance(body, dict):
             raise AgentProtocolError(
                 f"Агент магазина id={self.target.store_id} вернул не объект в /notify"
+            )
+        return body
+
+    async def notify_cancel(self, payload: NotifyCancelRequest) -> dict[str, Any]:
+        """`POST /notify/cancel` — отозвать доставленное уведомление (1.23, §7.4).
+
+        Админ отменил или удалил уведомление: касса убирает его из файловой
+        очереди, поэтому оно перестаёт показываться. `removed=false` — на кассе
+        его уже не было (повторный retry диспетчера — не ошибка).
+        """
+        body = await self.request_json(
+            "POST", NOTIFY_CANCEL_PATH, json_body=payload.model_dump()
+        )
+        if not isinstance(body, dict):
+            raise AgentProtocolError(
+                f"Агент магазина id={self.target.store_id} вернул не объект в /notify/cancel"
             )
         return body
 

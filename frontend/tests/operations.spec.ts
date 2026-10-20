@@ -142,6 +142,55 @@ describe('стор задач (§11.6)', () => {
     expect(detail).toBeNull()
     expect(jobs.errorMessage).toBe('Не найдено')
   })
+
+  it('выбор задач и удаление выбранных уходят массовой точкой (§11.6, Э10)', async () => {
+    fetchMock.mockImplementation(async () =>
+      jsonResponse({ items: [makeJob({ id: 7 }), makeJob({ id: 8 })], counts: {}, total: 2, active: 2 }),
+    )
+    const jobs = useJobsStore()
+    await jobs.load()
+
+    jobs.toggleSelect(7)
+    jobs.toggleSelect(8)
+    expect(jobs.selectedIds).toEqual([7, 8])
+
+    fetchMock.mockImplementation(async () => jsonResponse({ deleted: 2, total: 2, message: 'ok' }))
+    await jobs.removeSelected()
+
+    const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit]
+    expect(url).toBe('/api/v1/admin/jobs/bulk-delete')
+    expect(init.method).toBe('POST')
+    expect(String(init.body)).toContain('"ids":[7,8]')
+    expect(jobs.selectedIds).toEqual([])
+  })
+
+  it('выбрать-все отмечает видимые, повторно снимает (§11.6, Э10)', async () => {
+    fetchMock.mockImplementation(async () =>
+      jsonResponse({ items: [makeJob({ id: 7 }), makeJob({ id: 8 })], counts: {}, total: 2, active: 2 }),
+    )
+    const jobs = useJobsStore()
+    await jobs.load()
+
+    jobs.selectAll()
+    expect(jobs.selectedIds).toEqual([7, 8])
+    jobs.selectAll()
+    expect(jobs.selectedIds).toEqual([])
+  })
+
+  it('удаление одной задачи идёт DELETE-точкой (§11.6, Э10)', async () => {
+    fetchMock.mockImplementation(async () =>
+      jsonResponse({ items: [makeJob({ id: 7 })], counts: {}, total: 1, active: 1 }),
+    )
+    const jobs = useJobsStore()
+    await jobs.load()
+
+    fetchMock.mockImplementation(async () => jsonResponse({ deleted: true, job_id: 7, message: 'Задача удалена' }))
+    await jobs.removeOne(7)
+
+    const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit]
+    expect(url).toBe('/api/v1/admin/jobs/7')
+    expect(init.method).toBe('DELETE')
+  })
 })
 
 describe('стор матрицы файлов (§11.3)', () => {

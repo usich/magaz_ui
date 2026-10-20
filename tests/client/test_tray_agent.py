@@ -36,6 +36,7 @@ from client.tray.presenter import (
     TAB_ARCHIVE,
     TrayPresenter,
     build_tabs,
+    category_nav,
     group_items,
     items_for_tab,
     panel_geometry,
@@ -709,7 +710,7 @@ class TestProxyIsIgnored:
 class TestTrayPanel:
     """Окно уведомлений: вкладки, «справочник» и геометрия «не больше 15 %» (§7.4, Э9)."""
 
-    def test_tabs_count_unread_and_archive(self) -> None:
+    def test_tabs_count_only_unread_no_archive(self) -> None:
         unread = [
             make_pending(1, severity=NotificationSeverity.IMPORTANT),
             make_pending(2, severity=NotificationSeverity.IMPORTANT),
@@ -724,22 +725,21 @@ class TestTrayPanel:
             ("info", 0),
             ("important", 2),
             ("critical", 1),
-            (TAB_ARCHIVE, 1),
         ]
-        assert tabs[-1].is_archive is True
-        assert tabs[0].is_archive is False
+        assert not any(tab.is_archive for tab in tabs), "вкладки «справочник» больше нет"
 
-    def test_items_for_tab_filters_by_severity_and_archive(self) -> None:
+    def test_items_for_tab_keeps_acknowledged_in_category(self) -> None:
         unread = [
             make_pending(1, severity=NotificationSeverity.INFO),
             make_pending(2, severity=NotificationSeverity.CRITICAL),
         ]
-        archive = [make_pending(9)]
+        archive = [make_pending(9, severity=NotificationSeverity.CRITICAL)]
 
-        assert [item.id for item in items_for_tab(TAB_ALL, unread, archive)] == [1, 2]
-        assert [item.id for item in items_for_tab("critical", unread, archive)] == [2]
-        assert [item.id for item in items_for_tab("important", unread, archive)] == []
-        assert [item.id for item in items_for_tab(TAB_ARCHIVE, unread, archive)] == [9]
+        assert [i.id for i in items_for_tab(TAB_ALL, unread, archive)] == [1, 2, 9]
+        assert [i.id for i in items_for_tab("critical", unread, archive)] == [2, 9]
+        assert [i.id for i in items_for_tab("important", unread, archive)] == []
+        ack = next(i for i in items_for_tab(TAB_ALL, unread, archive) if i.id == 9)
+        assert ack.acknowledged is True, "прочитанное помечено `acknowledged`"
 
     def test_panel_is_top_right_and_within_15_percent(self) -> None:
         x, y, width, height = panel_geometry(1920, 1080)
@@ -756,7 +756,7 @@ class TestTrayPanel:
         assert 0 <= y and y + height <= 768
         assert width * height <= 0.15 * 1024 * 768
 
-    def test_presenter_tabs_use_archive(self) -> None:
+    def test_presenter_tabs_have_no_archive(self) -> None:
         presenter = TrayPresenter()
         presenter.decide([make_pending(1, severity=NotificationSeverity.INFO)])
         presenter.set_archive([make_pending(2)])
@@ -765,7 +765,7 @@ class TestTrayPanel:
 
         assert counts[TAB_ALL] == 1
         assert counts["info"] == 1
-        assert counts[TAB_ARCHIVE] == 1
+        assert TAB_ARCHIVE not in counts, "вкладки «справочник» больше нет"
         assert [item.id for item in presenter.archive] == [2]
 
     def test_group_by_severity_orders_and_colors(self) -> None:
@@ -813,6 +813,58 @@ class TestTrayPanel:
         groups = group_items([make_pending(1, severity=NotificationSeverity.INFO)])
 
         assert [group.key for group in groups] == ["info"]
+
+    def test_category_nav_dedups_and_keeps_order(self) -> None:
+        """Навигация по категориям: категории по порядку первых встреч, без дублей (1.23)."""
+        sales = make_category(1, name="Продажи", color="#2563eb")
+        purchases = make_category(2, name="Закупки", color="#10b981")
+        items = [
+            make_pending(1, category=purchases),
+            make_pending(2, category=sales),
+            make_pending(3, category=purchases),
+        ]
+
+        nav = category_nav(items)
+
+        assert nav == [
+            ("2", "Закупки", "#10b981"),
+            ("1", "Продажи", "#2563eb"),
+        ]
+
+    def test_category_nav_bucket_for_uncategorized(self) -> None:
+        """Уведомление без категории попадает в «без категории» (как и в списке)."""
+        sales = make_category(1, name="Продажи", color="#2563eb")
+
+        nav = category_nav([make_pending(1, category=sales), make_pending(2)])
+
+        assert nav[-1][0] == "none"
+        assert nav[-1][1] == NO_CATEGORY_TITLE
+
+    def test_category_nav_follows_importance_filter(self) -> None:
+        """Два отбора одновременно: навигация по категориям видит только важность (1.23).
+
+        `category_nav` получает уже отфильтрованные `items_for_tab` — поэтому
+        при выбранной пилюле важности слева остаются лишь те категории, в
+        которых под эту важность есть уведомления.
+        """
+        sales = make_category(1, name="Продажи", color="#2563eb")
+        purchases = make_category(2, name="Закупки", color="#10b981")
+        unread = [
+            make_pending(1, category=sales, severity=NotificationSeverity.IMPORTANT),
+            make_pending(2, category=purchases, severity=NotificationSeverity.INFO),
+        ]
+
+        important = items_for_tab("important", unread, [])
+        nav = category_nav(important)
+
+        assert [key for key, _, _ in nav] == ["1"], (
+            "под «важно» остаётся только «Продажи» — навигация идёт в ногу с важностью"
+        )
+
+    def test_category_nav_empty_items_is_empty(self) -> None:
+        """Пустой отфильтрованный список не рисует категорий слева зря."""
+        assert category_nav([]) == []
+
 
     def test_agent_reads_archive_even_when_panel_is_closed(self) -> None:
         """Архив читается всегда: меню после «Ознакомлен» открывается сразу (§7.4, 1.21-fix).

@@ -25,6 +25,7 @@ export const JOB_KIND_LABELS: Record<string, string> = {
   run_update_db: 'Обновление БД',
   send_message: 'Сообщение пользователям',
   notify: 'Уведомление',
+  notify_cancel: 'Отзыв уведомления',
 }
 
 /** Подписи статусов (§4.3). */
@@ -66,6 +67,10 @@ export const useJobsStore = defineStore('jobs', () => {
   const detail = ref<JobDetail | null>(null)
   const isDetailLoading = ref(false)
 
+  // Выбор задач для удаления (§11.6, Э10): id выбранных строк
+  const selectedIds = ref<number[]>([])
+  const isDeleting = ref(false)
+
   const filters = computed<JobFilters>(() => ({
     storeId: storeId.value,
     kind: kind.value,
@@ -73,6 +78,58 @@ export const useJobsStore = defineStore('jobs', () => {
     activeOnly: activeOnly.value,
     limit: 100,
   }))
+
+  /** Переключить выбор одной задачи (или снять при повторном клике). */
+  function toggleSelect(id: number): void {
+    const index = selectedIds.value.indexOf(id)
+    if (index === -1) selectedIds.value.push(id)
+    else selectedIds.value.splice(index, 1)
+  }
+
+  /** Выбрать / снять все видимые на странице задачи. */
+  function selectAll(): void {
+    const visible = items.value.map((item) => item.id)
+    const allVisibleSelected = visible.every((id) => selectedIds.value.includes(id))
+    selectedIds.value = allVisibleSelected
+      ? selectedIds.value.filter((id) => !visible.includes(id))
+      : [...new Set([...selectedIds.value, ...visible])]
+  }
+
+  function clearSelection(): void {
+    selectedIds.value = []
+  }
+
+  /** Удалить одну задачу и перечитать список. */
+  async function removeOne(id: number): Promise<void> {
+    isDeleting.value = true
+    try {
+      await jobsApi.remove(id)
+      selectedIds.value = selectedIds.value.filter((item) => item !== id)
+      await load()
+    } catch (error) {
+      errorMessage.value =
+        error instanceof ApiError ? error.message : 'Не удалось удалить задачу'
+    } finally {
+      isDeleting.value = false
+    }
+  }
+
+  /** Удалить выбранные задачи и перечитать список. */
+  async function removeSelected(): Promise<void> {
+    const ids = [...selectedIds.value]
+    if (!ids.length) return
+    isDeleting.value = true
+    try {
+      await jobsApi.removeBulk(ids)
+      selectedIds.value = []
+      await load()
+    } catch (error) {
+      errorMessage.value =
+        error instanceof ApiError ? error.message : 'Не удалось удалить выбранные задачи'
+    } finally {
+      isDeleting.value = false
+    }
+  }
 
   async function load(): Promise<void> {
     isLoading.value = true
@@ -140,8 +197,15 @@ export const useJobsStore = defineStore('jobs', () => {
     filters,
     detail,
     isDetailLoading,
+    selectedIds,
+    isDeleting,
     load,
     loadDetail,
+    toggleSelect,
+    selectAll,
+    clearSelection,
+    removeOne,
+    removeSelected,
     startPolling,
     stopPolling,
   }

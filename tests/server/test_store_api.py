@@ -23,6 +23,7 @@ CREATE_PAYLOAD: dict[str, object] = {
     "database_name": "trade",
     "version_1c": "8.3.24.1548",
     "user_name_1c": "Администратор",
+    "extension_name": "БГ_Торговоя",
 }
 
 
@@ -76,6 +77,7 @@ class TestStoreCrud:
         assert body["password_set"] is False
         assert body["credentials_version"] == 1
         assert body["devices_version"] == 1
+        assert body["extension_name"] == "БГ_Торговоя", "имя расширения сохраняется (FR-4)"
 
         config = body["agent_config"]
         assert config["store_id"] == body["id"]

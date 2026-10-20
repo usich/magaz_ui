@@ -37,6 +37,8 @@ class CommandKind(StrEnum):
     RUN_UPDATE_DB = "run_update_db"
     SEND_MESSAGE = "send_message"
     NOTIFY = "notify"
+    #: 1.23: отзыв уже доставленного уведомления с кассы (`POST /notify/cancel`)
+    NOTIFY_CANCEL = "notify_cancel"
     #: Э10: удаление файлов обновления в рабочей папке кассы
     DELETE_FILE = "delete_file"
 

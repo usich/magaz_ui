@@ -375,6 +375,36 @@ class NotificationQueue:
         )
         return {"queued": True, "sessions": sessions}
 
+    def remove(self, notification_id: int) -> bool:
+        """Отозвать уведомление с кассы (`POST /notify/cancel`, 1.23, §7.4).
+
+        Админ отменил или удалил уведомление на сервере — оно больше не должно
+        показываться в трее. Убираем само уведомление и все состояния сессий,
+        чтобы оно не «висело» в окне и не попадало в справочник прочитанного.
+
+        Возвращает `True`, если уведомление было в очереди и удалено; `False` —
+        его на кассе и не было (повторный отзыв, retry диспетчера — не ошибка).
+        """
+        item = self.find(notification_id)
+        if item is None:
+            logger.debug("Отзыв неизвестного уведомления id=%s: уже удалено", notification_id)
+            return False
+        removed = {int(item.id)}
+        self._data.notifications = [
+            entry for entry in self._data.notifications if int(entry.id) != int(notification_id)
+        ]
+        self._data.states = [
+            state
+            for state in self._data.states
+            if int(state.notification_id) not in removed
+        ]
+        self.save()
+        logger.info(
+            "Уведомление id=%s отозвано с кассы (отменено/удалено на сервере)",
+            notification_id,
+        )
+        return True
+
     # --- Сессии --------------------------------------------------------------
 
     def touch_session(

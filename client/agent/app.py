@@ -43,6 +43,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,7 @@ from shared.schemas import (
     JobStateResponse,
     MergeParams,
     MessageParams,
+    NotifyCancelRequest,
     NotifyRequest,
     SessionRef,
     SnoozeRequest,
@@ -137,6 +139,27 @@ def _file_info(path: Path) -> tuple[bool, int | None, str | None]:
     except OSError:
         return False, None, None
     return True, stat.st_size, _mtime_iso(stat.st_mtime)
+
+
+def _last_download_meta(work_dir: Path) -> tuple[str | None, str | None, str | None]:
+    """Мета последнего скачивания из `last-download.json` (FR-1).
+
+    Возвращает `(filename, status, error)`: имя скачанного пакета, статус
+    (`downloading`/`done`/`failed`) и текст ошибки при провале. Имя отдаётся,
+    только если скачивание завершилось успешно (`status == "done"`) и файл
+    всё ещё лежит в рабочей папке. Ошибки чтения не кидаются — меты может
+    не быть, если скачивание ещё не запускалось.
+    """
+    meta = work_dir / downloader.LAST_DOWNLOAD_FILE
+    try:
+        payload = json.loads(meta.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None, None
+    name = str(payload.get("filename") or "")
+    status = payload.get("status")
+    if str(status) == "done" and not (name and (work_dir / name).is_file()):
+        return None, status, None
+    return name or None, str(status) if status else None, payload.get("error")
 
 
 def create_agent_app(
@@ -367,6 +390,9 @@ def create_agent_app(
         xml_exists, xml_size, xml_mtime = _file_info(
             one_c_paths.update_file(params.filename, ".xml")
         )
+        downloaded, download_status, download_error = _last_download_meta(
+            one_c_paths.work_dir
+        )
         return CheckFilesResponse(
             cf_exists=cf_exists,
             cfe_exists=cfe_exists,
@@ -377,6 +403,9 @@ def create_agent_app(
             cf_mtime=cf_mtime,
             cfe_mtime=cfe_mtime,
             xml_mtime=xml_mtime,
+            downloaded=downloaded,
+            download_status=download_status,
+            download_error=download_error,
         )
 
     @app.post(
@@ -634,6 +663,22 @@ def create_agent_app(
                 name="agent-notify-images",
             )
         return result
+
+    @app.post(
+        "/notify/cancel",
+        dependencies=[Depends(require_agent_token)],
+        summary="Отзыв уведомления от сервера",
+        tags=["notifications"],
+    )
+    async def notify_cancel(payload: NotifyCancelRequest = Body(...)) -> dict[str, object]:
+        """Отозвать уже доставленное уведомление (`POST /notify/cancel`, 1.23, §7.4).
+
+        Админ отменил или удалил уведомление на сервере — касса убирает его из
+        файловой очереди, поэтому оно перестаёт показываться и в окне, и в трее.
+        Повторный отзыв (retry диспетчера) не ошибка: `removed=false` — его уже нет.
+        """
+        removed = notifications_queue.remove(int(payload.notification_id))
+        return {"ok": True, "removed": removed}
 
     @app.get(
         "/notifications/pending",

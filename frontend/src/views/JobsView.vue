@@ -7,12 +7,13 @@
  * Список обновляется polling-ом (§11.1), поэтому админ видит переход
  * `202 → 200/400` без перезагрузки страницы.
  */
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import Button from 'primevue/button'
 import Message from 'primevue/message'
 import Tag from 'primevue/tag'
 
+import ConfirmDeleteDialog from '@/components/ConfirmDeleteDialog.vue'
 import StatusTile from '@/components/StatusTile.vue'
 import {
   JOB_KIND_LABELS,
@@ -24,6 +25,15 @@ import { useStoresStore } from '@/stores/stores'
 
 const jobs = useJobsStore()
 const stores = useStoresStore()
+
+/** Что админ собирается удалить: одна задача или набор выбранных (§11.6, Э10). */
+const pendingDelete = ref<number | 'selected' | null>(null)
+
+const selectedCount = computed(() => jobs.selectedIds.length)
+const allVisibleSelected = computed(
+  () =>
+    jobs.items.length > 0 && jobs.items.every((item) => jobs.selectedIds.includes(item.id)),
+)
 
 const STATUS_OPTIONS = [
   'queued',
@@ -48,7 +58,10 @@ onMounted(async () => {
   jobs.startPolling()
 })
 
-onUnmounted(() => jobs.stopPolling())
+onUnmounted(() => {
+  jobs.stopPolling()
+  jobs.clearSelection()
+})
 
 function kindLabel(kind: string): string {
   return JOB_KIND_LABELS[kind] ?? kind
@@ -63,6 +76,25 @@ function formatDate(value: string | null): string {
   if (!value) return '—'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('ru-RU')
+}
+
+/** Открыть подтверждение удаления одной задачи. */
+function askDeleteOne(id: number): void {
+  pendingDelete.value = id
+}
+
+/** Открыть подтверждение удаления выбранных задач. */
+function askDeleteSelected(): void {
+  pendingDelete.value = 'selected'
+}
+
+async function confirmDelete(): Promise<void> {
+  if (pendingDelete.value === 'selected') {
+    await jobs.removeSelected()
+  } else if (typeof pendingDelete.value === 'number') {
+    await jobs.removeOne(pendingDelete.value)
+  }
+  pendingDelete.value = null
 }
 </script>
 
@@ -79,6 +111,17 @@ function formatDate(value: string | null): string {
         <span v-if="jobs.lastLoadedAt" class="magaz-muted text-xs">
           обновлено {{ jobs.lastLoadedAt.toLocaleTimeString('ru-RU') }}
         </span>
+        <Button
+          v-if="selectedCount"
+          label="Удалить выбранные"
+          :badge="String(selectedCount)"
+          icon="pi pi-trash"
+          size="small"
+          severity="danger"
+          text
+          data-test="jobs-delete-selected"
+          @click="askDeleteSelected"
+        />
         <Button
           label="Обновить"
           icon="pi pi-refresh"
@@ -162,6 +205,14 @@ function formatDate(value: string | null): string {
       <table class="magaz-table">
         <thead>
           <tr>
+            <th class="w-10">
+              <input
+                type="checkbox"
+                :checked="allVisibleSelected"
+                data-test="jobs-select-all"
+                @change="jobs.selectAll()"
+              />
+            </th>
             <th>#</th>
             <th>Магазин</th>
             <th>Операция</th>
@@ -175,6 +226,14 @@ function formatDate(value: string | null): string {
         </thead>
         <tbody>
           <tr v-for="job in jobs.items" :key="job.id" :data-test="`job-row-${job.id}`">
+            <td class="w-10">
+              <input
+                type="checkbox"
+                :checked="jobs.selectedIds.includes(job.id)"
+                :data-test="`job-select-${job.id}`"
+                @change="jobs.toggleSelect(job.id)"
+              />
+            </td>
             <td class="magaz-mono">{{ job.id }}</td>
             <td>{{ job.store_name ?? `#${job.store_id}` }}</td>
             <td>{{ kindLabel(job.kind) }}</td>
@@ -192,22 +251,54 @@ function formatDate(value: string | null): string {
               {{ job.last_message ?? job.last_error ?? '—' }}
             </td>
             <td>
-              <RouterLink
-                :to="{ name: 'job-detail', params: { id: job.id } }"
-                data-test="job-open"
-              >
-                <Button label="Лог" icon="pi pi-list" size="small" text />
-              </RouterLink>
+              <div class="flex items-center justify-end gap-1">
+                <RouterLink
+                  :to="{ name: 'job-detail', params: { id: job.id } }"
+                  data-test="job-open"
+                >
+                  <Button label="Лог" icon="pi pi-list" size="small" text />
+                </RouterLink>
+                <Button
+                  label="Удалить"
+                  icon="pi pi-trash"
+                  size="small"
+                  text
+                  severity="danger"
+                  :disabled="jobs.isDeleting"
+                  :data-test="`job-delete-${job.id}`"
+                  @click="askDeleteOne(job.id)"
+                />
+              </div>
             </td>
           </tr>
           <tr v-if="!jobs.items.length && !jobs.isLoading">
-            <td colspan="9" class="magaz-muted py-6 text-center" data-test="jobs-empty">
+            <td colspan="10" class="magaz-muted py-6 text-center" data-test="jobs-empty">
               Задач нет: запустите операцию в карточке магазина или на странице файлов.
             </td>
           </tr>
         </tbody>
       </table>
     </section>
+
+    <ConfirmDeleteDialog
+      :visible="pendingDelete !== null"
+      :header="pendingDelete === 'selected' ? 'Удалить выбранные задачи?' : 'Удалить задачу?'"
+      :message="
+        pendingDelete === 'selected'
+          ? `Будут удалены ${selectedCount} выбранных задач вместе с их журналами.`
+          : 'Задача будет удалена вместе с её журналом. Выполняющуюся на кассе операцию это не остановит.'
+      "
+      :details="
+        pendingDelete === 'selected'
+          ? ['Журналы удаляемых задач пропадут из истории.', 'Незавершённые задачи снимаются с очереди диспетчера.']
+          : ['Журнал задачи пропадёт из истории §11.6.', 'Если задача ещё не отправлена — она больше не уйдёт на кассу.']
+      "
+      :loading="jobs.isDeleting"
+      accept-label="Удалить"
+      data-test="jobs-confirm-delete"
+      @update:visible="pendingDelete = null"
+      @confirm="confirmDelete"
+    />
   </div>
 </template>
 

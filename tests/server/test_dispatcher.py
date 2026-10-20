@@ -86,6 +86,7 @@ def make_store(
     devices_version: int = 1,
     secret_box: SecretBox | None = None,
     is_active: bool = True,
+    extension_name: str | None = None,
 ) -> Store:
     """Магазин с настраиваемым «онлайн»-состоянием и учётными данными 1С (П-1)."""
     store = Store(
@@ -95,6 +96,7 @@ def make_store(
         database_name="trade",
         version_1c="8.3.24.1548",
         user_name_1c="Администратор",
+        extension_name=extension_name,
         # Токен агента — только ASCII: он уходит в заголовок `X-Agent-Token` (§8.1)
         agent_token=f"token-{uuid4().hex[:12]}",
         credentials_version=credentials_version,
@@ -702,6 +704,45 @@ class TestDownloadScenario:
         snapshots = list(session.scalars(select(FileCheck)))
         assert snapshots and snapshots[-1].cf_exists
 
+    async def test_download_uses_real_filename_from_agent(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        """Ссылка без имени файла: сервер узнаёт имя из `downloaded` (§11.3, FR-1).
+
+        Для `https://disk.yandex.ru/d/<id>` basename — это id ресурса, а не имя
+        пакета. Агент сообщает реальное имя скачанного файла, сервер
+        переспрашивает `/check-files` по нему и завершает задачу.
+        """
+        seed_settings(session)
+        store = make_store(session, online=True)
+        command = add_command(
+            session,
+            store,
+            CommandKind.DOWNLOAD_FILE,
+            {"url-file": "https://disk.yandex.ru/d/ukPxhdZu6Ax4WQ"},
+        )
+        agent = ScriptedAgent(downloaded_file_name="update.cf")
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+
+        # 1-й цикл: сервер отправил /download-file. 2-й: /check-files по имени из
+        # ссылки не находит файл, но агент сообщает `downloaded` — сервер
+        # переспрашивает по реальному имени и завершает задачу.
+        await dispatcher.process_once()
+        await dispatcher.process_once()
+
+        state = fresh(session, command.id)
+        assert state.status == CommandStatus.SUCCESS
+        assert state.log_files == ["ukPxhdZu6Ax4WQ"], "log_files — имя из ссылки (basename)"
+
+        follow_ups = command_service.list_commands(session, kind="check_files")
+        assert follow_ups, "после скачивания сервер сам заказывает проверку (§11.3)"
+        assert follow_ups[0].params == {"filename": "update"}, "переспрос по реальному имени"
+
+        await dispatcher.process_once()
+        snapshots = list(session.scalars(select(FileCheck)))
+        assert snapshots and snapshots[-1].cf_exists
+
+
     async def test_download_that_never_appears_hits_timeout(
         self, manager: DatabaseManager, settings: Settings, session: Session
     ) -> None:
@@ -717,6 +758,43 @@ class TestDownloadScenario:
         await dispatcher.process_once()
 
         assert fresh(session, command.id).status == CommandStatus.TIMEOUT
+
+
+    async def test_download_failed_status_completes_failed(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        """Скачивание провалилось: агент сообщает `failed`, задача закрывается.
+
+        Урок Э3 (наблюдение №7): нельзя ждать файл до таймаута, если касса уже
+        знает, что скачивание не удалось (сетевой сбой, Диск не отдал ссылку).
+        Агент пишет `status: failed` в `last-download.json` и сообщает его через
+        `/check-files`; диспетчер завершает задачу `failed` с текстом ошибки.
+        """
+        seed_settings(session, command_poll_timeout_sec="3600")
+        store = make_store(session, online=True)
+        command = add_command(
+            session,
+            store,
+            CommandKind.DOWNLOAD_FILE,
+            {"url-file": "https://disk.yandex.ru/d/ukPxhdZu6Ax4WQ"},
+        )
+        agent = ScriptedAgent(
+            download_failed=True,
+            download_error="404 — ресурс не найден или ссылка недоступна",
+        )
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+
+        # 1-й цикл: /download-file. 2-й: /check-files сообщает failed → задача
+        # закрывается, не дожидаясь файла.
+        await dispatcher.process_once()
+        await dispatcher.process_once()
+
+        state = fresh(session, command.id)
+        assert state.status == CommandStatus.FAILED
+        assert state.last_error and "404" in state.last_error, "текст ошибки уходит в задачу"
+        assert state.log_files == [
+            "ukPxhdZu6Ax4WQ"
+        ], "log_files — имя из ссылки (basename), файл не появился"
 
 
 class TestDispatcherLifecycle:
@@ -776,6 +854,29 @@ class TestPayloadHelpers:
             "file_name": "update",
             "full_merge": True,
         }
+
+    def test_build_1c_payload_fills_extension_from_store(self, session: Session) -> None:
+        """FR-4: имя расширения подставляется из карточки магазина, если не задано явно."""
+        store = make_store(session, online=False, extension_name="БГ_Торговоя")
+        command = add_command(
+            session, store, CommandKind.RUN_MERGE, {"file_name": "update"}
+        )
+
+        payload = build_1c_payload(store, command)
+        assert payload["extension_name"] == "БГ_Торговоя"
+
+    def test_build_1c_payload_explicit_extension_wins(self, session: Session) -> None:
+        """Явное имя расширения в параметрах операции приоритетнее карточки магазина."""
+        store = make_store(session, online=False, extension_name="БГ_Торговоя")
+        command = add_command(
+            session,
+            store,
+            CommandKind.RUN_MERGE,
+            {"file_name": "update", "extension_name": "ДругоеРасширение"},
+        )
+
+        payload = build_1c_payload(store, command)
+        assert payload["extension_name"] == "ДругоеРасширение"
 
     @pytest.mark.parametrize(
         ("url", "name", "kind"),

@@ -46,6 +46,18 @@ class TestV2Params:
         params = MergeParams(**merge_payload())
         assert params.full_merge is False
         assert params.extension_name is None
+        assert params.settings_file_name is None
+
+    def test_settings_file_name_optional_and_validated(self) -> None:
+        # Пусто/пропущено → None (по умолчанию full_merge.xml на агенте).
+        assert MergeParams(**merge_payload(settings_file_name="")).settings_file_name is None
+        assert (
+            MergeParams(**merge_payload(settings_file_name="частичное")).settings_file_name
+            == "частичное"
+        )
+        # Разделители пути — ошибка (как и для file_name).
+        with pytest.raises(ValidationError):
+            MergeParams(**merge_payload(settings_file_name="../evil"))
 
     def test_update_defaults(self) -> None:
         params = UpdateParams(**merge_payload())

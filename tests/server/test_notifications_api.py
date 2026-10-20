@@ -559,6 +559,40 @@ class TestCancel:
         actions = [row.action for row in session.scalars(select(AuditLog)).all()]
         assert "notification_cancel" in actions
 
+    def test_cancel_revokes_delivered_store(  # noqa: ANN001
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """1.23: отмена доставленного уведомления заказывает отзыв с кассы."""
+        notification_id = create_notification(auth_client)["notification"]["id"]
+        deliver(session, store, notification_id, sessions=1)
+
+        response = auth_client.post(f"{NOTIFICATIONS_URL}/{notification_id}/cancel")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["state"] == "canceled"
+        assert body["revoked_jobs"] == 1, "кассе, где уведомление уже показано, нужен отзыв"
+
+        revoked = list(
+            session.scalars(
+                select(Command).where(Command.kind == str(CommandKind.NOTIFY_CANCEL))
+            )
+        )
+        assert len(revoked) == 1
+        assert revoked[0].params == {"notification_id": notification_id}
+        assert revoked[0].store_id == store.id
+        assert revoked[0].status == str(CommandStatus.QUEUED), "диспетчер доставит отзыв"
+
+        # Повторная отмена — 409, лишних отзывов не появляется
+        auth_client.post(f"{NOTIFICATIONS_URL}/{notification_id}/cancel")
+        assert len(
+            list(
+                session.scalars(
+                    select(Command).where(Command.kind == str(CommandKind.NOTIFY_CANCEL))
+                )
+            )
+        ) == 1
+
 
 class TestNotifyAction:
     """Действие `notify` из карточки магазина и массово (§5.2.2, §11.4)."""
@@ -671,6 +705,49 @@ class TestNotifyDelivery:
         ).one()
         assert delivered.status == str(CommandStatus.SUCCESS)
 
+    def test_dispatcher_sends_notify_cancel(  # noqa: ANN001
+        self,
+        session: Session,
+        store: Store,
+        settings: Settings,
+        db_manager: DatabaseManager,
+    ) -> None:
+        """1.23: диспетчер доставляет отзыв `notify_cancel` на кассу."""
+        settings_service.ensure_defaults(session)
+        store.last_seen_at = utcnow()
+        session.commit()
+        notification = notification_service.create_notification(
+            session,
+            title="Устарело",
+            body="Отменить рассылку",
+            severity="info",
+            stores=[store],
+            created_by="tester",
+        )
+        command_service.create_command(
+            session,
+            store_id=store.id,
+            kind=CommandKind.NOTIFY_CANCEL,
+            params={"notification_id": notification.id},
+            created_by="tester",
+        )
+        session.commit()
+
+        agent = ScriptedAgent()
+        dispatcher = CommandDispatcher(
+            db_manager, settings, transport=agent.transport, interval_override_sec=0.05
+        )
+
+        report = asyncio.run(dispatcher.process_once())
+
+        assert "/notify/cancel" in agent.paths(), "отзыв ушёл на кассу (§7.4)"
+        assert agent.notify_cancel_pushes == [{"notification_id": notification.id}]
+        assert report.succeeded == 1
+        delivered = session.scalars(
+            select(Command).where(Command.kind == str(CommandKind.NOTIFY_CANCEL))
+        ).one()
+        assert delivered.status == str(CommandStatus.SUCCESS)
+
 
 
 
@@ -699,6 +776,47 @@ class TestDeleteNotification:
         actions = [row.action for row in session.scalars(select(AuditLog)).all()]
         assert "notification_delete" in actions
         assert auth_client.delete(f"{NOTIFICATIONS_URL}/{notification_id}").status_code == 404
+
+    def test_delete_revokes_delivered_store(  # noqa: ANN001
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """1.23: удаление доставленного уведомления заказывает отзыв с кассы."""
+        notification_id = create_notification(auth_client)["notification"]["id"]
+        deliver(session, store, notification_id, sessions=1)
+
+        response = auth_client.delete(f"{NOTIFICATIONS_URL}/{notification_id}")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["revoked_jobs"] == 1, "доставленной кассе нужен отзыв при удалении"
+        assert "кассам отправлен отзыв" in body["message"]
+
+        revoked = list(
+            session.scalars(
+                select(Command).where(Command.kind == str(CommandKind.NOTIFY_CANCEL))
+            )
+        )
+        assert len(revoked) == 1
+        assert revoked[0].params == {"notification_id": notification_id}
+        assert revoked[0].store_id == store.id
+
+    def test_delete_revokes_even_when_not_delivered(  # noqa: ANN001
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """1.24: удаление отзывается и кассе без `delivered_at` — иначе уведомление,
+        которое уже дошло (подтверждение доставки потерялось), «повисло» бы в трее."""
+        notification_id = create_notification(auth_client)["notification"]["id"]
+
+        response = auth_client.delete(f"{NOTIFICATIONS_URL}/{notification_id}")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["revoked_jobs"] == 1, "отзыв нужен всем адресатам"
+        revoked = list(
+            session.scalars(
+                select(Command).where(Command.kind == str(CommandKind.NOTIFY_CANCEL))
+            )
+        )
+        assert revoked[0].store_id == store.id
 
 
 CATEGORIES_URL = "/api/v1/admin/notification-categories"

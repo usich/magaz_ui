@@ -26,6 +26,7 @@ from shared.schemas import (
     MergeParams,
     MessageParams,
     NotificationPendingItem,
+    NotifyCancelRequest,
     NotifyRequest,
     UpdateParams,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "MergeParams",
     "MessageParams",
     "NotificationPendingItem",
+    "NotifyCancelRequest",
     "NotifyRequest",
     "UpdateParams",
 ]

@@ -19,7 +19,13 @@ import Message from 'primevue/message'
 import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
-import type { NotificationFilters, NotificationItem, NotificationSeverity } from '@/api/types'
+import type {
+  NotificationCategory,
+  NotificationCategoryPayload,
+  NotificationFilters,
+  NotificationItem,
+  NotificationSeverity,
+} from '@/api/types'
 import ConfirmDeleteDialog from '@/components/ConfirmDeleteDialog.vue'
 import NotificationFormDialog from '@/components/NotificationFormDialog.vue'
 import {
@@ -59,6 +65,8 @@ onMounted(async () => {
   }
   if (!stores.items.length) await stores.load()
   await notifications.load()
+  // 1.22, §11.5: категории нужны разделу «Категории» — читаем сразу с отключёнными
+  if (!notifications.allCategories.length) await notifications.loadCategories(true)
 })
 
 /** Вкладка важности: меняет фильтр списка и перечитывает выборку (§11.5, Э9). */
@@ -134,6 +142,83 @@ function formatTime(value: string | null): string {
   if (!value) return '—'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('ru-RU')
+}
+
+// --- Категории уведомлений (спека 1.22, §11.5) ------------------------------
+
+/** Открыта ли форма категории (создание или правка). */
+const categoryFormOpen = ref(false)
+/** Id редактируемой категории; `null` — создание новой. */
+const editingCategoryId = ref<number | null>(null)
+const categoryName = ref('')
+const categoryColor = ref<string>((notifications.CATEGORY_COLORS[0] as string) ?? '#64748b')
+const isCategorySaving = ref(false)
+
+function openCreateCategory(): void {
+  editingCategoryId.value = null
+  categoryName.value = ''
+  categoryColor.value = (notifications.CATEGORY_COLORS[0] as string) ?? '#64748b'
+  categoryFormOpen.value = true
+}
+
+function openEditCategory(category: NotificationCategory): void {
+  editingCategoryId.value = category.id
+  categoryName.value = category.name
+  categoryColor.value = category.color
+  categoryFormOpen.value = true
+}
+
+/** Создать или сохранить категорию: имя обязательно, цвет — из палитры сервера (§11.5). */
+async function saveCategory(): Promise<void> {
+  const name = categoryName.value.trim()
+  if (!name) {
+    toast.add({ severity: 'warn', summary: 'Имя категории не может быть пустым', life: 4000 })
+    return
+  }
+  isCategorySaving.value = true
+  try {
+    const payload: NotificationCategoryPayload = { name, color: categoryColor.value }
+    const ok =
+      editingCategoryId.value === null
+        ? await notifications.createCategory(payload)
+        : await notifications.updateCategory(editingCategoryId.value, payload)
+    if (!ok) {
+      toast.add({
+        severity: 'error',
+        summary: editingCategoryId.value === null ? 'Категория не создана' : 'Категория не изменена',
+        detail: notifications.errorMessage,
+        life: 6000,
+      })
+      return
+    }
+    categoryFormOpen.value = false
+    toast.add({
+      severity: 'success',
+      summary: editingCategoryId.value === null ? 'Категория создана' : 'Категория изменена',
+      detail: name,
+      life: 4000,
+    })
+  } finally {
+    isCategorySaving.value = false
+  }
+}
+
+/** Отключить категорию (мягкое удаление) или включить отключённую обратно (§11.5). */
+async function toggleCategory(category: NotificationCategory): Promise<void> {
+  const payload: NotificationCategoryPayload = {
+    name: category.name,
+    color: category.color,
+    is_active: !category.is_active,
+  }
+  const ok = await notifications.updateCategory(category.id, payload)
+  if (!ok) {
+    toast.add({
+      severity: 'error',
+      summary: 'Категория не изменена',
+      detail: notifications.errorMessage,
+      life: 6000,
+    })
+  }
 }
 </script>
 
@@ -386,6 +471,106 @@ function formatTime(value: string | null): string {
           </tr>
         </tbody>
       </table>
+    </section>
+
+    <!-- Категории (спека 1.22, §11.5): справочник, по которому касса группирует
+         уведомления. Здесь категории заводят, переименовывают и отключают —
+         активные предлагает форма «Создать уведомление». -->
+    <section class="rounded-xl border border-slate-200 bg-white p-5" data-test="notifications-categories">
+      <header class="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 class="text-lg font-semibold">Категории</h3>
+          <p class="magaz-muted text-sm">
+            По ним касса группирует список уведомлений (§7.4). Цвет плашки — из палитры сервера (§11.5).
+          </p>
+        </div>
+        <Button
+          label="Добавить категорию"
+          icon="pi pi-plus"
+          size="small"
+          data-test="category-add"
+          @click="openCreateCategory"
+        />
+      </header>
+
+      <form
+        v-if="categoryFormOpen"
+        class="mt-4 flex flex-wrap items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3"
+        data-test="category-form"
+        @submit.prevent="saveCategory"
+      >
+        <InputText
+          v-model="categoryName"
+          placeholder="Имя категории, например «Продажи»"
+          class="w-56"
+          :pt="{ root: { 'data-test': 'category-name' } }"
+        />
+        <div class="flex items-center gap-1">
+          <button
+            v-for="color in notifications.CATEGORY_COLORS"
+            :key="color"
+            type="button"
+            class="h-7 w-7 rounded-full border-2"
+            :class="categoryColor === color ? 'border-sky-600' : 'border-transparent'"
+            :style="{ backgroundColor: color }"
+            :aria-label="color"
+            :data-test="`category-color-${color.replace('#', '')}`"
+            @click="categoryColor = color"
+          />
+        </div>
+        <Button label="Сохранить" size="small" :loading="isCategorySaving" data-test="category-save" type="submit" />
+        <Button
+          label="Отмена"
+          size="small"
+          text
+          data-test="category-cancel"
+          type="button"
+          @click="categoryFormOpen = false"
+        />
+      </form>
+
+      <ul class="mt-4 space-y-2">
+        <li
+          v-for="category in notifications.allCategories"
+          :key="category.id"
+          class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 px-3 py-2"
+          :data-test="`category-row-${category.id}`"
+        >
+          <div class="flex items-center gap-2">
+            <span
+              class="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium text-white"
+              :style="{ backgroundColor: category.color }"
+            >
+              {{ category.name }}
+            </span>
+            <span v-if="!category.is_active" class="magaz-muted text-xs">отключена</span>
+          </div>
+          <div class="flex items-center gap-1">
+            <Button
+              label="Изменить"
+              size="small"
+              text
+              :data-test="`category-edit-${category.id}`"
+              @click="openEditCategory(category)"
+            />
+            <Button
+              :label="category.is_active ? 'Отключить' : 'Включить'"
+              size="small"
+              text
+              severity="secondary"
+              :data-test="`category-toggle-${category.id}`"
+              @click="toggleCategory(category)"
+            />
+          </div>
+        </li>
+        <li
+          v-if="!notifications.allCategories.length"
+          class="magaz-muted text-sm"
+          data-test="categories-empty"
+        >
+          Категорий пока нет: создайте первую — касса сгруппирует уведомления по ней (§7.4).
+        </li>
+      </ul>
     </section>
 
     <NotificationFormDialog

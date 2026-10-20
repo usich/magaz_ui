@@ -162,6 +162,7 @@ def create_store(
     password: str | None = None,
     secret_box: SecretBox | None = None,
     comment: str | None = None,
+    extension_name: str | None = None,
 ) -> Store:
     """Создать магазин и выдать ему токен агента (§11.2).
 
@@ -185,6 +186,7 @@ def create_store(
         devices_version=1,
         is_active=True,
         comment=(comment or "").strip() or None,
+        extension_name=(extension_name or "").strip() or None,
     )
     if password:
         if secret_box is None:  # pragma: no cover - защита от неверного вызова
@@ -209,6 +211,7 @@ def update_store(
     user_name_1c: str | None = None,
     agent_port: int | None = None,
     comment: str | None = None,
+    extension_name: str | None = None,
     is_active: bool | None = None,
 ) -> Store:
     """Изменить реквизиты магазина (передаются только изменяемые поля).
@@ -234,6 +237,9 @@ def update_store(
         store.version_1c = _require_text(version_1c, field="Версия 1С")
     if agent_port is not None:
         store.agent_port = _validate_port(agent_port)
+    if extension_name is not None:
+        store.extension_name = extension_name.strip() or None
+
     if comment is not None:
         store.comment = comment.strip() or None
     if is_active is not None:

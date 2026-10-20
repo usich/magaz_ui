@@ -135,6 +135,9 @@ class ScriptedAgent:
         cfe_exists: bool = False,
         xml_exists: bool = False,
         download_polls_before_file: int = 1,
+        downloaded_file_name: str | None = None,
+        download_failed: bool = False,
+        download_error: str | None = None,
         credentials_version: int = 1,
         devices_version: int = 1,
         device_status: str = "online",
@@ -150,6 +153,9 @@ class ScriptedAgent:
         self.cfe_exists = cfe_exists
         self.xml_exists = xml_exists
         self.download_polls_before_file = download_polls_before_file
+        self.downloaded_file_name = downloaded_file_name
+        self.download_failed = download_failed
+        self.download_error = download_error
         self.download_polls = 0
         self.download_requested = False
         self.credentials_version = credentials_version
@@ -169,6 +175,8 @@ class ScriptedAgent:
         #: Э5: принятые push-и уведомлений (ФН3) и число «видимых» сессий
         self.notify_pushes: list[dict[str, object]] = []
         self.sessions_online = 2
+        #: 1.23: принятые отзывы уведомлений (`POST /notify/cancel`)
+        self.notify_cancel_pushes: list[dict[str, object]] = []
 
     # --- Диагностика для тестов --------------------------------------------
 
@@ -240,10 +248,13 @@ class ScriptedAgent:
             return httpx.Response(
                 200, json={"queued": True, "sessions": int(self.sessions_online)}
             )
+        if path == "/notify/cancel":
+            self.notify_cancel_pushes.append(body or {})
+            return httpx.Response(200, json={"ok": True, "removed": True})
         if path == "/check-files":
             if self.download_requested:
                 self.download_polls += 1
-            return httpx.Response(200, json=self._files())
+            return httpx.Response(200, json=self._files((body or {}).get("filename")))
         if path == "/download-file":
             self.download_polls = 0
             self.download_requested = True
@@ -278,10 +289,31 @@ class ScriptedAgent:
             interrupted_operation=self.interrupted,
         )
 
-    def _files(self) -> dict[str, object]:
-        """`POST /check-files`: файл «появляется» после скачивания (ФН2, §11.3)."""
-        downloaded = self.download_requested and self.download_polls >= self.download_polls_before_file
-        has_cf = bool(self.cf_exists or downloaded)
+    def _files(self, filename: str | None = None) -> dict[str, object]:
+        """`POST /check-files`: файл «появляется» после скачивания (ФН2, §11.3).
+
+        `filename` — запрошенный сервером basename (без расширения). Файл считается
+        скачанным, если имя совпадает с реальным именем пакета (для ссылок без
+        имени сервер переспрашивает по `downloaded`).
+        """
+        appeared = (
+            self.download_requested and self.download_polls >= self.download_polls_before_file
+        )
+        downloaded_name = self.downloaded_file_name or "update.cf"
+        _, dot, suffix = downloaded_name.rpartition(".")
+        stem = (
+            downloaded_name[: len(downloaded_name) - len(suffix) - 1] if dot else downloaded_name
+        )
+        has_cf = bool(self.cf_exists or (appeared and stem == filename))
+        if self.download_failed:
+            download_status = "failed"
+            download_error = self.download_error or "ссылка не получена"
+        elif appeared:
+            download_status = "done"
+            download_error = None
+        else:
+            download_status = "downloading"
+            download_error = None
         return {
             "cf_exists": has_cf,
             "cfe_exists": bool(self.cfe_exists),
@@ -292,6 +324,9 @@ class ScriptedAgent:
             "cf_mtime": "2026-10-13T10:00:00Z" if has_cf else None,
             "cfe_mtime": None,
             "xml_mtime": None,
+            "downloaded": downloaded_name if appeared else None,
+            "download_status": download_status,
+            "download_error": download_error,
         }
 
     def _log_path(self, path: str) -> str:

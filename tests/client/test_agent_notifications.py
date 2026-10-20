@@ -254,6 +254,43 @@ class TestAgentNotificationsApi:
             )
             assert acked.status_code == 200 and acked.json()["status"] == "acknowledged"
 
+    def test_notify_cancel_requires_agent_token(self, tmp_path: Path) -> None:
+        app, _, _ = build_agent(tmp_path)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/notify/cancel", json={"notification_id": 5}
+            )
+
+        assert response.status_code == 401
+
+    def test_notify_cancel_removes_notification(self, tmp_path: Path) -> None:
+        """1.23: отмена на сервере убирает уведомление и с кассы (файловая очередь)."""
+        app, _, _ = build_agent(tmp_path)
+        params = {"session": "1", "user": "user1"}
+
+        with TestClient(app) as client:
+            client.post("/notify", json=notify_request().model_dump(mode="json"), headers=HEADERS)
+            pending = client.get(
+                "/notifications/pending", params=params
+            ).json()
+            assert [item["id"] for item in pending["notifications"]] == [5]
+
+            canceled = client.post(
+                "/notify/cancel", json={"notification_id": 5}, headers=HEADERS
+            )
+            assert canceled.status_code == 200
+            assert canceled.json() == {"ok": True, "removed": True}
+
+            after = client.get("/notifications/pending", params=params).json()
+            assert after["notifications"] == [], "отменённое не должно показываться в трее"
+
+            # Повторный отзыв (retry диспетчера) — не ошибка, просто ничего не удалено
+            again = client.post(
+                "/notify/cancel", json={"notification_id": 5}, headers=HEADERS
+            )
+            assert again.json() == {"ok": True, "removed": False}
+
     def test_unknown_notification_is_404(self, tmp_path: Path) -> None:
         app, _, _ = build_agent(tmp_path)
         ref = {"session_id": "1", "session_user": "user1"}

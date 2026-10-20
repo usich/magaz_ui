@@ -101,6 +101,8 @@ function apiMock(
     }
     if (url.includes('/admin/notifications/')) return jsonResponse(REPORT)
     if (url.includes('/admin/notifications')) return jsonResponse(list)
+    // 1.22: раздел «Категории» читается на загрузке страницы — по умолчанию пуст
+    if (url.includes('/notification-categories')) return jsonResponse([])
     return jsonResponse(stores)
   }
 }
@@ -317,6 +319,127 @@ describe('страница «Уведомления»', () => {
     expect(wrapper.find('[data-test="notify-form-editor"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="notify-form-delete-after-read"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="notify-form-preview"]').exists()).toBe(true)
+  })
+})
+
+describe('раздел «Категории» (спека 1.22, §11.5)', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  const sales = {
+    id: 1,
+    name: 'Продажи',
+    color: '#2563eb',
+    sort_order: 0,
+    is_active: true,
+    created_by: 'admin',
+    created_at: null,
+  }
+  const purchases = {
+    id: 2,
+    name: 'Закупки',
+    color: '#10b981',
+    sort_order: 1,
+    is_active: false,
+    created_by: 'admin',
+    created_at: null,
+  }
+
+  /** Мок категорий: GET — список, POST — создаёт и добавляет в список, PUT — меняет. */
+  function categoryMock(categories: Record<string, unknown>[]) {
+    return async (url: string, init?: RequestInit) => {
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (url.includes('/admin/notifications/')) return jsonResponse(REPORT)
+      if (url.includes('/admin/notifications')) return jsonResponse(makeList([]))
+      if (url.includes('/notification-categories')) {
+        if (method === 'POST') {
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          const created = {
+            id: 10,
+            name: body.name,
+            color: body.color,
+            sort_order: 0,
+            is_active: true,
+            created_by: 'admin',
+            created_at: null,
+          }
+          categories.push(created)
+          return jsonResponse(created)
+        }
+        if (method === 'PUT') {
+          const id = Number(url.split('/').pop())
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          const index = categories.findIndex((item) => item.id === id)
+          if (index !== -1) categories[index] = { ...categories[index], ...body }
+          return jsonResponse(categories[index])
+        }
+        return jsonResponse(categories)
+      }
+      return jsonResponse([])
+    }
+  }
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('показывает категории и помечает отключённую (1.22, §11.5)', async () => {
+    fetchMock.mockImplementation(categoryMock([sales, purchases]))
+
+    const { wrapper } = await mountNotifications(fetchMock)
+
+    expect(wrapper.find('[data-test="notifications-categories"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="category-row-1"]').text()).toContain('Продажи')
+    const row2 = wrapper.find('[data-test="category-row-2"]')
+    expect(row2.text()).toContain('Закупки')
+    expect(row2.text()).toContain('отключена')
+  })
+
+  it('пустой список объясняет, что категории ещё не заведены', async () => {
+    fetchMock.mockImplementation(categoryMock([]))
+
+    const { wrapper } = await mountNotifications(fetchMock)
+
+    expect(wrapper.find('[data-test="categories-empty"]').text()).toContain('Категорий пока нет')
+  })
+
+  it('создание категории отправляет POST и обновляет список (§11.5)', async () => {
+    const state: Record<string, unknown>[] = []
+    fetchMock.mockImplementation(categoryMock(state))
+
+    const { wrapper } = await mountNotifications(fetchMock)
+    await wrapper.find('[data-test="category-add"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('[data-test="category-name"]').setValue('Логистика')
+    await wrapper.find('[data-test="category-form"]').trigger('submit')
+    await flushPromises()
+
+    const postCall = fetchMock.mock.calls.find((call) => {
+      const u = String(call[0])
+      return u.includes('/notification-categories') && (call[1] as RequestInit | undefined)?.method === 'POST'
+    })
+    expect(postCall).toBeTruthy()
+    expect(wrapper.find('[data-test="category-row-10"]').text()).toContain('Логистика')
+  })
+
+  it('«Отключить» отправляет PUT с is_active=false (мягкое удаление)', async () => {
+    fetchMock.mockImplementation(categoryMock([sales]))
+
+    const { wrapper } = await mountNotifications(fetchMock)
+    await wrapper.find('[data-test="category-toggle-1"]').trigger('click')
+    await flushPromises()
+
+    const putCall = fetchMock.mock.calls.find((call) => {
+      const u = String(call[0])
+      return u.includes('/notification-categories/1') && (call[1] as RequestInit | undefined)?.method === 'PUT'
+    })
+    expect(putCall).toBeTruthy()
+    expect((putCall?.[1] as RequestInit).body).toContain('"is_active":false')
+    // Список перечитан — категория теперь отключена
+    expect(wrapper.find('[data-test="category-row-1"]').text()).toContain('отключена')
   })
 })
 

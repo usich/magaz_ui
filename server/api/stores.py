@@ -82,6 +82,7 @@ class StoreOut(BaseModel):
     is_online: bool = False
     is_active: bool
     comment: str | None = None
+    extension_name: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -112,6 +113,7 @@ class StoreOut(BaseModel):
             is_online=store.is_online(now, online_window_sec),
             is_active=store.is_active,
             comment=store.comment,
+            extension_name=store.extension_name,
             created_at=to_iso_z(store.created_at),
             updated_at=to_iso_z(store.updated_at),
         )
@@ -147,6 +149,7 @@ class StoreCreateRequest(BaseModel):
     agent_port: int = store_service.DEFAULT_AGENT_PORT
     password: str | None = None
     comment: str | None = None
+    extension_name: str | None = None
 
 
 class StoreUpdateRequest(BaseModel):
@@ -160,6 +163,7 @@ class StoreUpdateRequest(BaseModel):
     user_name_1c: str | None = None
     agent_port: int | None = None
     comment: str | None = None
+    extension_name: str | None = None
     is_active: bool | None = None
 
 
@@ -311,6 +315,7 @@ def create_store_endpoint(
             password=payload.password,
             secret_box=context.secret_box,
             comment=payload.comment,
+            extension_name=payload.extension_name,
         )
     except store_service.StoreValidationError as exc:
         raise HTTPException(

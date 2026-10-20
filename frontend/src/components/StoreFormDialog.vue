@@ -45,6 +45,7 @@ interface StoreForm {
   agent_port: number
   password: string
   comment: string
+  extension_name: string
   is_active: boolean
   clear_password: boolean
 }
@@ -60,6 +61,7 @@ function emptyForm(): StoreForm {
     agent_port: DEFAULT_AGENT_PORT,
     password: '',
     comment: '',
+    extension_name: '',
     is_active: true,
     clear_password: false,
   }
@@ -100,6 +102,7 @@ function reset(): void {
     user_name_1c: store?.user_name_1c ?? 'Администратор',
     agent_port: store?.agent_port ?? DEFAULT_AGENT_PORT,
     comment: store?.comment ?? '',
+    extension_name: store?.extension_name ?? '',
     is_active: store?.is_active ?? true,
   })
   formError.value = ''
@@ -149,6 +152,7 @@ async function submit(): Promise<void> {
         agent_port: Number(form.agent_port),
         password: form.password || null,
         comment: form.comment.trim() || null,
+        extension_name: form.extension_name.trim() || null,
       }
       const created = await stores.create(payload)
       emit('saved', created, true)
@@ -170,6 +174,7 @@ async function submit(): Promise<void> {
       user_name_1c: form.user_name_1c.trim(),
       agent_port: Number(form.agent_port),
       comment: form.comment.trim() || null,
+      extension_name: form.extension_name.trim() || null,
       is_active: form.is_active,
     }
     let updated = await stores.update(id, payload)
@@ -279,6 +284,15 @@ async function submit(): Promise<void> {
           v-model="form.comment"
           class="w-full"
           :pt="{ root: { 'data-test': 'form-comment' } }"
+        />
+      </label>
+      <label class="space-y-1 md:col-span-2">
+        <span class="magaz-muted text-xs">Имя расширения 1С (для слияния)</span>
+        <InputText
+          v-model="form.extension_name"
+          class="w-full"
+          placeholder="БГ_Торговоя"
+          :pt="{ root: { 'data-test': 'form-extension-name' } }"
         />
       </label>
 

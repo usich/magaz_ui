@@ -246,6 +246,8 @@ class CancelNotificationOut(BaseModel):
     notification_id: int
     state: str
     canceled_jobs: int
+    #: 1.23: сколько касс получили отзыв (`notify_cancel`) — убрать из очереди
+    revoked_jobs: int = 0
     message: str
 
 
@@ -603,28 +605,35 @@ def cancel_notification(
             detail="Уведомление уже отменено: рассылка не активна",
         )
 
-    canceled = notification_service.cancel_notification(session, notification)
+    summary = notification_service.cancel_notification(session, notification)
+    canceled = int(summary["canceled_jobs"])
+    revoked = int(summary["revoked_jobs"])
     audit_service.record(
         session,
         action="notification_cancel",
         actor=admin.username,
         entity="notification",
         entity_id=notification.id,
-        details={"canceled_jobs": canceled},
+        details={"canceled_jobs": canceled, "revoked_jobs": revoked},
         ip_address=get_client_ip(request),
     )
     session.commit()
     logger.info(
-        "Уведомление id=%s отменено администратором %s (задач закрыто: %s)",
+        "Уведомление id=%s отменено администратором %s (задач закрыто: %s, отзывов: %s)",
         notification.id,
         admin.username,
         canceled,
+        revoked,
     )
     return CancelNotificationOut(
         notification_id=notification.id,
         state=notification_service.state(notification),
         canceled_jobs=canceled,
-        message=f"Рассылка остановлена; незавершённых задач закрыто: {canceled}",
+        revoked_jobs=revoked,
+        message=(
+            f"Рассылка остановлена; незавершённых задач закрыто: {canceled}"
+            + (f", кассам отправлен отзыв: {revoked}" if revoked else "")
+        ),
     )
 
 
@@ -770,6 +779,8 @@ class NotificationDeleteOut(BaseModel):
 
     notification_id: int
     canceled_jobs: int = 0
+    #: 1.23: сколько касс получили отзыв (`notify_cancel`) — убрать из очереди
+    revoked_jobs: int = 0
     images_removed: int = 0
     message: str
 
@@ -814,6 +825,7 @@ def delete_notification_endpoint(
         details={
             "title": notification.title,
             "canceled_jobs": summary["canceled_jobs"],
+            "revoked_jobs": summary["revoked_jobs"],
             "images_removed": summary["images_removed"],
         },
         ip_address=get_client_ip(request),
@@ -825,12 +837,18 @@ def delete_notification_endpoint(
     return NotificationDeleteOut(
         notification_id=notification_id,
         canceled_jobs=summary["canceled_jobs"],
+        revoked_jobs=summary["revoked_jobs"],
         images_removed=summary["images_removed"],
         message=(
             "Уведомление удалено"
             + (
                 f"; незавершённых задач закрыто: {summary['canceled_jobs']}"
                 if summary["canceled_jobs"]
+                else ""
+            )
+            + (
+                f"; кассам отправлен отзыв: {summary['revoked_jobs']}"
+                if summary["revoked_jobs"]
                 else ""
             )
             + (

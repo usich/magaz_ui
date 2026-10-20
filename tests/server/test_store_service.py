@@ -41,6 +41,11 @@ class TestCreateStore:
         assert first.devices_version == 1, "Д-2: версия списка оборудования стартует с 1"
         assert first.credentials_version == 1
 
+    def test_extension_name_is_saved_and_stripped(self, session: Session) -> None:
+        store = make_store(session, name="Магазин №9", ip_address="10.10.9.9", extension_name=" БГ_Торговоя ")
+        session.commit()
+        assert store.extension_name == "БГ_Торговоя", "имя расширения обрезается (FR-4)"
+
     def test_password_is_encrypted_and_never_plaintext(
         self, session: Session, secret_box: SecretBox
     ) -> None:

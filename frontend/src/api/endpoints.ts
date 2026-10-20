@@ -23,7 +23,9 @@ import type {
   FileMatrixFilters,
   FileSnapshotDeleted,
   JobDetail,
+  JobDelete,
   JobFilters,
+  JobsBulkDelete,
   JobsPage,
   LoginPayload,
   NotificationCategory,
@@ -190,6 +192,12 @@ export const jobsApi = {
 
   /** Карточка задачи с полным журналом (`/jobs/{id}`, §11.6). */
   get: (id: number) => api.get<JobDetail>(`/admin/jobs/${id}`),
+
+  /** Удалить одну задачу вместе с журналом (`DELETE /jobs/{id}`, §11.6, Э10). */
+  remove: (id: number) => api.delete<JobDelete>(`/admin/jobs/${id}`),
+
+  /** Удалить выбранные задачи (`POST /jobs/bulk-delete`, §11.6, Э10). */
+  removeBulk: (ids: number[]) => api.post<JobsBulkDelete>('/admin/jobs/bulk-delete', { ids }),
 }
 
 /** Матрица файлов обновления (§11.3, Q52). */

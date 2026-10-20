@@ -185,6 +185,28 @@ class JobsPageOut(BaseModel):
     active: int = 0
 
 
+class JobDeleteOut(BaseModel):
+    """Ответ `DELETE /jobs/{id}`: что удалено (§11.6, Э10)."""
+
+    job_id: int
+    deleted: bool
+    message: str
+
+
+class JobsBulkDeleteRequest(BaseModel):
+    """Тело `POST /jobs/bulk-delete`: список id выбранных задач (§11.6, Э10)."""
+
+    ids: list[int] = Field(default_factory=list)
+
+
+class JobsBulkDeleteOut(BaseModel):
+    """Ответ `POST /jobs/bulk-delete`: сколько задач удалено (§11.6, Э10)."""
+
+    deleted: int
+    total: int
+    message: str
+
+
 class FileMatrixRow(BaseModel):
     """Строка матрицы `/files`: магазин и его последняя проверка (§11.3)."""
 
@@ -322,6 +344,9 @@ def _validate_action(action: str, params: dict[str, Any]) -> tuple[str, dict[str
         extension_name = str(raw.get("extension_name") or "").strip()
         if extension_name:
             clean["extension_name"] = extension_name
+        settings_file_name = str(raw.get("settings_file_name") or "").strip()
+        if settings_file_name:
+            clean["settings_file_name"] = _validate_filename(settings_file_name)
 
     elif name == str(ActionKind.RUN_UPDATE_DB):
         clean["is_fast_update"] = bool(raw.get("is_fast_update"))
@@ -810,6 +835,87 @@ def get_job(job_id: int, session: Annotated[Session, Depends(get_db)]) -> JobDet
     logs = list(command.logs)
     base = JobOut.from_model(command, last_message=logs[-1].message if logs else None)
     return JobDetailOut(**base.model_dump(), logs=[JobLogOut.from_model(entry) for entry in logs])
+
+
+@router.delete(
+    "/jobs/{job_id}",
+    response_model=JobDeleteOut,
+    summary="Удалить задачу",
+)
+def delete_job(
+    job_id: int,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+) -> JobDeleteOut:
+    """Удалить одну задачу вместе с её журналом (§11.6, Э10).
+
+    Зависшая задача в очереди (например, ошибочный `download_file`) блокирует
+    новые — админ убирает её вручную. Для незавершённой это «снять с очереди»:
+    диспетчер больше её не увидит. Удаление в любом статусе, историю аудита
+    оставляет `job_delete`.
+    """
+    deleted = command_service.delete_command(session, job_id)
+    if deleted is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Задача id={job_id} не найдена"
+        )
+    audit_service.record(
+        session,
+        action="job_delete",
+        actor=admin.username,
+        entity="job",
+        entity_id=job_id,
+        details={"kind": str(deleted.kind), "status": str(deleted.status)},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    logger.info("Задача id=%s удалена администратором %s", job_id, admin.username)
+    return JobDeleteOut(job_id=job_id, deleted=True, message="Задача удалена")
+
+
+@router.post(
+    "/jobs/bulk-delete",
+    response_model=JobsBulkDeleteOut,
+    summary="Удалить выбранные задачи",
+)
+def bulk_delete_jobs(
+    payload: JobsBulkDeleteRequest,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+) -> JobsBulkDeleteOut:
+    """Удалить несколько задач за один запрос (§11.6, Э10).
+
+    Тело — `{"ids": [...]}`. Несуществующие id пропускаются, поэтому повторный
+    запрос идемпотентен. Пустой список — `422` (чтобы UI не «удалил 0» по ошибке).
+    В аудите остаётся запись `job_bulk_delete` с числом удалённых.
+    """
+    ids = list(dict.fromkeys(int(item) for item in payload.ids))
+    if not ids:
+        raise HTTPException(
+            status_code=HTTP_422,
+            detail="Не выбрано ни одной задачи для удаления",
+        )
+    deleted = command_service.delete_commands(session, ids)
+    audit_service.record(
+        session,
+        action="job_bulk_delete",
+        actor=admin.username,
+        entity="job",
+        entity_id=None,
+        details={"ids": ids, "deleted": deleted, "total": len(ids)},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    logger.info(
+        "Администратор %s удалил задач: %s из %s", admin.username, deleted, len(ids)
+    )
+    return JobsBulkDeleteOut(
+        deleted=deleted,
+        total=len(ids),
+        message=f"Удалено задач: {deleted} из {len(ids)}",
+    )
 
 
 # --- Матрица файлов (§11.3) -------------------------------------------------

@@ -49,6 +49,8 @@ __all__ = [
     "count_active",
     "counts_by_status",
     "create_command",
+    "delete_command",
+    "delete_commands",
     "dispatch_guard",
     "find_update_conflicts",
     "get_command",
@@ -239,6 +241,43 @@ def get_command(session: Session, command_id: int) -> Command | None:
         .options(selectinload(Command.store), selectinload(Command.logs))
     )
     return session.scalars(stmt).one_or_none()
+
+
+def delete_command(session: Session, command_id: int) -> Command | None:
+    """Жёстко удалить задачу вместе с её журналом (Э10, §11.6).
+
+    Каскад `job_logs` уходит через relationship `Command.logs`
+    (`cascade="all, delete-orphan"`) и FK `ondelete="CASCADE"`. Задача в любом
+    статусе может быть удалена: для незавершённой это «снять с очереди» —
+    диспетчер (который читает `list_pending` из той же таблицы) перестанет её
+    видеть сразу после коммита. Возвращает `None`, если задачи нет.
+    """
+    command = session.get(Command, command_id)
+    if command is None:
+        return None
+    session.delete(command)
+    session.flush()
+    logger.info("Задача id=%s удалена (журнал ушёл вместе с ней)", command_id)
+    return command
+
+
+def delete_commands(session: Session, command_ids: Sequence[int]) -> int:
+    """Жёстко удалить несколько задач; возвращает число удалённых (§11.6, Э10).
+
+    Несуществующие id пропускаются (идемпотентность массовой операции), поэтому
+    повторный запрос с тем же списком не падает. Каждая задача удаляется через
+    ORM-каскад журнала `job_logs`.
+    """
+    ids = [int(item) for item in command_ids if item]
+    if not ids:
+        return 0
+    deleted = 0
+    for command_id in ids:
+        if delete_command(session, command_id) is not None:
+            deleted += 1
+    session.flush()
+    logger.info("Удалено задач: %s (из %s запрошенных)", deleted, len(ids))
+    return deleted
 
 
 def list_commands(

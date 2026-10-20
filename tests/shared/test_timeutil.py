@@ -52,6 +52,8 @@ class TestEnumValues:
             "run_update_db",
             "send_message",
             "notify",
+            #: 1.23: отзыв уже доставленного уведомления с кассы
+            "notify_cancel",
             #: Э10: удаление файлов обновления на кассе
             "delete_file",
         }

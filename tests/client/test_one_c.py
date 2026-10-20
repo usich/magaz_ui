@@ -90,10 +90,32 @@ class TestBuildMergeCommand:
             make_merge_params(extension_name="МоеРасширение"), LOG_PATH, one_c_paths
         )
 
-        assert "/Extension" in args
-        assert args[args.index("/Extension") + 1] == "МоеРасширение"
+        # Расширение 1С объединяется `/MergeCfg <файл>.cfe -Extension <имя> -force
+        # -Settings <файл>.xml` (проверено на 8.3.27). По умолчанию settings —
+        # `full_merge.xml`; `/LoadCfg` для расширения не используется.
+        assert "/MergeCfg" in args
         assert args[args.index("/MergeCfg") + 1].endswith("1cv8.cfe")
-        assert "-Settings" not in args, "FR-4: у слияния расширения настроек нет"
+        assert args[args.index("-Extension") + 1] == "МоеРасширение"
+        assert "/LoadCfg" not in args
+        assert "-force" in args, "FR-4: -force из рабочего вызова на 8.3.27"
+        assert "-Settings" in args, "FR-4: расширение тоже идёт через -Settings"
+        assert args[args.index("-Settings") + 1].endswith("full_merge.xml"), (
+            "FR-4: для расширения по умолчанию full_merge.xml"
+        )
+        # Порядок как в успешном вызове: файл → -Extension → -force → -Settings.
+        assert args.index("-Extension") < args.index("-force") < args.index("-Settings")
+
+    def test_extension_partial_merge_uses_settings_file(self, one_c_paths) -> None:  # noqa: ANN001
+        args = build_merge_command(
+            make_merge_params(
+                extension_name="МоеРасширение", settings_file_name="частичное_слияние"
+            ),
+            LOG_PATH,
+            one_c_paths,
+        )
+        assert args[args.index("-Settings") + 1].endswith("частичное_слияние.xml"), (
+            "FR-4: частичное слияние расширения использует заданное имя файла настроек"
+        )
 
     def test_empty_password_is_not_passed(self, one_c_paths) -> None:  # noqa: ANN001
         args = build_merge_command(make_merge_params(password=""), LOG_PATH, one_c_paths)

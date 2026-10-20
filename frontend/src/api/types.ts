@@ -116,6 +116,7 @@ export interface StoreItem {
   is_online: boolean
   is_active: boolean
   comment: string | null
+  extension_name: string | null
   created_at: string | null
   updated_at: string | null
 }
@@ -147,6 +148,7 @@ export interface StoreCreatePayload {
   agent_port: number
   password?: string | null
   comment?: string | null
+  extension_name?: string | null
 }
 
 /** Тело `PUT /stores/{id}`: передаются только изменяемые поля. */
@@ -225,6 +227,20 @@ export interface JobsPage {
   counts: Record<string, number>
   total: number
   active: number
+}
+
+/** Ответ `DELETE /jobs/{id}`: что удалено (§11.6, Э10). */
+export interface JobDelete {
+  job_id: number
+  deleted: boolean
+  message: string
+}
+
+/** Ответ `POST /jobs/bulk-delete`: сколько задач удалено (§11.6, Э10). */
+export interface JobsBulkDelete {
+  deleted: number
+  total: number
+  message: string
 }
 
 export interface JobFilters {

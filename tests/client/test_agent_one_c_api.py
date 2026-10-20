@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -107,6 +108,62 @@ class TestFileSystemEndpoints:
         assert body["cf_mtime"].endswith("Z"), "даты в API — UTC (§6)"
         assert body["cfe_size"] is None and body["xml_mtime"] is None
 
+    async def test_check_files_reports_last_download_name(
+        self, one_c_config, work_dir: Path
+    ) -> None:  # noqa: ANN001
+        """FR-1: `/check-files` сообщает реальное имя скачанного файла (`downloaded`).
+
+        Для ссылки Яндекс.Диска без имени файла сервер по этому полю узнаёт
+        basename пакета и переспрашивает `/check-files` уже по нему.
+        """
+        (work_dir / "update.cf").write_text("cf", encoding="utf-8")
+        (work_dir / downloader.LAST_DOWNLOAD_FILE).write_text(
+            json.dumps({"status": "done", "filename": "update.cf"}),
+            encoding="utf-8",
+        )
+
+        async with agent_api(one_c_config, RecordingProvider()) as (http, _):
+            body = (
+                await http.post(
+                    "/check-files", json={"filename": "ukPxhdZu6Ax4WQ"}, headers=HEADERS
+                )
+            ).json()
+
+        assert body["downloaded"] == "update.cf"
+        assert body["cf_exists"] is False, "имя из ссылки не совпадает с реальным файлом"
+
+    async def test_check_files_reports_download_failure(
+        self, one_c_config, work_dir: Path
+    ) -> None:  # noqa: ANN001
+        """Провал скачивания: `/check-files` сообщает статус и текст ошибки.
+
+        Агент пишет `status: failed` + `error` в `last-download.json`, когда Диск
+        не отдал ссылку или произошёл сетевой сбой. Сервер по этим полям
+        закрывает задачу `download_file` как `failed`, а не ждёт файл до таймаута.
+        """
+        (work_dir / downloader.LAST_DOWNLOAD_FILE).write_text(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "filename": None,
+                    "error": "404 — ресурс не найден или ссылка недоступна",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async with agent_api(one_c_config, RecordingProvider()) as (http, _):
+            body = (
+                await http.post(
+                    "/check-files", json={"filename": "ukPxhdZu6Ax4WQ"}, headers=HEADERS
+                )
+            ).json()
+
+        assert body["download_status"] == "failed"
+        assert body["download_error"] == "404 — ресурс не найден или ссылка недоступна"
+        assert body["downloaded"] is None, "имя при провале не отдаётся"
+        assert body["cf_exists"] is False
+
     async def test_check_files_rejects_path_traversal(self, one_c_config) -> None:  # noqa: ANN001
         async with agent_api(one_c_config, RecordingProvider()) as (http, _):
             response = await http.post(
@@ -163,6 +220,12 @@ class TestMergeEndpoints:
         assert response.json()["log_path"] == str(work_dir / "log-merge-extension.txt")
         command = provider.commands[0]
         assert command[command.index("/MergeCfg") + 1].endswith("1cv8.cfe")
+        assert command.index("-Extension") < command.index("-Settings"), (
+            "FR-4: порядок `/MergeCfg <файл> -Extension <имя> -force -Settings`"
+        )
+        assert command[command.index("-Settings") + 1].endswith("full_merge.xml"), (
+            "FR-4: для расширения по умолчанию full_merge.xml"
+        )
 
     async def test_check_merge_states(self, one_c_config, work_dir: Path) -> None:  # noqa: ANN001
         """Переходы статусов слияния (перенос v2): 202 → 400 → 200."""

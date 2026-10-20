@@ -128,6 +128,11 @@ class Store(TimestampMixin, Base):
     )
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+
+    # Имя расширения 1С для этого магазина (FR-4): при массовой операции сервер
+    # подставляет его в `run_merge`, если в форме операции не задано явно.
+    extension_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
     devices: Mapped[list["StoreDevice"]] = relationship(
         back_populates="store",
         cascade="all, delete-orphan",

@@ -39,6 +39,7 @@ __all__ = [
     "MessageParams",
     "NotificationCategoryRef",
     "NotificationPendingItem",
+    "NotifyCancelRequest",
     "NotifyRequest",
     "ReceiptReport",
     "UpdateParams",
@@ -86,10 +87,20 @@ class MergeParams(Base1CParams):
     file_name: str
     full_merge: bool = False
     extension_name: str | None = None
+    # Частичное слияние расширения: имя xml-настроек без расширения; если не задано —
+    # по умолчанию `full_merge.xml`.
+    settings_file_name: str | None = None
 
     @field_validator("file_name")
     @classmethod
     def check_file_name(cls, value: str) -> str:
+        return _validate_file_name(value)
+
+    @field_validator("settings_file_name")
+    @classmethod
+    def check_settings_file_name(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
         return _validate_file_name(value)
 
 
@@ -140,7 +151,18 @@ class CheckFilesParams(BaseModel):
 
 
 class CheckFilesResponse(BaseModel):
-    """Ответ `/check-files` (Q52: `*_size`/`*_mtime` — расширение, обратно совместимо)."""
+    """Ответ `/check-files` (Q52: `*_size`/`*_mtime` — расширение, обратно совместимо).
+
+    `downloaded` — имя последнего скачанного пакета (с расширением), которое
+    агент записал в `last-download.json` (FR-1). Непусто, только если файл
+    реально присутствует в рабочей папке. Сервер использует его, когда имя
+    файла не следует из ссылки (§11.3) — например для ссылок Яндекс.Диска.
+
+    `download_status`/`download_error` — состояние последнего скачивания из
+    `last-download.json` (`downloading`/`done`/`failed` и текст ошибки при
+    провале). Диспетчер по ним закрывает задачу `download_file` как `failed`,
+    а не ждёт файл до таймаута (§11.4).
+    """
 
     cf_exists: bool
     cfe_exists: bool
@@ -151,6 +173,9 @@ class CheckFilesResponse(BaseModel):
     cf_mtime: str | None = None
     cfe_mtime: str | None = None
     xml_mtime: str | None = None
+    downloaded: str | None = None
+    download_status: str | None = None
+    download_error: str | None = None
 
 
 class DeleteFileParams(BaseModel):
@@ -263,6 +288,17 @@ class NotifyRequest(BaseModel):
         return value
 
 
+class NotifyCancelRequest(BaseModel):
+    """`POST /notify/cancel` — отзыв уже доставленного уведомления (1.23, §7.4).
+
+    Сервер шлёт его, когда админ отменяет или удаляет уведомление: касса убирает
+    уведомление из файловой очереди и связанные состояния сессий, поэтому оно
+    перестаёт показываться и не «висит» в трее после отмены на сервере.
+    """
+
+    notification_id: int
+
+
 class NotificationCategoryRef(BaseModel):
     """Категория уведомления в том виде, в каком её видит касса (1.22, §7.4).
 
@@ -294,6 +330,9 @@ class NotificationPendingItem(BaseModel):
     requires_ack: bool
     repeat_every_min: int | None = None
     snooze_until: str | None = None
+    #: 1.24: прочитанное (`delete_after_read=false`) показывается в своих категориях
+    #: важности с пометкой «прочитано», а не в отдельном «справочнике» (§7.4)
+    acknowledged: bool = False
 
 
 class AckRequest(BaseModel):

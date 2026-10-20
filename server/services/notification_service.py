@@ -1078,12 +1078,51 @@ def _notify_commands(
     ]
 
 
-def cancel_notification(session: Session, notification: Notification) -> int:
+def _schedule_notify_cancels(
+    session: Session, notification: Notification, *, author: str | None = None
+) -> int:
+    """Заказать отзыв уведомления магазинам, куда оно адресовано (1.23, §7.4).
+
+    При отмене/удалении уведомления доставленная касса должна убрать его из
+    файловой очереди, иначе оно продолжает «висеть» в трее после отмены на
+    сервере. Отзыв (`notify_cancel`) ставится **всем** адресатам уведомления, а не
+    только тем, у кого `delivered_at` уже проставлен: доставка подтверждается
+    агентом отдельно, и подтверждение может потеряться (касса офлайн, гонка при
+    удалении) — тогда уведомление дошло, а `delivered_at` на сервере нет, и без
+    отзыва оно «висело» бы в трее после отмены. Касса, которая уведомления не
+    получала, отзыв неизвестного id проигнорирует (`NotificationQueue.remove`
+    возвращает `False`, не ошибка).
+    Повторная отмена не плодит задач: адресаты уведомления уже выбраны.
+    """
+    store_ids = [int(target.store_id) for target in notification.targets]
+    if not store_ids:
+        return 0
+    with command_service.dispatch_guard():
+        for store_id in store_ids:
+            command_service.create_command(
+                session,
+                store_id=store_id,
+                kind=CommandKind.NOTIFY_CANCEL,
+                params={"notification_id": notification.id},
+                created_by=author,
+            )
+    session.flush()
+    logger.info(
+        "Отзыв уведомления id=%s заказан магазинам: %s", notification.id, len(store_ids)
+    )
+    return len(store_ids)
+
+
+def cancel_notification(session: Session, notification: Notification) -> dict[str, int]:
     """Отменить рассылку (§11.5) и закрыть ещё не отправленные задачи.
 
     Уже показанные окна отозвать нельзя: TrayAgent перестанет отдавать
     уведомление сам — `GET /notifications/pending` отдаёт только активные
     (§7.4), — а отчёт сохранит историю «кто успел ознакомиться».
+
+    1.23: кассы, куда уведомление уже доставлено, получают отзыв
+    (`notify_cancel`), чтобы уведомление исчезло и из файловой очереди — иначе
+    оно «висело» бы в трее после отмены на сервере.
     """
     notification.is_active = False
     canceled = 0
@@ -1094,13 +1133,17 @@ def cancel_notification(session: Session, notification: Notification) -> int:
         command_service.set_status(session, command, CommandStatus.CANCELED)
         command_service.add_log(session, command, "Уведомление отменено администратором")
         canceled += 1
+    revoked = _schedule_notify_cancels(
+        session, notification, author=notification.created_by
+    )
     session.flush()
     logger.info(
-        "Уведомление id=%s отменено; незавершённых задач закрыто: %s",
+        "Уведомление id=%s отменено; незавершённых задач закрыто: %s, отзывов: %s",
         notification.id,
         canceled,
+        revoked,
     )
-    return canceled
+    return {"canceled_jobs": canceled, "revoked_jobs": revoked}
 
 
 def _receipt_row(
@@ -1298,6 +1341,9 @@ def delete_notification(
 
     Уже показанные на кассах окна не отзываются — это то же ограничение, что и у
     отмены (§7.4): сервер не управляет тем, что уже нарисовано в сессии Windows.
+
+    1.23: кассы, куда уведомление уже доставлено, получают отзыв (`notify_cancel`),
+    чтобы уведомление исчезло и из файловой очереди кассы после удаления.
     """
     canceled = 0
     for command in _notify_commands(
@@ -1306,6 +1352,9 @@ def delete_notification(
         command_service.set_status(session, command, CommandStatus.CANCELED)
         command_service.add_log(session, command, "Уведомление удалено администратором")
         canceled += 1
+    revoked = _schedule_notify_cancels(
+        session, notification, author=notification.created_by
+    )
 
     names = [str(image.name) for image in _images_of(session, notification)]
     for name in names:
@@ -1343,12 +1392,17 @@ def delete_notification(
     session.delete(notification)
     session.flush()
     logger.info(
-        "Уведомление id=%s удалено; задач закрыто: %s, картинок: %s",
+        "Уведомление id=%s удалено; задач закрыто: %s, отзывов: %s, картинок: %s",
         notification.id,
         canceled,
+        revoked,
         len(names),
     )
-    return {"canceled_jobs": canceled, "images_removed": len(names)}
+    return {
+        "canceled_jobs": canceled,
+        "revoked_jobs": revoked,
+        "images_removed": len(names),
+    }
 
 
 # --- Категории уведомлений (1.22, §4.6, §11.5) ------------------------------

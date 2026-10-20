@@ -38,6 +38,7 @@ __all__ = [
     "TrayGroup",
     "TrayPresenter",
     "build_tabs",
+    "category_nav",
     "group_items",
     "items_for_tab",
     "panel_geometry",
@@ -58,12 +59,13 @@ TAB_ALL = "all"
 TAB_ARCHIVE = "archive"
 
 #: Подписи вкладок окна кассы: уровни совпадают с уровнями уведомления (§4.6)
+#: «справочника» больше нет — прочитанное показывается в своих категориях важности
+#: с пометкой «прочитано» (1.24, §7.4).
 TAB_TITLES: dict[str, str] = {
     TAB_ALL: "все",
     str(NotificationSeverity.INFO): "информация",
     str(NotificationSeverity.IMPORTANT): "важно",
     str(NotificationSeverity.CRITICAL): "критично",
-    TAB_ARCHIVE: "справочник",
 }
 
 #: Доля площади экрана, которую занимает окно уведомления (§7.4: не больше 15 %)
@@ -190,10 +192,11 @@ def build_tabs(
     unread: "Sequence[NotificationPendingItem]",
     archive: "Sequence[NotificationPendingItem]",
 ) -> list[TrayTab]:
-    """Вкладки окна: «все», три уровня и «справочник» со счётчиками (§7.4, Э9).
+    """Вкладки окна: «все» и три уровня важности со счётчиками (§7.4, Э9).
 
-    Счётчики считаются здесь, а не в окне: так их видно тестам, и трей не хранит
-    второй список — он показывает то же, что отдала служба.
+    Счётчики — только непрочитанные (вкладки «справочник» нет: прочитанное с
+    `delete_after_read=false` показывается в своих категориях важности с пометкой
+    «прочитано», 1.24). Считаются здесь, а не в окне: так их видно тестам.
     """
     tabs = [TrayTab(TAB_ALL, TAB_TITLES[TAB_ALL], len(unread))]
     for severity in (
@@ -204,8 +207,23 @@ def build_tabs(
         key = str(severity)
         count = sum(1 for item in unread if str(item.severity) == key)
         tabs.append(TrayTab(key, TAB_TITLES[key], count))
-    tabs.append(TrayTab(TAB_ARCHIVE, TAB_TITLES[TAB_ARCHIVE], len(archive)))
     return tabs
+
+
+def _merged_items(
+    unread: "Sequence[NotificationPendingItem]",
+    archive: "Sequence[NotificationPendingItem]",
+) -> list[NotificationPendingItem]:
+    """Единый список окна: непрочитанные и прочитанные-справочник, помеченные.
+
+    Прочитанное с `delete_after_read=false` больше не прячется во вкладку
+    «справочник»: оно приходит в свои категории важности с флагом
+    `acknowledged`, чтобы строка рисовалась как «прочитано» (1.24, §7.4).
+    """
+    merged = list(unread)
+    for item in archive:
+        merged.append(item.model_copy(update={"acknowledged": True}))
+    return merged
 
 
 def items_for_tab(
@@ -213,12 +231,42 @@ def items_for_tab(
     unread: "Sequence[NotificationPendingItem]",
     archive: "Sequence[NotificationPendingItem]",
 ) -> list[NotificationPendingItem]:
-    """Что показывает выбранная вкладка: «все», уровень важности или справочник."""
-    if tab == TAB_ARCHIVE:
-        return list(archive)
+    """Что показывает выбранная вкладка: «все» или уровень важности.
+
+    В обеих случаях — непрочитанные вместе с прочитанными-справочником
+    (помеченными `acknowledged`), чтобы прочитанное оставалось в своей категории.
+    """
+    items = _merged_items(unread, archive)
     if tab == TAB_ALL:
-        return list(unread)
-    return [item for item in unread if str(item.severity) == tab]
+        return items
+    return [item for item in items if str(item.severity) == tab]
+
+
+def category_nav(
+    items: "Sequence[NotificationPendingItem]",
+) -> list[tuple[str, str, str]]:
+    """Категории левой колонки в порядке первых встреч: `(ключ, имя, цвет)`.
+
+    `items` — уже отфильтрованные по важности (`items_for_tab`), поэтому
+    навигация по категориям работает одновременно с отбором по важности:
+    кассир выбирает пилюлю важности справа, а слева видит только те категории,
+    в которых под эту важность есть уведомления (§7.4, 1.23). Уведомление без
+    категории попадает в «без категории» — так же, как при группировке списка.
+    """
+    seen: dict[str, tuple[str, str]] = {}
+    for item in items:
+        if item.category is not None:
+            key = str(item.category.id)
+            seen.setdefault(
+                key,
+                (
+                    str(item.category.name),
+                    str(item.category.color or NO_CATEGORY_COLOR),
+                ),
+            )
+        else:
+            seen.setdefault("none", (NO_CATEGORY_TITLE, NO_CATEGORY_COLOR))
+    return [(key, name, color) for key, (name, color) in seen.items()]
 
 
 def panel_geometry(

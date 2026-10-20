@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Макет: окно просмотра уведомлений — Magaz UI</title>
+<style>
+  :root {
+    --bg: rgba(15, 23, 42, 0.82);
+    --card: rgba(30, 41, 59, 0.55);
+    --card-hover: rgba(51, 65, 85, 0.75);
+    --border: rgba(148, 163, 184, 0.22);
+    --text: #f8fafc;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI Variable", "Segoe UI", Inter, sans-serif;
+    background:
+      radial-gradient(1200px 800px at 80% -10%, rgba(56,189,248,0.35), transparent 60%),
+      radial-gradient(900px 700px at 10% 110%, rgba(99,102,241,0.30), transparent 60%),
+      #0f172a;
+    color: var(--text);
+    min-height: 100vh;
+    padding: 40px;
+  }
+  .caption { font-size: 13px; color: var(--muted); margin-bottom: 18px; text-align: center; }
+  .window {
+    width: 940px; height: 600px; margin: 0 auto;
+    background: linear-gradient(180deg, rgba(30,41,59,0.72), rgba(15,23,42,0.72));
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    box-shadow: 0 24px 70px rgba(0,0,0,0.6);
+    display: flex; flex-direction: column; overflow: hidden;
+    backdrop-filter: blur(24px);
+  }
+  .top { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .btn-back { background: var(--card); border: 1px solid var(--border); color: var(--text); border-radius: 10px; padding: 6px 14px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  .btn-back:hover { background: var(--card-hover); }
+  .back-arrow { font-size: 14px; line-height: 1; }
+  .title { flex: 1; text-align: center; font-size: 15px; font-weight: 600; }
+  .title-sub { color: var(--muted); font-size: 12px; font-weight: 400; }
+  .top-right-spacer { width: 74px; }
+  .body { flex: 1; display: flex; min-height: 0; }
+  .categories { width: 200px; border-right: 1px solid var(--border); padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); padding: 6px 4px; margin-bottom: 6px; cursor: pointer; user-select: none; }
+  .check input { accent-color: var(--accent); width: 15px; height: 15px; }
+  .cat-head { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; padding: 4px; }
+  .cat { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 10px; font-size: 13px; cursor: pointer; }
+  .cat:hover { background: var(--card); }
+  .cat.active { background: var(--card-hover); }
+  .cat.unread { background: var(--card); border-left: 3px solid var(--accent); }
+  .cat.unread .cat-name { font-weight: 600; color: var(--text); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .cat-count { margin-left: auto; color: var(--muted); font-size: 11px; }
+  .unread-pill { background: var(--accent); color: #0f172a; font-size: 11px; font-weight: 700; border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
+  .cat-hint { font-size: 11px; color: var(--muted); padding: 8px 4px; opacity: 0.7; }
+  .list { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .cols { display: flex; gap: 6px; padding: 12px 16px 8px; flex-wrap: wrap; }
+  .col-btn { border: 1px solid var(--border); background: var(--card); color: var(--muted); border-radius: 999px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
+  .col-btn.active { background: var(--accent); color: #0f172a; border-color: transparent; font-weight: 600; }
+  .col-btn.unread { border-color: var(--accent); color: var(--text); }
+  .col-btn.unread .u-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); margin-right: 5px; }
+  .rows { flex: 1; padding: 0 12px 8px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .group-head { font-size: 12px; font-weight: 600; color: var(--muted); padding: 8px 6px 2px; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: var(--card); border-radius: 12px; cursor: pointer; border: 1px solid transparent; }
+  .row:hover { background: var(--card-hover); }
+  .row.selected { border-color: var(--accent); background: var(--card-hover); }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 8px; white-space: nowrap; color: #fff; }
+  .row-title { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-time { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .bottom { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 12px 16px; border-top: 1px solid var(--border); }
+  .btn { border-radius: 10px; padding: 8px 18px; font-size: 13px; cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--text); }
+  .btn:hover { background: var(--card-hover); }
+  .btn-accent { background: var(--accent); color: #0f172a; border: none; font-weight: 600; }
+  .btn-accent:hover { background: #7dd3fc; }
+  .grip { width: 16px; height: 16px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); opacity: .5; margin-left: auto; }
+  /* ---- экран открытого сообщения ---- */
+  .read-window { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+  .read-body { flex: 1; overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+  .msg-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .msg-title { font-size: 17px; font-weight: 600; }
+  .msg-meta { display: flex; gap: 8px; align-items: center; }
+  .body-text { font-size: 13px; line-height: 1.6; color: var(--text); white-space: pre-wrap; }
+  .body-text .muted { color: var(--muted); }
+  .read-badge { font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 8px; white-space: nowrap; color: #fff; }
+  /* ---- тост (всплывающее уведомление в правом верхнем углу, §7.4) ---- */
+  .toast-wrap { position: relative; margin-top: 30px; }
+  .toast-stage { min-height: 190px; position: relative; background: repeating-linear-gradient(45deg, rgba(56,189,248,.05) 0 14px, transparent 14px 28px); border-radius: 18px; border: 1px dashed var(--border); }
+  .toast { position: absolute; top: 14px; right: 14px; width: 348px; background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 12px 16px; box-shadow: 0 10px 30px rgba(0,0,0,.4); display: flex; flex-direction: column; gap: 6px; }
+  .toast-head { display: flex; align-items: center; gap: 6px; }
+  .toast-title { font-weight: 600; font-size: 14px; }
+  .toast-preview { color: var(--muted); font-size: 12px; line-height: 1.45; }
+  .toast-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+  .toast-note { position: absolute; left: 14px; bottom: 10px; color: var(--muted); font-size: 11px; max-width: 300px; }
+</style>
+</head>
+<body>
+
+  <div class="caption">Макет — окно «Уведомления» (клиент, спека 1.22). Перетаскивание за шапку, изменение размера за правый нижний угол.</div>
+  <div class="caption"><b>Состояние 1 — список</b> (без кнопки «Назад»)</div>
+
+  <div class="window">
+    <!-- Экран 1: СПИСОК. Шапка без «Назад» — кнопка нужна только в открытом сообщении -->
+    <div class="top">
+      <div class="top-right-spacer"></div>
+      <div class="title">Уведомления <span class="title-sub">· 5 непрочитанных</span></div>
+      <div class="top-right-spacer"></div>
+    </div>
+
+    <!-- Тело: категории слева + таблица справа -->
+    <div class="body">
+      <aside class="categories">
+        <label class="check"><input type="checkbox" checked> Включить сортировку по категориям</label>
+        <div class="cat-head">Категории</div>
+        <div class="cat active"><span class="dot" style="background:#2563eb"></span> <span class="cat-name">Все</span> <span class="cat-count">5</span><span class="unread-pill">3</span></div>
+        <div class="cat unread"><span class="dot" style="background:#6366f1"></span> <span class="cat-name">Работа с 1С</span> <span class="cat-count">3</span><span class="unread-pill">2</span></div>
+        <div class="cat unread"><span class="dot" style="background:#f59e0b"></span> <span class="cat-name">Оборудование</span> <span class="cat-count">1</span><span class="unread-pill">1</span></div>
+        <div class="cat"><span class="dot" style="background:#14b8a6"></span> <span class="cat-name">Кадры</span> <span class="cat-count">1</span></div>
+        <div class="cat"><span class="dot" style="background:#64748b"></span> <span class="cat-name">Без категории</span> <span class="cat-count">0</span></div>
+        <div class="cat-hint">Группы создаются в админке (раздел «Уведомления») и выбираются при создании уведомления.</div>
+      </aside>
+
+      <div class="list">
+        <div class="cols">
+          <span class="col-btn active">Все · 5</span>
+          <span class="col-btn unread"><span class="u-dot"></span>Критично · 1</span>
+          <span class="col-btn unread"><span class="u-dot"></span>Важно · 1</span>
+          <span class="col-btn">Информация · 3</span>
+        </div>
+
+        <div class="rows">
+          <div class="group-head">Работа с 1С</div>
+          <div class="row selected">
+            <span class="badge" style="background:#ef4444">критично</span>
+            <span class="row-title">Не выгрузился прайс в 1С, проверьте обмен</span>
+            <span class="row-time">10:42</span>
+          </div>
+          <div class="row">
+            <span class="badge" style="background:#f59e0b">важно</span>
+            <span class="row-title">Остатки расходятся: сверьте с 1С</span>
+            <span class="row-time">09:18</span>
+          </div>
+          <div class="row">
+            <span class="badge" style="background:#64748b">инфо</span>
+            <span class="row-title">Обновление справочника номенклатуры выполнено</span>
+            <span class="row-time">08:05</span>
+          </div>
+
+          <div class="group-head">Оборудование</div>
+          <div class="row">
+            <span class="badge" style="background:#64748b">инфо</span>
+            <span class="row-title">Кассовый аппарат №3 требует замены чековой ленты</span>
+            <span class="row-time">Вчера</span>
+          </div>
+
+          <div class="group-head">Кадры</div>
+          <div class="row">
+            <span class="badge" style="background:#64748b">инфо</span>
+            <span class="row-title">Новый график смен утверждён с понедельника</span>
+            <span class="row-time">Вчера</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Нижняя панель -->
+    <div class="bottom">
+      <span class="grip"></span>
+      <button class="btn">Отложить</button>
+      <button class="btn btn-accent">Ознакомлен</button>
+    </div>
+  </div>
+  <div class="caption" style="margin-top:30px"><b>Состояние 2 — открытое сообщение</b> (кнопка «← Назад» + только «Ознакомлен» и «Отложить»)</div>
+
+  <div class="window">
+    <!-- Экран 2: ОТКРЫТОЕ СООБЩЕНИЕ. В шапке — «Назад», заголовок по центру -->
+    <div class="top">
+      <button class="btn-back"><span class="back-arrow">←</span> Назад</button>
+      <div class="title">Уведомления <span class="title-sub">· сообщение #12</span></div>
+      <div class="top-right-spacer"></div>
+    </div>
+
+    <div class="read-window">
+      <div class="read-body">
+        <div class="msg-head">
+          <div class="msg-title">Не выгрузился прайс в 1С, проверьте обмен</div>
+          <div class="msg-meta">
+            <span class="read-badge" style="background:#ef4444">критично</span>
+            <span class="read-badge" style="background:#6366f1">Работа с 1С</span>
+            <span class="row-time">10:42</span>
+          </div>
+        </div>
+        <div class="body-text">
+Выгрузка прайса в 1С завершилась с ошибкой. Возможная причина — нет связи с сервером 1С
+или заблокирован обмен. Проверьте соединение и запустите выгрузку заново.
+
+Если ошибка повторится, обратитесь к системному администратору. Сообщение останется
+в списке до нажатия кнопки «Ознакомлен» или «Отложить».
+        </div>
+      </div>
+
+      <!-- Нижняя панель открытого сообщения: только Ознакомлен / Отложить -->
+      <div class="bottom">
+        <span class="grip"></span>
+        <button class="btn">Отложить</button>
+        <button class="btn btn-accent">Ознакомлен</button>
+      </div>
+    </div>
+  </div>
+  <div class="caption" style="margin-top:30px"><b>Состояние 3 — всплывающий тост</b> (правый верхний угол; кнопки «Отложить» и «Просмотреть»). Тост сам не исчезает, закрывается только кнопкой.</div>
+
+  <div class="toast-wrap">
+    <div class="toast-stage">
+      <div class="toast">
+        <div class="toast-head">
+          <span class="read-badge" style="background:#ef4444">критично</span>
+          <span class="read-badge" style="background:#6366f1">Работа с 1С</span>
+          <span style="margin-left:auto; color:var(--muted); font-size:13px">✕</span>
+        </div>
+        <div class="toast-title">Не выгрузился прайс в 1С, проверьте обмен</div>
+        <div class="toast-preview">Выгрузка прайса в 1С завершилась с ошибкой. Возможная причина — нет связи с сервером 1С или заблокирован обмен. Проверьте соедине…</div>
+        <div class="toast-btns">
+          <button class="btn">Отложить</button>
+          <button class="btn btn-accent">Просмотреть</button>
+        </div>
+      </div>
+      <div class="toast-note">Тост не привязан к списку: показывается поверх кассы и закрывается только кнопкой (спека 1.22, §7.4).</div>
+    </div>
+  </div>
+
+  <div class="caption" style="margin-top:14px; font-size:11px">После нажатия «Просмотреть» в тосте открывается <b>состояние 2</b> — читалка с этим сообщением (заголовок, тело, кнопки «Отложить»/«Ознакомлен»).</div>
+
+</body>
+</html>

@@ -140,7 +140,11 @@ QListWidget {{
 }}
 QListWidget::item {{
     border-radius: 10px;
-    padding: 8px 10px;
+    /* Вертикальный padding убран: строки кладутся через `setItemWidget` и сами
+       имеют внутренние отступы (`_make_row_widget`), а заголовки групп — свой
+       `setSizeHint`. Padding сверху/снизу «откусывал» высоту у вложенного
+       виджета, из-за чего низ текста обрезался (1.24). */
+    padding: 0px 10px;
     margin: 2px 0;
     color: {TEXT};
 }}
@@ -165,5 +169,70 @@ QScrollBar::add-line, QScrollBar::sub-line {{
 }}
 QScrollBar::add-page, QScrollBar::sub-page {{
     background: transparent;
+}}
+/* 1.22: окно уведомлений — фильтры, категории и строки списка */
+QCheckBox {{
+    font-size: 12px;
+    color: {TEXT_MUTED};
+    spacing: 6px;
+}}
+QCheckBox::indicator {{
+    width: 15px;
+    height: 15px;
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    background: {BG_INPUT};
+}}
+QCheckBox::indicator:checked {{
+    background: {ACCENT};
+    border-color: {ACCENT};
+}}
+QPushButton[pill="true"] {{
+    border-radius: 999px;
+    padding: 5px 14px;
+    background: {BG_CARD};
+    color: {TEXT_MUTED};
+    border: 1px solid {BORDER};
+    font-size: 12px;
+}}
+QPushButton[pill="true"]:hover {{
+    background: {BG_CARD_HOVER};
+}}
+QPushButton[pill="true"][active="true"] {{
+    background: {ACCENT};
+    color: #0f172a;
+    border-color: transparent;
+    font-weight: 600;
+}}
+QPushButton[pill="true"][unread="true"] {{
+    border-color: {ACCENT};
+}}
+QPushButton[side="true"] {{
+    text-align: left;
+    border: none;
+    background: transparent;
+    border-radius: 10px;
+    padding: 7px 10px;
+    font-size: 13px;
+    color: {TEXT_MUTED};
+}}
+QPushButton[side="true"]:hover {{
+    background: {BG_CARD};
+}}
+QPushButton[side="true"][active="true"] {{
+    background: {BG_CARD_HOVER};
+    color: {TEXT};
+    font-weight: 600;
+}}
+QPushButton[side="true"][unread="true"] {{
+    border-left: 3px solid {ACCENT};
+    color: {TEXT};
+}}
+QLabel[role="caption"] {{
+    font-size: 11px;
+    color: {TEXT_MUTED};
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 4px;
 }}
 """
