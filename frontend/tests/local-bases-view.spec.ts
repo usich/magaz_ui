@@ -174,8 +174,8 @@ describe('страница «Локальные базы»', () => {
 
     const wrapper = await mountView(fetchMock)
 
-    await wrapper.find('[data-test="lb-select-2"]').setChecked()
-    await wrapper.find('[data-test="lb-select-3"]').setChecked()
+    await wrapper.find('[data-test="lb-select-2"]').setValue(true)
+    await wrapper.find('[data-test="lb-select-3"]').setValue(true)
     await flushPromises()
 
     await wrapper.find('[data-test="lb-update-selected"]').trigger('click')

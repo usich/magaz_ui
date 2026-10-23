@@ -331,8 +331,8 @@ describe('страница «Обновление 1С»', () => {
     await flushPromises()
 
     // Выбрать две базы и открыть массовый диалог
-    await wrapper.find('[data-test="lb-select-2"]').setChecked()
-    await wrapper.find('[data-test="lb-select-3"]').setChecked()
+    await wrapper.find('[data-test="lb-select-2"]').setValue(true)
+    await wrapper.find('[data-test="lb-select-3"]').setValue(true)
     await flushPromises()
     await wrapper.find('[data-test="updates-local-update-selected"]').trigger('click')
     await flushPromises()
