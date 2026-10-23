@@ -24,14 +24,16 @@ const props = withDefaults(
     visible: boolean
     /** База, которую обновляем (открывает диалог из строки таблицы). */
     base?: LocalBaseItem | null
+    /** Массовый режим (Д-25): обновить эти базы одним запуском (без карточки `base`). */
+    bulkBaseIds?: number[]
   }>(),
-  { base: null },
+  { base: null, bulkBaseIds: () => [] },
 )
 
 const emit = defineEmits<{
   'update:visible': [value: boolean]
-  /** Задача поставлена в очередь — родитель перечитывает статусы. */
-  submitted: [jobId: number]
+  /** Задача (или пачка задач) поставлена в очередь — родитель перечитывает статусы. */
+  submitted: []
 }>()
 
 const toast = useToast()
@@ -46,7 +48,12 @@ const form = reactive({
 const isRunning = ref(false)
 const formError = ref('')
 
-const dialogTitle = computed(() => `Обновление базы «${props.base?.name ?? ''}»`)
+const isBulk = computed(() => props.bulkBaseIds.length > 0)
+const dialogTitle = computed(() =>
+  isBulk.value
+    ? `Обновление баз (выбрано: ${props.bulkBaseIds.length})`
+    : `Обновление базы «${props.base?.name ?? ''}»`,
+)
 const isFormValid = computed(() => Boolean(form.file_name.trim()))
 
 function reset(): void {
@@ -70,25 +77,41 @@ function close(): void {
 }
 
 async function run(): Promise<void> {
-  if (!props.base || !form.file_name.trim()) return
+  const canRunSingle = Boolean(props.base) && !isBulk.value
+  const canRunBulk = isBulk.value && props.bulkBaseIds.length > 0
+  if ((!canRunSingle && !canRunBulk) || !form.file_name.trim()) return
   isRunning.value = true
   formError.value = ''
+  const payload = {
+    file_name: form.file_name.trim(),
+    is_fast_update: form.is_fast_update,
+    is_extension: form.is_extension,
+    ...(form.is_extension && form.extension_name.trim()
+      ? { extension_name: form.extension_name.trim() }
+      : {}),
+  }
   try {
-    const response = await localBasesApi.runUpdate(props.base.id, {
-      file_name: form.file_name.trim(),
-      is_fast_update: form.is_fast_update,
-      is_extension: form.is_extension,
-      ...(form.is_extension && form.extension_name.trim()
-        ? { extension_name: form.extension_name.trim() }
-        : {}),
-    })
-    toast.add({
-      severity: 'success',
-      summary: 'Обновление поставлено в очередь',
-      detail: response.message,
-      life: 5000,
-    })
-    emit('submitted', response.job.id)
+    if (isBulk.value) {
+      const response = await localBasesApi.bulkUpdate({
+        local_base_ids: props.bulkBaseIds,
+        ...payload,
+      })
+      toast.add({
+        severity: 'success',
+        summary: 'Обновление поставлено в очередь',
+        detail: response.message,
+        life: 5000,
+      })
+    } else {
+      const response = await localBasesApi.runUpdate(props.base!.id, payload)
+      toast.add({
+        severity: 'success',
+        summary: 'Обновление поставлено в очередь',
+        detail: response.message,
+        life: 5000,
+      })
+    }
+    emit('submitted')
     close()
   } catch (error) {
     const message =
@@ -146,8 +169,15 @@ async function run(): Promise<void> {
         {{ formError }}
       </p>
       <p class="magaz-muted text-xs">
-        Задачу выполнит сервер напрямую на этой машине. Пока база обновляется, повторный запуск
-        для неё заблокирован.
+        <template v-if="isBulk">
+          Задачу получит каждая выбранная база; сколько из них выполняется параллельно —
+          настраивается в «Настройках» (`local_update_concurrency`, по умолчанию 5).
+          Базы, которые уже обновляются, будут пропущены.
+        </template>
+        <template v-else>
+          Задачу выполнит сервер напрямую на этой машине. Пока база обновляется, повторный запуск
+          для неё заблокирован.
+        </template>
       </p>
     </div>
 

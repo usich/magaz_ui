@@ -63,8 +63,23 @@ function apiMock(
   localBases: unknown[] = [],
   localJobs: unknown[] = [],
   onRunUpdate?: (body: unknown) => void,
+  onBulkUpdate?: (body: unknown) => void,
 ) {
   return async (url: string, init: RequestInit = {}): Promise<Response> => {
+    if (init.method === 'POST' && url.includes('/bulk/update')) {
+      onBulkUpdate?.(init.body)
+      return jsonResponse(
+        {
+          message: 'Задачи поставлены: 2 из 2 баз',
+          total: 2,
+          jobs: [
+            { local_base_id: 2, local_base_name: 'Бухгалтерия', job_id: 10, status: 'queued', detail: null },
+            { local_base_id: 3, local_base_name: 'Торговля', job_id: 11, status: 'queued', detail: null },
+          ],
+        },
+        202,
+      )
+    }
     if (init.method === 'POST' && url.includes('/run-update')) {
       onRunUpdate?.(init.body)
       return jsonResponse(
@@ -291,6 +306,49 @@ describe('страница «Обновление 1С»', () => {
       is_extension: true,
       extension_name: 'БГ_Бухгалтерия',
       is_fast_update: false,
+    })
+    wrapper.unmount()
+  })
+
+  it('вкладка «Локальные базы»: массовое обновление выбранных шлёт POST .../bulk/update (Д-25)', async () => {
+    const bulkBodies: unknown[] = []
+    fetchMock.mockImplementation(
+      apiMock(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [makeLocalBase(), makeLocalBase({ id: 3, name: 'Торговля', database_name: 'trade', group: 'Продажи' })],
+        [],
+        undefined,
+        (body) => bulkBodies.push(body),
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    // Выбрать две базы и открыть массовый диалог
+    await wrapper.find('[data-test="lb-select-2"]').setChecked()
+    await wrapper.find('[data-test="lb-select-3"]').setChecked()
+    await flushPromises()
+    await wrapper.find('[data-test="updates-local-update-selected"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
+
+    await wrapper.find('[data-test="lbu-file"]').setValue('update')
+    await wrapper.find('[data-test="lbu-run"]').trigger('click')
+    await flushPromises()
+
+    expect(bulkBodies).toHaveLength(1)
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      local_base_ids: [2, 3],
+      file_name: 'update',
+      is_fast_update: false,
+      is_extension: false,
     })
     wrapper.unmount()
   })

@@ -52,8 +52,9 @@ router = APIRouter(
 #: Имя файла конфига агента (§7.2) и каталог установки (§7.1) — подсказка в UI
 AGENT_CONFIG_FILE_NAME = "agent-config.json"
 AGENT_CONFIG_DIR_HINT = r"C:\MagazAgent"
-#: Значение по умолчанию из §7.2 — попадает в подсказку, а не в логику
-BASE_1C_PATH_HINT = "C:/Program Files (x86)/1cv8"
+#: Значение по умолчанию из §7.2 — попадает в подсказку, а не в логику.
+#: 1С на 64-разрядной Windows ставится в "C:/Program Files/1cv8" (не (x86)).
+BASE_1C_PATH_HINT = "C:/Program Files/1cv8"
 
 ONLINE_WINDOW_SETTING = "online_window_sec"
 HEALTH_TIMEOUT_SETTING = "health_timeout_sec"

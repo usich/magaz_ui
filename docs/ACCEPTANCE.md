@@ -203,6 +203,9 @@ python -m client.tray --ack <id>                             # «Ознаком�
 | Д-23: «Скопировать» — форма создания с полями объекта, кроме имени (магазин/база/устройство) | `frontend/tests/stores-view.spec.ts`, `frontend/tests/local-bases-view.spec.ts`, `frontend/tests/store-detail-view.spec.ts` |
 | Д-24: обновление локальной базы — `POST .../run-update` ставит `run_update_db_local`, `409` при активной задаче (R12), диспетчер не трогает локальные, `/jobs?local_base_id=` фильтрует, цикл закрывает задачу по логу 1С | `tests/server/test_local_updates_api.py` |
 | Д-24 (frontend): статус по базе, диалог выбора файла, запуск шлёт `run-update` | `frontend/tests/updates-view.spec.ts`, `frontend/tests/local-bases-view.spec.ts` |
+| Д-25 (backend): массовое обновление — `POST /local-bases/bulk/update` ставит по задаче на базу, занятая пропускается (`skipped`), параллельность по `local_update_concurrency` (по умолчанию 5) | `tests/server/test_local_updates_api.py` |
+| Д-25 (frontend): выбор нескольких баз и «Обновить выбранные» → `bulk/update` | `frontend/tests/updates-view.spec.ts`, `frontend/tests/local-bases-view.spec.ts` |
+| `agent-config.json`: `base_1c_path = "C:/Program Files/1cv8"` (не `(x86)`) | `tests/server/test_store_api.py` |
 
 | Разметка уведомления: санитайз, метки `magaz-image:` без файла, лимиты картинок | `tests/shared/test_richtext.py`, `tests/server/test_notification_images.py`, `frontend/tests/notification-editor.spec.ts` |
 | Кэш картинок на кассе, справочник прочитанного, `delete_after_read` до кассы | `tests/client/test_agent_notifications.py` |

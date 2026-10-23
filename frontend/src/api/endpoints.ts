@@ -32,6 +32,8 @@ import type {
   LocalBaseRunUpdatePayload,
   LocalBaseRunUpdateResponse,
   LocalBaseUpdatePayload,
+  LocalBulkUpdatePayload,
+  LocalBulkUpdateResponse,
   BackupStatus,
   BackupListItem,
   LoginPayload,
@@ -418,6 +420,10 @@ export const localBasesApi = {
   /** Обновить локальную базу 1С (Д-24): поставить задачу `run_update_db_local` в очередь. */
   runUpdate: (id: number, payload: LocalBaseRunUpdatePayload) =>
     api.post<LocalBaseRunUpdateResponse>(`/admin/local-bases/${id}/run-update`, payload),
+
+  /** Массовое обновление выбранных локальных баз (Д-25): по задаче на базу. */
+  bulkUpdate: (payload: LocalBulkUpdatePayload) =>
+    api.post<LocalBulkUpdateResponse>('/admin/local-bases/bulk/update', payload),
 }
 
 /** Бэкапы 1С (`/admin/backup/*`, Д-21): сводка, раздельные списки, ручная проверка. */

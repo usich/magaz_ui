@@ -207,3 +207,116 @@ def test_monitor_poll_once_runs_command(tmp_path, secret_box) -> None:
     finally:
         engine.dispose()
 
+
+def test_bulk_update_creates_jobs_for_selected(auth_client: TestClient) -> None:
+    """`POST /local-bases/bulk/update` ставит задачу каждой выбранной базе (Д-25)."""
+    first = auth_client.post(BASE_URL, json=make_payload(name="Бухгалтерия")).json()
+    second = auth_client.post(
+        BASE_URL, json=make_payload(name="Торговля", database_name="trade")
+    ).json()
+    response = auth_client.post(
+        f"{BASE_URL}/bulk/update",
+        json={"local_base_ids": [first["id"], second["id"]], "file_name": "update"},
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["total"] == 2
+    assert len(body["jobs"]) == 2
+    assert all(job["job_id"] is not None and job["status"] == "queued" for job in body["jobs"])
+    assert "2 из 2" in body["message"]
+
+
+def test_bulk_update_skips_busy_base(auth_client: TestClient) -> None:
+    """База, которая уже обновляется, пропускается — остальные не блокируются (Д-25)."""
+    busy = auth_client.post(BASE_URL, json=make_payload()).json()
+    auth_client.post(f"{BASE_URL}/{busy['id']}/run-update", json={"file_name": "update"})
+    free = auth_client.post(
+        BASE_URL, json=make_payload(name="Торговля", database_name="trade")
+    ).json()
+
+    response = auth_client.post(
+        f"{BASE_URL}/bulk/update",
+        json={"local_base_ids": [busy["id"], free["id"]], "file_name": "update"},
+    )
+    assert response.status_code == 202
+    body = response.json()
+    by_id = {job["local_base_id"]: job for job in body["jobs"]}
+    assert by_id[busy["id"]]["status"] == "skipped"
+    assert "уже обновляется" in by_id[busy["id"]]["detail"]
+    assert by_id[free["id"]]["status"] == "queued"
+
+
+def test_bulk_update_empty_selection_is_422(auth_client: TestClient) -> None:
+    """Массовый запуск без выбора баз — `422` (как `bulk/actions` без магазинов)."""
+    response = auth_client.post(f"{BASE_URL}/bulk/update", json={"local_base_ids": []})
+    assert response.status_code == 422
+
+
+def test_local_update_concurrency_default(tmp_path, secret_box) -> None:  # noqa: ARG002
+    """Настройка `local_update_concurrency` по умолчанию — 5 (Д-25)."""
+    from server.db.base import Base
+    from server.db.session import DatabaseManager, create_db_engine
+    from server.services import settings_service
+
+    db_url = f"sqlite:///{(tmp_path / 'c.db').as_posix()}"
+    engine = create_db_engine(db_url)
+    Base.metadata.create_all(engine)
+    manager = DatabaseManager(db_url)
+    try:
+        with manager.session() as session:
+            settings_service.ensure_defaults(session)
+            session.commit()
+            assert settings_service.get_int(session, "local_update_concurrency") == 5
+    finally:
+        engine.dispose()
+
+
+def test_monitor_poll_once_runs_multiple_concurrently(tmp_path, secret_box) -> None:
+    """LocalUpdateMonitor обрабатывает до `concurrency` задач за один цикл (Д-25)."""
+    from server.db.base import Base
+    from server.db.session import DatabaseManager, create_db_engine
+
+    db_url = f"sqlite:///{(tmp_path / 'm2.db').as_posix()}"
+    engine = create_db_engine(db_url)
+    Base.metadata.create_all(engine)
+    manager = DatabaseManager(db_url)
+    try:
+        with manager.session() as session:
+            b1 = add_local_base(session, secret_box, name="База-1")
+            b2 = add_local_base(session, secret_box, name="База-2", database_name="trade2")
+            c1 = command_service.create_local_command(
+                session,
+                local_base_id=b1.id,
+                kind=CommandKind.RUN_UPDATE_DB_LOCAL,
+                params={"file_name": "update", "is_fast_update": True},
+                created_by="admin",
+            )
+            c2 = command_service.create_local_command(
+                session,
+                local_base_id=b2.id,
+                kind=CommandKind.RUN_UPDATE_DB_LOCAL,
+                params={"file_name": "update", "is_fast_update": True},
+                created_by="admin",
+            )
+            session.commit()
+            c1_id, c2_id = c1.id, c2.id
+
+        settings = SimpleNamespace(
+            local_1c_path=str(tmp_path / "1c"),
+            local_update_dir=tmp_path,
+            local_updater_startup_delay_sec=0,
+            local_updater_interval_sec=5,
+        )
+        provider = _FakeProvider(tmp_path, "Обновление конфигурации успешно завершено")
+        monitor = LocalUpdateMonitor(
+            manager, settings, secret_box=secret_box, provider=provider, concurrency_override=2
+        )
+
+        processed = asyncio.run(monitor.poll_once())
+        assert processed == 2
+
+        with manager.session() as session:
+            assert command_service.get_command(session, c1_id).status == "success"
+            assert command_service.get_command(session, c2_id).status == "success"
+    finally:
+        engine.dispose()

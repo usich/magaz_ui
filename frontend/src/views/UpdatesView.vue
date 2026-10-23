@@ -88,20 +88,45 @@ async function loadJobs(): Promise<void> {
   }
 }
 
-// Д-24: диалог «Обновить базу» для локальной базы
+// Д-24: диалог «Обновить базу» для локальной базы; Д-25: массовое обновление.
 const updateBase = ref<LocalBaseItem | null>(null)
+const bulkBaseIds = ref<number[]>([])
 const localUpdateVisible = computed({
-  get: () => updateBase.value !== null,
+  get: () => updateBase.value !== null || bulkBaseIds.value.length > 0,
   set: (value: boolean) => {
-    if (!value) updateBase.value = null
+    if (!value) {
+      updateBase.value = null
+      bulkBaseIds.value = []
+    }
   },
 })
 function openLocalUpdate(base: LocalBaseItem): void {
+  bulkBaseIds.value = []
   updateBase.value = base
+  localUpdateVisible.value = true
+}
+function openLocalBulkUpdate(): void {
+  if (!localSelected.value.length) return
+  updateBase.value = null
+  bulkBaseIds.value = [...localSelected.value]
   localUpdateVisible.value = true
 }
 function onLocalUpdateSubmitted(): void {
   void loadJobs()
+}
+
+// Д-25: выбор нескольких баз для массового обновления (аналог магазинов)
+const localSelected = ref<number[]>([])
+const localAllSelected = computed(
+  () => localBases.items.length > 0 && localSelected.value.length === localBases.items.length,
+)
+function toggleLocalSelect(baseId: number): void {
+  localSelected.value = localSelected.value.includes(baseId)
+    ? localSelected.value.filter((id) => id !== baseId)
+    : [...localSelected.value, baseId]
+}
+function toggleLocalAll(): void {
+  localSelected.value = localAllSelected.value ? [] : localBases.items.map((item) => item.id)
 }
 
 function lastFor(jobs: JobItem[], storeId: number): JobItem | null {
@@ -488,9 +513,26 @@ onUnmounted(() => {
     </div>
 
     <div v-else class="space-y-6">
-      <div class="flex items-center justify-between gap-2">
+      <div class="flex flex-wrap items-center justify-between gap-2">
         <h2 class="font-semibold">Локальные базы 1С</h2>
-        <Button label="Добавить базу" icon="pi pi-plus" size="small" data-test="updates-local-add" @click="openBaseCreate" />
+        <div class="flex flex-wrap gap-2">
+          <Button
+            label="Выбрать все"
+            severity="secondary"
+            size="small"
+            outlined
+            :data-test="`updates-local-select-all-${localAllSelected ? 'on' : 'off'}`"
+            @click="toggleLocalAll"
+          />
+          <Button
+            label="Обновить выбранные…"
+            size="small"
+            :disabled="!localSelected.length"
+            data-test="updates-local-update-selected"
+            @click="openLocalBulkUpdate"
+          />
+          <Button label="Добавить базу" icon="pi pi-plus" size="small" data-test="updates-local-add" @click="openBaseCreate" />
+        </div>
       </div>
       <p class="magaz-muted max-w-2xl text-sm">
         Базы 1С на этой машине. Группируются по полю «Группа»: одинаковое значение
@@ -511,6 +553,7 @@ onUnmounted(() => {
           <table class="w-full text-sm">
             <thead>
               <tr class="magaz-muted border-b border-slate-100 text-left text-xs">
+                <th class="px-4 py-2 font-medium"><span class="sr-only">выбор</span></th>
                 <th class="px-4 py-2 font-medium">Название</th>
                 <th class="py-2 pr-3 font-medium">Версия 1С</th>
                 <th class="py-2 pr-3 font-medium">Кластер / БД</th>
@@ -528,6 +571,14 @@ onUnmounted(() => {
                 class="border-b border-slate-100 last:border-0"
                 :data-test="`lb-row-${base.id}`"
               >
+                <td class="px-4 py-2">
+                  <Checkbox
+                    :model-value="localSelected.includes(base.id)"
+                    binary
+                    :data-test="`lb-select-${base.id}`"
+                    @update:model-value="toggleLocalSelect(base.id)"
+                  />
+                </td>
                 <td class="px-4 py-2 font-medium">
                   {{ base.name }}
                   <div v-if="base.comment" class="magaz-muted text-xs">{{ base.comment }}</div>
@@ -633,6 +684,11 @@ onUnmounted(() => {
   </div>
 
   <LocalBaseFormDialog v-model:visible="baseFormVisible" :base="editingBase" @saved="onBaseSaved" />
-  <LocalBaseUpdateDialog v-model:visible="localUpdateVisible" :base="updateBase" @submitted="onLocalUpdateSubmitted" />
+  <LocalBaseUpdateDialog
+    v-model:visible="localUpdateVisible"
+    :base="updateBase"
+    :bulk-base-ids="bulkBaseIds"
+    @submitted="onLocalUpdateSubmitted"
+  />
 </template>
 

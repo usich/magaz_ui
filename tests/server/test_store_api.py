@@ -87,6 +87,7 @@ class TestStoreCrud:
         assert config["config_json"]["store_id"] == body["id"]
         assert config["config_json"]["agent_token"] == config["agent_token"]
         assert config["config_json"]["port"] == 8383
+        assert config["config_json"]["base_1c_path"] == "C:/Program Files/1cv8", "не (x86)"
         assert audit_actions(engine)[0] == "store_create"
 
     def test_duplicate_name_is_422(self, auth_client: TestClient, admin, store) -> None:  # noqa: ANN001, ARG002
@@ -137,6 +138,7 @@ class TestStoreCrud:
         assert config["config_json"]["agent_token"] == store.agent_token
         assert config["config_json"]["one_c_profile"]["user_name"] == store.user_name_1c
         assert config["config_json"]["one_c_profile"]["password_enc"] is None, "П-1"
+        assert config["config_json"]["base_1c_path"] == "C:/Program Files/1cv8", "не (x86)"
         assert config["notes"], "подсказки по установке остаются в блоке"
 
     def test_agent_config_of_unknown_store_is_404(

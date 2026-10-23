@@ -50,6 +50,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "backup_retry_interval_sec": "600",
     #: Д-24: интервал опроса очереди обновлений локальных баз
     "local_update_interval_sec": "5",
+    #: Д-25: сколько локальных баз обновлять одновременно (сколько `1cv8.exe`)
+    "local_update_concurrency": "5",
 }
 
 #: Ключи, значение которых обязано быть неотрицательным целым

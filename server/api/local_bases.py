@@ -14,14 +14,14 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from server.core.context import AppContext
 from server.core.dependencies import get_client_ip, get_context, get_db, require_active_admin
 from server.db.models import AdminUser, LocalBase
 from server.services import audit_service, backup_service, local_base_service, command_service
-from shared.enums import CommandKind
+from shared.enums import CommandKind, CommandStatus
 from shared.timeutil import to_iso_z
 
 logger = logging.getLogger(__name__)
@@ -351,6 +351,29 @@ def set_credentials_endpoint(
 
 # --- Обновление локальной базы (Д-24) ----------------------------------------
 
+from shared.paths import split_merge_file_name
+
+
+def _build_local_update_params(
+    payload: LocalUpdateRunRequest,
+) -> dict[str, object]:
+    """Собрать параметры задачи обновления локальной базы из тела запроса (Д-24).
+
+    Тип обновления (`is_extension`) по умолчанию определяется по имени файла:
+    `.cfe` → расширение, `.cf` → основная конфигурация (Д-16).
+    """
+    params: dict[str, object] = {
+        "file_name": payload.file_name,
+        "is_fast_update": payload.is_fast_update,
+        "is_extension": payload.is_extension,
+    }
+    if payload.extension_name:
+        params["extension_name"] = payload.extension_name
+    else:
+        _, suffix = split_merge_file_name(payload.file_name)
+        params["is_extension"] = bool(payload.is_extension) if payload.is_extension is not None else (suffix == ".cfe")
+    return params
+
 
 class LocalUpdateRunRequest(BaseModel):
     """Тело `POST /local-bases/{id}/run-update`: файл и режим операции.
@@ -384,6 +407,24 @@ class LocalUpdateRunOut(BaseModel):
     job: LocalUpdateJobOut
 
 
+class LocalBulkUpdateJobOut(BaseModel):
+    """Строка результата массового обновления по одной базе (Д-25)."""
+
+    local_base_id: int
+    local_base_name: str = ""
+    job_id: int | None = None
+    status: str = CommandStatus.QUEUED
+    detail: str | None = None
+
+
+class LocalBulkUpdateOut(BaseModel):
+    """Ответ `POST /local-bases/bulk/update` (Д-25): по строке на базу."""
+
+    message: str
+    total: int = 0
+    jobs: list[LocalBulkUpdateJobOut] = Field(default_factory=list)
+
+
 @router.post(
     "/{base_id}/run-update",
     response_model=LocalUpdateRunOut,
@@ -404,21 +445,8 @@ def run_update_local_base(
     в параметры не попадает (I-7): подключение берётся из карточки базы.
     R12-запрет «одна локальная база — одно обновление» — под `dispatch_guard`.
     """
-    from shared.paths import split_merge_file_name
-
     row = _get_or_404(session, base_id)
-
-    params: dict[str, object] = {
-        "file_name": payload.file_name,
-        "is_fast_update": payload.is_fast_update,
-        "is_extension": payload.is_extension,
-    }
-    if payload.extension_name:
-        params["extension_name"] = payload.extension_name
-    else:
-        # Тип обновления по имени файла: `.cfe` → расширение, `.cf` → основная
-        _, suffix = split_merge_file_name(payload.file_name)
-        params["is_extension"] = bool(payload.is_extension) if payload.is_extension is not None else (suffix == ".cfe")
+    params = _build_local_update_params(payload)
 
     with command_service.dispatch_guard():
         busy = command_service.find_local_update_conflict(session, row.id)
@@ -472,3 +500,111 @@ def run_update_local_base(
         ),
     )
 
+class LocalBulkUpdateRequest(BaseModel):
+    """Тело `POST /local-bases/bulk/update`: список баз + файл и режим (Д-25)."""
+
+    local_base_ids: list[int] = Field(default_factory=list)
+    file_name: str = "update"
+    is_fast_update: bool = False
+    is_extension: bool | None = None
+    extension_name: str | None = None
+
+
+@router.post(
+    "/bulk/update",
+    response_model=LocalBulkUpdateOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Массовое обновление локальных баз 1С (Д-25)",
+)
+def bulk_update_local_bases(
+    payload: LocalBulkUpdateRequest,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+) -> LocalBulkUpdateOut:
+    """Поставить обновление пачке локальных баз (Д-25), как `bulk/actions` у магазинов.
+
+    Каждой базе создаётся своя задача `run_update_db_local`; сколько из них
+    выполняется параллельно — решает настройка `local_update_concurrency`
+    (по умолчанию 5). База, которая уже обновляется (R12 «одна база — одно
+    обновление»), пропускается со строкой `skipped` — остальные не блокируются.
+    """
+    ids = list(dict.fromkeys(payload.local_base_ids))
+    if not ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Не выбрано ни одной локальной базы",
+        )
+
+    results: list[LocalBulkUpdateJobOut] = []
+    with command_service.dispatch_guard():
+        for base_id in ids:
+            row = session.get(LocalBase, base_id)
+            if row is None:
+                results.append(
+                    LocalBulkUpdateJobOut(
+                        local_base_id=base_id,
+                        local_base_name="",
+                        status="skipped",
+                        detail="Локальная база не найдена",
+                    )
+                )
+                continue
+            busy = command_service.find_local_update_conflict(session, base_id)
+            if busy is not None:
+                results.append(
+                    LocalBulkUpdateJobOut(
+                        local_base_id=base_id,
+                        local_base_name=row.name,
+                        status="skipped",
+                        detail=f"уже обновляется (задача #{busy.id})",
+                    )
+                )
+                continue
+            params = _build_local_update_params(
+                LocalUpdateRunRequest(
+                    file_name=payload.file_name,
+                    is_fast_update=payload.is_fast_update,
+                    is_extension=payload.is_extension,
+                    extension_name=payload.extension_name,
+                )
+            )
+            job = command_service.create_local_command(
+                session,
+                local_base_id=base_id,
+                kind=CommandKind.RUN_UPDATE_DB_LOCAL,
+                params=params,
+                created_by=admin.username,
+            )
+            results.append(
+                LocalBulkUpdateJobOut(
+                    local_base_id=base_id,
+                    local_base_name=row.name,
+                    job_id=job.id,
+                    status=job.status,
+                )
+            )
+        session.commit()
+
+    created = sum(1 for item in results if item.job_id is not None)
+    audit_service.record(
+        session,
+        action="local_base_bulk_update",
+        actor=admin.username,
+        entity="local_bases",
+        entity_id=None,
+        details={
+            "local_base_ids": [item.local_base_id for item in results],
+            "created": created,
+            "file_name": payload.file_name,
+            "is_fast_update": payload.is_fast_update,
+        },
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    logger.info("Массовое обновление локальных баз: создано %s из %s", created, len(results))
+    return LocalBulkUpdateOut(
+        message=f"Задачи поставлены: {created} из {len(results)} баз",
+        total=len(results),
+        jobs=results,
+    )

@@ -8,6 +8,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import Button from 'primevue/button'
+import Checkbox from 'primevue/checkbox'
 import InputText from 'primevue/inputtext'
 import Message from 'primevue/message'
 import Tag from 'primevue/tag'
@@ -56,20 +57,45 @@ function lastLocalFor(jobs: JobItem[], localBaseId: number): JobItem | null {
   return best
 }
 
-// Диалог «Обновить базу» для локальной базы
+// Диалог «Обновить базу» для локальной базы (Д-24); Д-25: массовое обновление
 const updateBase = ref<LocalBaseItem | null>(null)
+const bulkBaseIds = ref<number[]>([])
 const localUpdateVisible = computed({
-  get: () => updateBase.value !== null,
+  get: () => updateBase.value !== null || bulkBaseIds.value.length > 0,
   set: (value: boolean) => {
-    if (!value) updateBase.value = null
+    if (!value) {
+      updateBase.value = null
+      bulkBaseIds.value = []
+    }
   },
 })
 function openLocalUpdate(base: LocalBaseItem): void {
+  bulkBaseIds.value = []
   updateBase.value = base
+  localUpdateVisible.value = true
+}
+function openLocalBulkUpdate(): void {
+  if (!localSelected.value.length) return
+  updateBase.value = null
+  bulkBaseIds.value = [...localSelected.value]
   localUpdateVisible.value = true
 }
 function onLocalUpdateSubmitted(): void {
   void loadJobs()
+}
+
+// Д-25: выбор нескольких баз для массового обновления
+const localSelected = ref<number[]>([])
+const localAllSelected = computed(
+  () => store.items.length > 0 && localSelected.value.length === store.items.length,
+)
+function toggleLocalSelect(baseId: number): void {
+  localSelected.value = localSelected.value.includes(baseId)
+    ? localSelected.value.filter((id) => id !== baseId)
+    : [...localSelected.value, baseId]
+}
+function toggleLocalAll(): void {
+  localSelected.value = localAllSelected.value ? [] : store.items.map((item) => item.id)
 }
 
 function stageStatus(job: JobItem | null): { label: string; severity: string } {
@@ -139,13 +165,30 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
         />
         <span class="magaz-muted text-sm">всего {{ store.items.length }}</span>
       </div>
-      <Button
-        label="Добавить базу"
-        icon="pi pi-plus"
-        size="small"
-        data-test="lb-add"
-        @click="openCreate"
-      />
+      <div class="flex flex-wrap items-center gap-2">
+        <Button
+          label="Выбрать все"
+          severity="secondary"
+          size="small"
+          outlined
+          :data-test="`lb-select-all-${localAllSelected ? 'on' : 'off'}`"
+          @click="toggleLocalAll"
+        />
+        <Button
+          label="Обновить выбранные…"
+          size="small"
+          :disabled="!localSelected.length"
+          data-test="lb-update-selected"
+          @click="openLocalBulkUpdate"
+        />
+        <Button
+          label="Добавить базу"
+          icon="pi pi-plus"
+          size="small"
+          data-test="lb-add"
+          @click="openCreate"
+        />
+      </div>
     </div>
 
     <div v-if="store.groups.length" class="space-y-4">
@@ -161,6 +204,7 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
         <table class="w-full text-sm">
           <thead>
             <tr class="magaz-muted border-b border-slate-100 text-left text-xs">
+              <th class="px-4 py-2 font-medium"><span class="sr-only">выбор</span></th>
               <th class="px-4 py-2 font-medium">Название</th>
               <th class="py-2 pr-3 font-medium">Версия 1С</th>
               <th class="py-2 pr-3 font-medium">Кластер / БД</th>
@@ -178,6 +222,14 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               class="border-b border-slate-100 last:border-0"
               :data-test="`lb-row-${base.id}`"
             >
+              <td class="px-4 py-2">
+                <Checkbox
+                  :model-value="localSelected.includes(base.id)"
+                  binary
+                  :data-test="`lb-select-${base.id}`"
+                  @update:model-value="toggleLocalSelect(base.id)"
+                />
+              </td>
               <td class="px-4 py-2 font-medium">
                 {{ base.name }}
                 <div v-if="base.comment" class="magaz-muted text-xs">{{ base.comment }}</div>
@@ -232,7 +284,7 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               </td>
             </tr>
             <tr v-if="!visibleItems.filter((item) => item.group === group).length">
-              <td colspan="8" class="magaz-muted py-4 text-center">Нет баз в этой группе</td>
+              <td colspan="9" class="magaz-muted py-4 text-center">Нет баз в этой группе</td>
             </tr>
           </tbody>
         </table>
@@ -244,7 +296,12 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
     </div>
 
     <LocalBaseFormDialog v-model:visible="formVisible" :base="editingBase" :copy-from="copyFrom" @saved="onSaved" />
-    <LocalBaseUpdateDialog v-model:visible="localUpdateVisible" :base="updateBase" @submitted="onLocalUpdateSubmitted" />
+    <LocalBaseUpdateDialog
+      v-model:visible="localUpdateVisible"
+      :base="updateBase"
+      :bulk-base-ids="bulkBaseIds"
+      @submitted="onLocalUpdateSubmitted"
+    />
   </div>
 </template>
 

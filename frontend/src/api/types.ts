@@ -244,6 +244,32 @@ export interface LocalBaseRunUpdateResponse {
   job: LocalBaseRunUpdateJob
 }
 
+/** Тело `POST /admin/local-bases/bulk/update` (Д-25): пачка баз + файл и режим. */
+export interface LocalBulkUpdatePayload {
+  /** id выбранных локальных баз. */
+  local_base_ids: number[]
+  file_name?: string
+  is_fast_update?: boolean
+  is_extension?: boolean | null
+  extension_name?: string | null
+}
+
+/** Строка результата массового обновления по одной базе (Д-25). */
+export interface LocalBulkUpdateJob {
+  local_base_id: number
+  local_base_name: string
+  job_id: number | null
+  status: string
+  detail: string | null
+}
+
+/** Ответ `POST /admin/local-bases/bulk/update` (Д-25). */
+export interface LocalBulkUpdateResponse {
+  message: string
+  total: number
+  jobs: LocalBulkUpdateJob[]
+}
+
 /** Блок «что вписать в конфиг агента» (§11.2). */
 export interface AgentConfigBlock {
   store_id: number

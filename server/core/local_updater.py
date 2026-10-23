@@ -40,6 +40,8 @@ __all__ = ["LocalUpdateMonitor", "build_update_params", "update_db_cycle"]
 
 STOP_TIMEOUT_SEC = 10
 INTERVAL_SETTING = "local_update_interval_sec"
+#: Д-25: сколько локальных баз обновлять одновременно (`local_update_concurrency`)
+CONCURRENCY_SETTING = "local_update_concurrency"
 
 #: Сообщение успеха обновления БД (перенос v2, §7.1 «менять нельзя»)
 SUCCESS_UPDATE_MSG = "Обновление конфигурации успешно завершено"
@@ -130,12 +132,14 @@ class LocalUpdateMonitor:
         secret_box: SecretBox,
         provider: ProcessProvider = DEFAULT_PROVIDER,
         interval_override: int | None = None,
+        concurrency_override: int | None = None,
     ) -> None:
         self._db = db
         self._settings = settings
         self._secret_box = secret_box
         self._provider = provider
         self._interval_override = interval_override
+        self._concurrency_override = concurrency_override
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self.last_processed = 0
@@ -146,6 +150,14 @@ class LocalUpdateMonitor:
             return max(1, int(self._interval_override))
         with self._db.session() as session:
             return max(1, settings_service.get_int(session, INTERVAL_SETTING))
+
+    @property
+    def concurrency(self) -> int:
+        """Сколько локальных баз обновлять одновременно (Д-25, `1cv8.exe` параллельно)."""
+        if self._concurrency_override is not None:
+            return max(1, int(self._concurrency_override))
+        with self._db.session() as session:
+            return max(1, settings_service.get_int(session, CONCURRENCY_SETTING))
 
     @property
     def is_running(self) -> bool:
@@ -161,38 +173,55 @@ class LocalUpdateMonitor:
         )
 
     async def poll_once(self) -> int:
-        """Выполнить один цикл: одну незавершённую локальную задачу, если есть."""
+        """Выполнить один цикл: до `concurrency` незавершённых локальных задач (Д-25).
+
+        Пока базы обновляются параллельно (по настройке `local_update_concurrency`),
+        остальные ждут в очереди `queued` и подхватятся следующим циклом.
+        """
         paths = self._paths()
         if paths is None:
             return 0
+        limit = self.concurrency
         with self._db.session() as session:
             pending = command_service.list_pending_local(session)
-            if not pending:
-                return 0
-            command = pending[0]
-            await self._run_one(session, command, paths)
+            command_ids = [command.id for command in pending[:limit]]
+        if not command_ids:
+            return 0
+        # Каждая задача — в своей asyncio-задаче и своей SQLAlchemy-сессии: конкурентное
+        # выполнение `1cv8.exe` не делит ни соединение, ни транзакцию.
+        await asyncio.gather(*(self._run_one(cmd_id, paths) for cmd_id in command_ids))
+        self.last_processed = len(command_ids)
+        return len(command_ids)
+
+    async def _run_one(self, command_id: int, paths: OneCPaths) -> None:
+        """Выполнить одну локальную задачу по её id в собственной сессии."""
+        with self._db.session() as session:
+            command = command_service.get_command(session, command_id)
+            if command is None:
+                return
+            base = command.local_base
+            if base is None or not base.is_active:
+                command_service.add_log(session, command, "Локальная база не найдена или отключена")
+                command_service.set_status(session, command, CommandStatus.FAILED)
+                session.commit()
+                return
+
+            password = self._secret_box.decrypt(base.password_enc) if base.password_enc else ""
+            up = build_update_params(base, command.params, password=password)
+            # RUNNING: `set_status` проставит `started_at`, чтобы UI видел «идёт N сек»
+            command_service.set_status(session, command, CommandStatus.RUNNING)
+            command_service.add_log(session, command, f"Запуск обновления локальной базы «{base.name}»")
+            # Коммитим статус до долгой операции 1С — UI успевает показать прогресс
             session.commit()
-        self.last_processed = 1
-        return 1
-
-    async def _run_one(self, session: Session, command: Command, paths: OneCPaths) -> None:
-        base = command.local_base
-        if base is None or not base.is_active:
-            command_service.add_log(session, command, "Локальная база не найдена или отключена")
-            command_service.set_status(session, command, CommandStatus.FAILED)
-            return
-
-        password = self._secret_box.decrypt(base.password_enc) if base.password_enc else ""
-        up = build_update_params(base, command.params, password=password)
-        # RUNNING: `set_status` проставит `started_at`, чтобы UI видел «идёт N сек»
-        command_service.set_status(session, command, CommandStatus.RUNNING)
-        command_service.add_log(session, command, f"Запуск обновления локальной базы «{base.name}»")
-        status, message = await update_db_cycle(up, paths, provider=self._provider, log_update=paths.log_update_db)
-        if status == CommandStatus.SUCCESS:
-            command_service.add_log(session, command, message)
-        else:
-            command_service.add_log(session, command, message, level="error")
-        command_service.set_status(session, command, status)
+            status, message = await update_db_cycle(
+                up, paths, provider=self._provider, log_update=paths.log_update_db
+            )
+            if status == CommandStatus.SUCCESS:
+                command_service.add_log(session, command, message)
+            else:
+                command_service.add_log(session, command, message, level="error")
+            command_service.set_status(session, command, status)
+            session.commit()
 
     async def run(self) -> None:
         await asyncio.sleep(max(0.0, float(self._settings.local_updater_startup_delay_sec)))

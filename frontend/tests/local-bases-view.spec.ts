@@ -38,8 +38,19 @@ function makeJob(overrides: Record<string, unknown> = {}): Record<string, unknow
 }
 
 /** Маршрутизатор fetch: магазинные/локальные базы, журнал локальных обновлений. */
-function apiMock(localBases: unknown[], localJobs: unknown[] = []) {
-  return async (url: string): Promise<Response> => {
+function apiMock(localBases: unknown[], localJobs: unknown[] = [], onBulkUpdate?: (body: unknown) => void) {
+  return async (url: string, init: RequestInit = {}): Promise<Response> => {
+    if (init.method === 'POST' && url.includes('/bulk/update')) {
+      onBulkUpdate?.(init.body)
+      return jsonResponse({
+        message: 'Задачи поставлены: 2 из 2 баз',
+        total: 2,
+        jobs: [
+          { local_base_id: 2, local_base_name: 'Бухгалтерия', job_id: 10, status: 'queued', detail: null },
+          { local_base_id: 3, local_base_name: 'Торговля', job_id: 11, status: 'queued', detail: null },
+        ],
+      })
+    }
     if (url.includes('/admin/local-bases')) return jsonResponse(localBases)
     if (url.includes('/admin/jobs')) {
       if (url.includes('kind=run_update_db_local'))
@@ -59,7 +70,11 @@ const stubs = {
     template: '<input :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" />',
   },
   Dialog: { props: ['visible'], template: '<div v-if="visible"><slot /><slot name="footer" /></div>' },
-  Checkbox: { props: ['modelValue'], template: '<input type="checkbox" />' },
+  Checkbox: {
+    props: ['modelValue'],
+    emits: ['update:modelValue'],
+    template: '<input type="checkbox" :checked="modelValue" @change="$emit(\'update:modelValue\', $event.target.checked)" />',
+  },
   RadioButton: { template: '<span />' },
 }
 
@@ -141,6 +156,44 @@ describe('страница «Локальные базы»', () => {
 
     expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="lbu-file"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('кнопка «Обновить выбранные» шлёт POST .../bulk/update с выбранными базами (Д-25)', async () => {
+    const bulkBodies: unknown[] = []
+    fetchMock.mockImplementation(
+      apiMock(
+        [
+          makeBase(),
+          makeBase({ id: 3, name: 'Торговля', database_name: 'trade', group: 'Продажи' }),
+        ],
+        [],
+        (body) => bulkBodies.push(body),
+      ),
+    )
+
+    const wrapper = await mountView(fetchMock)
+
+    await wrapper.find('[data-test="lb-select-2"]').setChecked()
+    await wrapper.find('[data-test="lb-select-3"]').setChecked()
+    await flushPromises()
+
+    await wrapper.find('[data-test="lb-update-selected"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
+
+    await wrapper.find('[data-test="lbu-file"]').setValue('update')
+    await wrapper.find('[data-test="lbu-run"]').trigger('click')
+    await flushPromises()
+
+    expect(bulkBodies).toHaveLength(1)
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      local_base_ids: [2, 3],
+      file_name: 'update',
+      is_fast_update: false,
+      is_extension: false,
+    })
     wrapper.unmount()
   })
 })
