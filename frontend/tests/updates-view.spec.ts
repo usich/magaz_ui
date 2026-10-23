@@ -197,7 +197,7 @@ describe('страница «Обновление 1С»', () => {
 
     expect(wrapper.find('[data-test="updates-tab-stores"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="updates-tab-local"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="operation-panel"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="store-operation-strip"]').exists()).toBe(true)
 
     const row = wrapper.find('[data-test="updates-store-1"]')
     expect(row.exists()).toBe(true)

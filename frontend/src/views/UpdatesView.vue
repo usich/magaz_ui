@@ -13,7 +13,7 @@ import { useToast } from 'primevue/usetoast'
 import { dispatchAction, type ActionOutcome } from '@/api/actions'
 import { jobsApi } from '@/api/endpoints'
 import type { JobItem, LocalBaseItem } from '@/api/types'
-import OperationPanel from '@/components/OperationPanel.vue'
+import StoreOperationStrip from '@/components/StoreOperationStrip.vue'
 import StatusTile from '@/components/StatusTile.vue'
 import LocalBaseFormDialog from '@/components/LocalBaseFormDialog.vue'
 import LocalBaseUpdateDialog from '@/components/LocalBaseUpdateDialog.vue'
@@ -336,12 +336,11 @@ onUnmounted(() => {
         <StatusTile label="Операций в работе" :value="counts.activeJobs" icon="pi pi-refresh" />
       </section>
 
-      <OperationPanel
+      <StoreOperationStrip
         :store-ids="selected"
         :all="!selected.length"
-        title="Массовые операции"
-        :show-check-files="true"
-        show-download-link
+        :all-stores="stores.items"
+        title="Массовые операции по магазинам"
         @submitted="loadJobs"
       />
 
