@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta
 from typing import Annotated
 
@@ -213,7 +214,7 @@ def backup_local_bases_endpoint(
 
 
 @router.post("/check", summary="Ручная проверка не найденных бэкапов")
-def backup_check_endpoint(
+async def backup_check_endpoint(
     request: Request,
     admin: Annotated[AdminUser, Depends(require_active_admin)],
     context: Annotated[AppContext, Depends(get_context)],
@@ -222,18 +223,34 @@ def backup_check_endpoint(
     """Проверить вручную только те бэкапы, которые ещё не найдены (Д-21).
 
     Не делает лишних запросов по уже найденным за целевую дату объектам.
+    SMB-опрос синхронный (pysmb) и с недоступными шарами может ждать таймауты
+    по 10+ сек на объект, поэтому выполняется в отдельном потоке через
+    `asyncio.to_thread` (по образцу BackupMonitor) — иначе он занял бы поток
+    threadpool FastAPI на минуты и затормозил бы остальную админку.
     """
-    stores = list(session.scalars(select(Store).where(Store.backup_check_enabled.is_(True))))
-    bases = list(
-        session.scalars(select(LocalBase).where(LocalBase.backup_check_enabled.is_(True)))
-    )
-    checked = backup_monitor.check_missing(
-        session,
-        stores,
-        bases,
-        secret_box=context.secret_box,
-    )
-    session.commit()
+
+    def _run_check_sync() -> int:
+        # Собственная сессия внутри потока: объекты и их статусы не делят
+        # соединение/транзакцию с сессией HTTP-запроса (аналог _check_missing_sync).
+        with context.db.session() as db_session:
+            stores = list(
+                db_session.scalars(select(Store).where(Store.backup_check_enabled.is_(True)))
+            )
+            bases = list(
+                db_session.scalars(
+                    select(LocalBase).where(LocalBase.backup_check_enabled.is_(True))
+                )
+            )
+            checked = backup_monitor.check_missing(
+                db_session,
+                stores,
+                bases,
+                secret_box=context.secret_box,
+            )
+            db_session.commit()
+            return checked
+
+    checked = await asyncio.to_thread(_run_check_sync)
 
     audit_service.record(
         session,

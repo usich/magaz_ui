@@ -13,6 +13,7 @@ HTML-страница 503 с подсказкой — это состояние 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -79,15 +80,22 @@ def build_spa_router(settings: Settings) -> APIRouter:
 
         if normalized:
             candidate = dist_dir / normalized
-            try:
-                resolved = candidate.resolve()
-                inside_dist = dist_dir.resolve() in resolved.parents
-            except OSError:  # pragma: no cover - нечитаемый путь
-                resolved, inside_dist = candidate, False
-            if inside_dist and resolved.is_file():
+
+            def _resolve_candidate() -> tuple[Path, bool]:
+                # Синхронный доступ к ФС (stat/resolve); выносим в поток, чтобы не
+                # блокировать event loop uvicorn на каждый GET-запрос фронта.
+                try:
+                    resolved = candidate.resolve()
+                    inside = dist_dir.resolve() in resolved.parents
+                except OSError:  # pragma: no cover - нечитаемый путь
+                    return candidate, False
+                return resolved, inside
+
+            resolved, inside_dist = await asyncio.to_thread(_resolve_candidate)
+            if inside_dist and await asyncio.to_thread(resolved.is_file):
                 return FileResponse(resolved)
 
-        if index_file.is_file():
+        if await asyncio.to_thread(index_file.is_file):
             return FileResponse(index_file)
 
         logger.warning("SPA не собрана: нет файла %s", index_file)

@@ -307,7 +307,12 @@ class LocalUpdateMonitor:
 
             if command.kind == str(CommandKind.CHECK_FILES_LOCAL):
                 file_name = str((command.params or {}).get("file_name") or "update")
-                status, message = check_files_cycle(base, file_name, paths)
+                # Проверка файлов — синхронный доступ к файловой системе (stat/списки);
+                # выполняем в потоке, чтобы не блокировать главный event loop uvicorn
+                # (по образцу `asyncio.to_thread` в backup_monitor).
+                status, message = await asyncio.to_thread(
+                    check_files_cycle, base, file_name, paths
+                )
             elif command.kind == str(CommandKind.RUN_MERGE_LOCAL):
                 up = build_merge_params(base, command.params, password=password)
                 status, message = await merge_cycle(up, paths, provider=self._provider)
