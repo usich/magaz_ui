@@ -48,6 +48,15 @@ interface StoreForm {
   extension_name: string
   is_active: boolean
   clear_password: boolean
+  // Д-21: проверка бэкапа
+  backup_check_enabled: boolean
+  backup_path: string
+  backup_host: string
+  backup_use_auth: boolean
+  backup_user: string
+  backup_password: string
+  backup_clear_password: boolean
+  backup_check_yesterday: boolean
 }
 
 function emptyForm(): StoreForm {
@@ -64,6 +73,14 @@ function emptyForm(): StoreForm {
     extension_name: '',
     is_active: true,
     clear_password: false,
+    backup_check_enabled: false,
+    backup_path: '',
+    backup_host: '',
+    backup_use_auth: false,
+    backup_user: '',
+    backup_password: '',
+    backup_clear_password: false,
+    backup_check_yesterday: false,
   }
 }
 
@@ -104,6 +121,12 @@ function reset(): void {
     comment: store?.comment ?? '',
     extension_name: store?.extension_name ?? '',
     is_active: store?.is_active ?? true,
+    backup_check_enabled: store?.backup_check_enabled ?? false,
+    backup_path: store?.backup_path ?? '',
+    backup_host: store?.backup_host ?? '',
+    backup_use_auth: store?.backup_use_auth ?? false,
+    backup_user: store?.backup_user ?? '',
+    backup_check_yesterday: store?.backup_check_yesterday ?? false,
   })
   formError.value = ''
 }
@@ -153,6 +176,14 @@ async function submit(): Promise<void> {
         password: form.password || null,
         comment: form.comment.trim() || null,
         extension_name: form.extension_name.trim() || null,
+        backup_check_enabled: form.backup_check_enabled,
+        backup_path: form.backup_path.trim() || null,
+        backup_host: form.backup_host.trim() || null,
+        backup_use_auth: form.backup_use_auth,
+        backup_user: form.backup_use_auth ? form.backup_user.trim() || null : null,
+        backup_password: form.backup_use_auth ? form.backup_password || null : null,
+        backup_clear_password: form.backup_clear_password,
+        backup_check_yesterday: form.backup_check_yesterday,
       }
       const created = await stores.create(payload)
       emit('saved', created, true)
@@ -176,6 +207,14 @@ async function submit(): Promise<void> {
       comment: form.comment.trim() || null,
       extension_name: form.extension_name.trim() || null,
       is_active: form.is_active,
+      backup_check_enabled: form.backup_check_enabled,
+      backup_path: form.backup_path.trim() || null,
+      backup_host: form.backup_host.trim() || null,
+      backup_use_auth: form.backup_use_auth,
+      backup_user: form.backup_use_auth ? form.backup_user.trim() || null : null,
+      backup_password: form.backup_use_auth ? form.backup_password || null : null,
+      backup_clear_password: form.backup_clear_password,
+      backup_check_yesterday: form.backup_check_yesterday,
     }
     let updated = await stores.update(id, payload)
 
@@ -312,6 +351,80 @@ async function submit(): Promise<void> {
         </label>
       </template>
     </div>
+
+    <!-- Д-21: проверка бэкапа -->
+    <div class="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4" data-test="backup-block">
+      <label class="flex items-center gap-2 text-sm font-medium">
+        <input v-model="form.backup_check_enabled" type="checkbox" data-test="backup-enable" />
+        проверять наличие бэкапа
+      </label>
+
+      <div v-if="form.backup_check_enabled" class="mt-3 grid gap-3 md:grid-cols-2">
+        <label class="space-y-1 md:col-span-2">
+          <span class="magaz-muted text-xs">Путь к бэкапу (локальный C:\… или сетевой \\…)</span>
+          <InputText
+            v-model="form.backup_path"
+            class="w-full"
+            placeholder="\\server\backup\Магазин\…"
+            :pt="{ root: { 'data-test': 'backup-path' } }"
+          />
+        </label>
+        <label class="space-y-1">
+          <span class="magaz-muted text-xs">Имя машины SMB</span>
+          <InputText
+            v-model="form.backup_host"
+            class="w-full"
+            placeholder="ilya"
+            :pt="{ root: { 'data-test': 'backup-host' } }"
+          />
+        </label>
+        <label class="flex items-center gap-2 text-sm">
+          <select
+            v-model="form.backup_check_yesterday"
+            class="rounded-lg border border-slate-300 px-3 py-2 text-sm"
+            data-test="backup-yesterday"
+          >
+            <option :value="false">за сегодня</option>
+            <option :value="true">за вчера</option>
+          </select>
+          <span class="magaz-muted text-xs">актуальность бэкапа</span>
+        </label>
+        <label class="flex items-center gap-2 text-sm">
+          <input v-model="form.backup_use_auth" type="checkbox" data-test="backup-auth" />
+          отдельная авторизация (не гость)
+        </label>
+
+        <template v-if="form.backup_use_auth">
+          <label class="space-y-1">
+            <span class="magaz-muted text-xs">Логин SMB</span>
+            <InputText
+              v-model="form.backup_user"
+              class="w-full"
+              :pt="{ root: { 'data-test': 'backup-user' } }"
+            />
+          </label>
+          <label class="space-y-1">
+            <span class="magaz-muted text-xs">Пароль SMB</span>
+            <InputText
+              v-model="form.backup_password"
+              type="password"
+              class="w-full"
+              :disabled="form.backup_clear_password"
+              :pt="{ root: { 'data-test': 'backup-password' } }"
+            />
+          </label>
+          <label v-if="isEdit" class="magaz-muted flex items-center gap-2 text-sm">
+            <input v-model="form.backup_clear_password" type="checkbox" data-test="backup-clear-password" />
+            очистить пароль SMB
+          </label>
+        </template>
+      </div>
+      <p class="magaz-muted mt-2 text-xs">
+        Проверка раз в день: если бэкап за {{ form.backup_check_yesterday ? 'вчера' : 'сегодня' }} найден —
+        стоп; иначе до 5 попыток с интервалом 3 мин (Backup Monitor).
+      </p>
+    </div>
+
 
     <p class="magaz-muted mt-4 text-xs">
       Пароль 1С хранится на сервере в шифрованном виде и доставляется агенту отдельно (П-1): в

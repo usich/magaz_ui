@@ -36,6 +36,7 @@ const stubs = {
     template: '<input :value="modelValue" />',
   },
   Checkbox: { props: ['modelValue'], template: '<label><slot /></label>' },
+  RadioButton: { props: ['modelValue', 'value'], template: '<span />' },
   Message: {
     props: ['severity'],
     template: '<div :data-severity="severity"><slot /></div>',

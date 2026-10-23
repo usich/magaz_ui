@@ -61,7 +61,14 @@ from server.services import (
     notification_service,
     settings_service,
 )
-from shared.enums import CommandKind, CommandStatus, JobLogLevel
+from shared.enums import (
+    CommandKind,
+    CommandStatus,
+    JobLogLevel,
+    NotificationSeverity,
+    TargetType,
+)
+from shared.paths import is_extension_operation
 from shared.schemas import CheckFilesResponse, CredentialsPush, NotifyCancelRequest
 from shared.timeutil import utcnow
 
@@ -249,6 +256,11 @@ class CommandDispatcher:
         self._progress: dict[int, str] = {}
         #: store_id → когда последний раз сверяли версии на кассе (П-1, Д-1)
         self._credentials_checked: dict[int, datetime] = {}
+        #: command_id задач, переведённых в `SENT` «аварийно» (Вариант B): `/run-*`
+        #: мог дойти до агента, но ответ не дошёл (разрыв). Их опрашиваем, а не
+        #: переотправляем; если опрос покажет, что агент не знает об операции —
+        #: вернём в `queued` для повторной отправки (§13.2, FR-9).
+        self._provisional_sent: set[int] = set()
         self.last_report: DispatchReport | None = None
 
     # --- Настройки из БД ----------------------------------------------------
@@ -389,6 +401,7 @@ class CommandDispatcher:
         for command_id in list(self._progress):
             if command_id not in seen:
                 del self._progress[command_id]
+        self._provisional_sent &= seen
 
     def _expired(self, session: Any, command: Command) -> bool:  # noqa: ANN401 - Session
         """Не «висит» ли задача дольше `command_poll_timeout_sec` (§11.4).
@@ -752,7 +765,18 @@ class CommandDispatcher:
         `failed` с причиной (наблюдение №7 этапа Э3).
         """
         kind = str(command.kind)
-        extension = bool((command.params or {}).get("extension_name"))
+        # FR-4/Д-16/Д-17: имя расширения может жить в карточке магазина, а в `params`
+        # операции его нет. Флаг `extension` для `/check-*` обязан отражать
+        # фактическую операцию (как в `build_1c_payload`), иначе агент читал бы
+        # основной лог, а команда пишет в `<...>-extension.txt` — и сервер не
+        # находит результат. Тип решает `is_extension_operation`: явный флаг из
+        # params → файл (`.cf`/`.cfe`) → `extension_name` (Д-16, Д-17).
+        params = command.params or {}
+        extension = is_extension_operation(
+            params.get("is_extension"),
+            str(params.get("file_name") or ""),
+            params.get("extension_name") or store.extension_name,
+        )
         async with self._client(store) as client:
             status_code, body = await client.check_job_state(kind, extension=extension)
             report.polled += 1
@@ -769,6 +793,7 @@ class CommandDispatcher:
                     log_text=logs_text,
                     report=report,
                 )
+                self._maybe_notify_can_login(session, store, command)
                 return
             if status_code == 400:
                 self._finish(
@@ -786,17 +811,82 @@ class CommandDispatcher:
             self._log_progress(session, command, message)
             stuck = await self._stuck_reason(client, command)
             if stuck:
-                self._finish(
-                    session,
-                    command,
-                    CommandStatus.FAILED,
-                    message=stuck,
-                    log_text=logs_text,
-                    report=report,
-                    level=JobLogLevel.ERROR,
-                )
+                if (
+                    command.id in self._provisional_sent
+                    and "запуск не состоялся" in stuck
+                ):
+                    # Вариант B (Д-15): задачу перевели в `SENT` «аварийно» (разрыв
+                    # на отправке), а опрос показал, что агент не знает об операции
+                    # (не занят, лог пуст) — команда на самом деле не дошла. Возвращаем
+                    # в очередь для честной повторной отправки, а не закрываем failed.
+                    self._provisional_sent.discard(command.id)
+                    command_service.set_status(session, command, CommandStatus.QUEUED)
+                    command_service.add_log(
+                        session,
+                        command,
+                        "Агент не подтвердил запуск операции — задача возвращена "
+                        "в очередь для повторной отправки",
+                        level=JobLogLevel.WARNING,
+                    )
+                    report.waiting += 1
+                else:
+                    self._finish(
+                        session,
+                        command,
+                        CommandStatus.FAILED,
+                        message=stuck,
+                        log_text=logs_text,
+                        report=report,
+                        level=JobLogLevel.ERROR,
+                    )
             else:
                 report.waiting += 1
+
+    def _maybe_notify_can_login(
+        self, session: Any, store: Store, command: Command  # noqa: ANN401 - Session
+    ) -> None:
+        """Д-18: после успешного **полного** обновления БД сообщить «Можно входить».
+
+        Срабатывает, когда `run_update_db` с `is_fast_update=false` (полный цикл:
+        завершение сеансов → `/UpdateDBCfg` → разрешение входа) завершился успехом.
+        Создаём уведомление уровня «важно» (без подтверждения, удаляется после
+        прочтения, без категории) и ставим `notify`-задачу на этот магазин — касса
+        покажет его кассирам. Один раз: задача уже закрыта и больше не опрашивается.
+        """
+        if str(command.kind) != str(CommandKind.RUN_UPDATE_DB):
+            return
+        params = command.params or {}
+        if bool(params.get("is_fast_update")):
+            return
+        try:
+            notification = notification_service.create_notification(
+                session,
+                title="Можно входить в программу 1С",
+                body="Можно входить в программу 1С",
+                severity=str(NotificationSeverity.IMPORTANT),
+                requires_ack=False,
+                delete_after_read=True,
+                target_type=str(TargetType.STORES),
+                stores=[store],
+                created_by="dispatcher",
+            )
+            command_service.create_command(
+                session,
+                store_id=store.id,
+                kind=CommandKind.NOTIFY,
+                params={"notification_id": notification.id},
+                created_by="dispatcher",
+            )
+            command_service.add_log(
+                session,
+                command,
+                f"Уведомление «Можно входить в программу 1С» (id={notification.id}) "
+                "поставлено на кассу после обновления",
+            )
+        except Exception:  # noqa: BLE001 - уведомление не роняет цикл диспетчера
+            logger.exception(
+                "Не удалось создать уведомление «Можно входить» для магазина id=%s", store.id
+            )
 
     def _log_progress(self, session: Any, command: Command, message: str) -> None:  # noqa: ANN401
         """Записать в журнал задачи только **новое** сообщение опроса (§4.4)."""
@@ -913,12 +1003,16 @@ class CommandDispatcher:
     ) -> None:
         """Решить судьбу задачи после ошибки канала (§13.2).
 
-        Три разных случая, и путать их нельзя:
+        Четыре разных случая, и путать их нельзя:
 
         * **касса офлайн** — команда остаётся `queued` и ждёт появления в сети
           (FR-16): попытки не тратятся, иначе очередь «сгорала» бы за 15 секунд;
         * **`409` от агента** — на кассе уже идёт другая 1С-операция (I-13):
           ждём с максимальной паузой, команда не теряется и попыток не тратит;
+        * **разрыв/таймаут на «в сеть» кассе для `/run-*`** (Вариант B, Д-15):
+          неопределённость — агент мог принять и выполнить, но ответ не дошёл.
+          Допрашиваем `/check-*` (переведя задачу в `SENT` при неудачной отправке),
+          а не переотправляем, иначе на свободной кассе операция выполнится дважды;
         * **касса в сети, но запрос не удался** — считаем попытку (§4.3
           `attempts`), повторяем с backoff, после `command_retry_max` — `error`.
         """
@@ -955,6 +1049,39 @@ class CommandDispatcher:
                 level=JobLogLevel.WARNING,
             )
             self._schedule_backoff(command.id, attempts=99)  # максимальная пауза
+            report.waiting += 1
+            return
+
+        # Вариант B (Д-15, §13.2): для `/run-merge`/`/run-update-db` разрыв или
+        # таймаут на «в сеть» кассе — это неопределённость, а не гарантированный
+        # провал доставки: агент мог принять команду и выполнить, но ответ не
+        # дошёл. Вместо повторной отправки (которая дала бы дубль операции на
+        # свободной кассе) — допрашиваем `/check-*`. Если отправка не удалась
+        # (`queued`), переводим задачу в `SENT`; при обрыве опроса оставляем как
+        # есть. Возврат в `queued` произойдёт только если опрос покажет, что
+        # агент не знает об операции.
+        is_1c_kind = str(command.kind) in POLLABLE_KINDS
+        if is_1c_kind and isinstance(exc, AgentOfflineError) and online:
+            sending = str(command.status) == str(CommandStatus.QUEUED)
+            if sending:
+                self._provisional_sent.add(command.id)
+                command_service.set_status(session, command, CommandStatus.SENT)
+                command_service.add_log(
+                    session,
+                    command,
+                    f"Ответ агента на отправку не получен ({exc.message}) — "
+                    "опрос, а не повторная отправка (защита от дубля)",
+                    level=JobLogLevel.WARNING,
+                )
+            else:
+                command_service.add_log(
+                    session,
+                    command,
+                    f"Опрос `/check-*` не удался ({exc.message}) — продолжаем опрос, "
+                    "команду не переотправляем (защита от дубля)",
+                    level=JobLogLevel.WARNING,
+                )
+            self._schedule_backoff(command.id, attempts=1)
             report.waiting += 1
             return
 
@@ -1135,14 +1262,27 @@ def build_1c_payload(store: Store, command: Command) -> dict[str, Any]:
         "extension_name",
         "settings_file_name",
         "is_fast_update",
+        "is_extension",
     ):
         if key in params and params[key] is not None:
             payload[key] = params[key]
-    # FR-4: имя расширения может жить в карточке магазина. Если в параметрах операции
-    # оно не задано явно, подставляем из карточки — так массовая операция сама
-    # знает расширение для каждого магазина.
-    if "extension_name" not in payload and store.extension_name:
-        payload["extension_name"] = store.extension_name
+    # FR-4/Д-16/Д-17: имя расширения может жить в карточке магазина. Тип операции
+    # («основная/расширение») решает единый источник `is_extension_operation`:
+    # явный флаг `is_extension` из параметров операции → расширение в имени файла
+    # (`.cf`/`.cfe`) → `extension_name` (параметры или карточка). Если идёт на
+    # расширение, подставляем имя из карточки, когда в параметрах его нет; если
+    # на основную конфигурацию — расширение из карточки **не** подставляем, иначе
+    # `.cf`-обновление на магазине с настроенным расширением превращалось бы в `.cfe`.
+    # Флаг `is_extension` всегда передаём агенту явно, чтобы он не выводил тип из
+    # карточки заново (иначе на агенте снова всплыл бы `-Extension`).
+    file_name = str(params.get("file_name") or "")
+    ext = payload.get("extension_name") or store.extension_name
+    is_ext = is_extension_operation(params.get("is_extension"), file_name, ext)
+    payload["is_extension"] = is_ext
+    if is_ext:
+        payload["extension_name"] = payload.get("extension_name") or store.extension_name
+    else:
+        payload.pop("extension_name", None)
     return payload
 
 

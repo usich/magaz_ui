@@ -11,8 +11,11 @@ from pathlib import PurePosixPath, PureWindowsPath
 
 __all__ = [
     "UPDATE_FILE_SUFFIXES",
+    "is_extension_merge",
+    "is_extension_operation",
     "is_safe_archive_member",
     "safe_basename",
+    "split_merge_file_name",
     "validate_file_name",
     "validate_ipv4_address",
 ]
@@ -31,6 +34,58 @@ def validate_file_name(value: str) -> str:
     if value in (".", "..") or "/" in value or "\\" in value:
         raise ValueError("Имя файла не должно содержать разделителей пути")
     return value
+
+
+def split_merge_file_name(value: str) -> tuple[str, str | None]:
+    """Разобрать имя файла слияния на «корень» и явное расширение (FR-4, Д-16).
+
+    Пользователь может указать имя с расширением (`1Cv8-mag-2110.cf` / `.cfe`) —
+    тогда тип слияния определяется по файлу, а не по `extension_name` из карточки.
+    Возвращает `(stem, suffix)`: `suffix` равен `".cf"`/`".cfe"`, если расширение
+    указано явно, иначе `None` (тип тогда решает `extension_name`). Регистр
+    расширения не важен, порядок проверки — `.cfe` раньше `.cf` (иначе `.cfe`
+    был бы ошибочно принят за `.cf`).
+    """
+    raw = (value or "").strip()
+    lower = raw.lower()
+    for suffix in (".cfe", ".cf"):
+        if lower.endswith(suffix):
+            return raw[: len(raw) - len(suffix)], suffix
+    return raw, None
+
+
+def is_extension_merge(file_name: str, extension_name: str | None) -> bool:
+    """Сливается ли **расширение** (а не основная конфигурация) (FR-4, Д-16).
+
+    Приоритет у фактического файла, а не у карточки магазина:
+    * имя оканчивается на `.cfe` → расширение (`True`), даже если `extension_name`
+      не задан (значение для `-Extension` возьмётся из карточки);
+    * имя оканчивается на `.cf` → основная конфигурация (`False`), даже если в
+      карточке магазина прописано расширение — это и есть способ обновить `.cf`
+      на магазине с настроенным расширением;
+    * без расширения → по `extension_name` (есть → расширение, нет → основная).
+    """
+    _, suffix = split_merge_file_name(file_name)
+    if suffix == ".cfe":
+        return True
+    if suffix == ".cf":
+        return False
+    return bool(extension_name)
+
+
+def is_extension_operation(
+    is_extension: bool | None, file_name: str, extension_name: str | None
+) -> bool:
+    """Обновляем ли **расширение** (Д-17): явный флаг операции главнее остального.
+
+    Приоритет: заданный `is_extension` → расширение в имени файла (`.cf`/`.cfe`)
+    → `extension_name` (параметры или карточка магазина). Это единый источник
+    «что обновляем» для `/run-merge` и `/run-update-db`: массовая операция передаёт
+    явный флаг, а не полагается на карточку магазина.
+    """
+    if is_extension is not None:
+        return bool(is_extension)
+    return is_extension_merge(file_name, extension_name)
 
 
 def safe_basename(name: str) -> str:

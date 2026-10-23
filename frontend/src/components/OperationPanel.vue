@@ -15,6 +15,7 @@ import Button from 'primevue/button'
 import Checkbox from 'primevue/checkbox'
 import InputText from 'primevue/inputtext'
 import Message from 'primevue/message'
+import RadioButton from 'primevue/radiobutton'
 import { useToast } from 'primevue/usetoast'
 
 import { ApiError } from '@/api/client'
@@ -54,10 +55,17 @@ const toast = useToast()
 const merge = reactive({
   file_name: props.defaultFileName,
   full_merge: false,
+  // Д-17: явный тип слияния — основная (.cf) или расширение (.cfe)
+  is_extension: false,
   extension_name: '',
   settings_file_name: '',
 })
-const update = reactive({ is_fast_update: false, extension_name: '' })
+const update = reactive({
+  is_fast_update: false,
+  // Д-17: явный тип обновления БД — основная или расширение
+  is_extension: false,
+  extension_name: '',
+})
 const message = reactive({ text_message: '' })
 const check = reactive({ filename: props.defaultFileName })
 const link = reactive({ url: '' })
@@ -188,8 +196,27 @@ async function run(
               :pt="{ root: { 'data-test': 'merge-file-name' } }"
             />
           </label>
-          <label class="block space-y-1">
-            <span class="magaz-muted text-xs">Расширение (опционально)</span>
+          <div class="flex items-center gap-4 text-sm">
+            <span class="magaz-muted text-xs">Сливаем:</span>
+            <label class="flex items-center gap-1">
+              <RadioButton
+                v-model="merge.is_extension"
+                :value="false"
+                data-test="merge-type-cf"
+              />
+              <span>Основная (.cf)</span>
+            </label>
+            <label class="flex items-center gap-1">
+              <RadioButton
+                v-model="merge.is_extension"
+                :value="true"
+                data-test="merge-type-cfe"
+              />
+              <span>Расширение (.cfe)</span>
+            </label>
+          </div>
+          <label v-if="merge.is_extension" class="block space-y-1">
+            <span class="magaz-muted text-xs">Имя расширения</span>
             <InputText
               v-model="merge.extension_name"
               class="w-full"
@@ -231,7 +258,8 @@ async function run(
                 {
                   file_name: merge.file_name.trim(),
                   full_merge: merge.full_merge,
-                  ...(merge.extension_name.trim()
+                  is_extension: merge.is_extension,
+                  ...(merge.is_extension && merge.extension_name.trim()
                     ? { extension_name: merge.extension_name.trim() }
                     : {}),
                   ...(merge.full_merge && merge.settings_file_name.trim()
@@ -249,8 +277,27 @@ async function run(
       <div class="rounded-lg border border-slate-200 p-4" data-test="update-form">
         <h4 class="text-sm font-semibold">Обновление конфигурации БД</h4>
         <div class="mt-2 space-y-2">
-          <label class="block space-y-1">
-            <span class="magaz-muted text-xs">Расширение (опционально)</span>
+          <div class="flex items-center gap-4 text-sm">
+            <span class="magaz-muted text-xs">Обновляем:</span>
+            <label class="flex items-center gap-1">
+              <RadioButton
+                v-model="update.is_extension"
+                :value="false"
+                data-test="update-type-cf"
+              />
+              <span>Основная конфигурация</span>
+            </label>
+            <label class="flex items-center gap-1">
+              <RadioButton
+                v-model="update.is_extension"
+                :value="true"
+                data-test="update-type-cfe"
+              />
+              <span>Расширение (.cfe)</span>
+            </label>
+          </div>
+          <label v-if="update.is_extension" class="block space-y-1">
+            <span class="magaz-muted text-xs">Имя расширения</span>
             <InputText
               v-model="update.extension_name"
               class="w-full"
@@ -278,7 +325,8 @@ async function run(
                 'run_update_db',
                 {
                   is_fast_update: update.is_fast_update,
-                  ...(update.extension_name.trim()
+                  is_extension: update.is_extension,
+                  ...(update.is_extension && update.extension_name.trim()
                     ? { extension_name: update.extension_name.trim() }
                     : {}),
                 },

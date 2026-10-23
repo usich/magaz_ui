@@ -20,7 +20,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from server.api import admins as admins_api
+from server.api import backups as backups_api
 from server.api import devices as devices_api
+from server.api import local_bases as local_bases_api
 from server.api import notifications as notifications_api
 from server.api import operations as operations_api
 from server.api import stores as stores_api
@@ -143,6 +145,10 @@ router.include_router(notifications_api.router)
 #: Администраторы (Э6, Д-8): список, создание, смена пароля, блокировка,
 #: удаление (§5.2.2, §11.6)
 router.include_router(admins_api.router)
+#: Локальные базы 1С (Д-20): CRUD, учётные данные 1С (П-1), группировка по `group`
+router.include_router(local_bases_api.router)
+#: Бэкапы 1С (Д-21): сводка для главной и список статусов
+router.include_router(backups_api.router)
 
 
 # --- Вход/выход (§4.2, §8.1) ------------------------------------------------

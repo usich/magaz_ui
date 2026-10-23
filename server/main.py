@@ -26,6 +26,7 @@ from server.api import agent_report, spa
 from server.config import API_PREFIX, Settings, get_settings
 from server.core.context import AppContext, build_app_context
 from server.core.dispatcher import CommandDispatcher
+from server.core.backup_monitor import BackupMonitor
 from server.core.health_monitor import HealthMonitor
 from server.core.logging_setup import configure_logging
 from server.db.migrations import run_migrations
@@ -67,6 +68,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     monitor: HealthMonitor | None = None
     dispatcher: CommandDispatcher | None = None
+    backup_monitor: BackupMonitor | None = None
     try:
         # Автоприменение миграций: идемпотентный `alembic upgrade head`. Защищает
         # от `no such column`, когда к рабочей БД ещё не подошла миграция, но
@@ -98,6 +100,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             dispatcher.start()
         app.state.dispatcher = dispatcher
+
+        # Д-21: Backup Monitor — опрос бэкапов 1С по SMB/файловой системе
+        if settings.backup_monitor_enabled:
+            backup_monitor = BackupMonitor(
+                context.db,
+                settings,
+                secret_box=context.secret_box,
+            )
+            backup_monitor.start()
+        app.state.backup_monitor = backup_monitor
         yield
     except SQLAlchemyError:  # pragma: no cover - нужен реальный сбой БД
         logger.exception("Ошибка БД при старте сервера")
@@ -107,6 +119,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await dispatcher.stop()
         if monitor is not None:
             await monitor.stop()
+        if backup_monitor is not None:
+            await backup_monitor.stop()
         context.dispose()
         logger.info("Сервер остановлен")
 

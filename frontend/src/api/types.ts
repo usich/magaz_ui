@@ -117,8 +117,103 @@ export interface StoreItem {
   is_active: boolean
   comment: string | null
   extension_name: string | null
+  // Д-21: проверка бэкапа (текущий статус + настройки)
+  backup_check_enabled: boolean
+  backup_path: string | null
+  backup_host: string | null
+  backup_use_auth: boolean
+  backup_user: string | null
+  backup_password_set: boolean
+  backup_check_yesterday: boolean
+  backup_status: string
+  backup_error: string | null
+  backup_checked_at: string | null
+  backup_checked_date: string | null
+  backup_tries: number
   created_at: string | null
   updated_at: string | null
+}
+
+/**
+ * Локальная база 1С (Д-20): база на машине дашборда, без агента и IP.
+ * Пароль 1С наружу не уходит — только признак `password_set`. Поле `group` —
+ * группировка в админке: базы с одинаковым значением собираются в одну секцию.
+ */
+export interface LocalBaseItem {
+  id: number
+  name: string
+  version_1c: string
+  cluster_name: string
+  database_name: string
+  user_name_1c: string
+  password_set: boolean
+  credentials_version: number
+  base_path: string | null
+  extension_name: string | null
+  group: string
+  is_active: boolean
+  comment: string | null
+  // Д-21: проверка бэкапа (текущий статус + настройки)
+  backup_check_enabled: boolean
+  backup_path: string | null
+  backup_host: string | null
+  backup_use_auth: boolean
+  backup_user: string | null
+  backup_password_set: boolean
+  backup_check_yesterday: boolean
+  backup_status: string
+  backup_error: string | null
+  backup_checked_at: string | null
+  backup_checked_date: string | null
+  backup_tries: number
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** Тело `POST /admin/local-bases` (Д-20): реквизиты + опциональный пароль 1С. */
+export interface LocalBaseCreatePayload {
+  name: string
+  version_1c: string
+  cluster_name: string
+  database_name: string
+  user_name_1c: string
+  base_path?: string | null
+  extension_name?: string | null
+  group?: string
+  password?: string | null
+  comment?: string | null
+  // Д-21: настройки проверки бэкапа
+  backup_check_enabled?: boolean
+  backup_path?: string | null
+  backup_host?: string | null
+  backup_use_auth?: boolean
+  backup_user?: string | null
+  backup_password?: string | null
+  backup_clear_password?: boolean
+  backup_check_yesterday?: boolean
+}
+
+/** Тело `PUT /admin/local-bases/{id}`: передаются только изменяемые поля. */
+export interface LocalBaseUpdatePayload {
+  name?: string
+  version_1c?: string
+  cluster_name?: string
+  database_name?: string
+  user_name_1c?: string
+  base_path?: string | null
+  extension_name?: string | null
+  group?: string
+  comment?: string | null
+  is_active?: boolean
+  // Д-21: настройки проверки бэкапа
+  backup_check_enabled?: boolean
+  backup_path?: string | null
+  backup_host?: string | null
+  backup_use_auth?: boolean
+  backup_user?: string | null
+  backup_password?: string | null
+  backup_clear_password?: boolean
+  backup_check_yesterday?: boolean
 }
 
 /** Блок «что вписать в конфиг агента» (§11.2). */
@@ -149,6 +244,15 @@ export interface StoreCreatePayload {
   password?: string | null
   comment?: string | null
   extension_name?: string | null
+  // Д-21: настройки проверки бэкапа (в create необязательны)
+  backup_check_enabled?: boolean
+  backup_path?: string | null
+  backup_host?: string | null
+  backup_use_auth?: boolean
+  backup_user?: string | null
+  backup_password?: string | null
+  backup_clear_password?: boolean
+  backup_check_yesterday?: boolean
 }
 
 /** Тело `PUT /stores/{id}`: передаются только изменяемые поля. */
@@ -656,5 +760,34 @@ export interface FileSnapshotDeleted {
   filename: string | null
   removed: number
   message: string
+}
+
+
+/** Сводка по одной категории бэкапов (Д-21): магазины или локальные базы. */
+export interface BackupCategory {
+  total: number
+  checked: number
+  ok: number
+  missing: number
+}
+
+/** Сводка для блока «Бэкапы» на главной (Д-21). */
+export interface BackupStatus {
+  stores: BackupCategory
+  local_bases: BackupCategory
+  /** Когда Backup Monitor снова сможет опросить автоматически, ISO. */
+  next_check_iso: string | null
+}
+
+/** Строка объединённого списка бэкапов (магазин или локальная база). */
+export interface BackupListItem {
+  kind: 'store' | 'local_base'
+  id: number
+  name: string
+  backup_status: string // ok | missing | ''
+  backup_error: string | null
+  backup_checked_at: string | null
+  backup_checked_date: string | null
+  backup_check_yesterday: boolean
 }
 

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from client.agent import messenger, one_c
 from client.agent.one_c import OneCPaths
 from client.agent.processes import DEFAULT_PROVIDER
+from shared.paths import is_extension_operation
 from shared.schemas import BusyState
 from shared.timeutil import to_iso_z, utcnow
 
@@ -113,12 +114,13 @@ async def run_update_db_process(
     paths: OneCPaths,
     provider: ProcessProvider | None = None,
 ) -> None:
-    """Фоновое обновление конфигурации БД (перенос v2, FR-6).
+    """Фоновое обновление конфигурации БД (Д-18, FR-6).
 
-    1. если `is_fast_update = false`: завершение работы пользователей и `taskkill 1cv8.exe`;
+    1. если `is_fast_update = false`: завершение работы пользователей командой 1С
+       `/C ЗавершитьРаботуПользователей` — 1С сама закрывает сеансы (без taskkill);
     2. `/UpdateDBCfg` (устанавливает код разрешения);
-    3. если `is_fast_update = false`: снятие блокировки базы, чтобы пользователи
-       могли продолжить работу.
+    3. если `is_fast_update = false`: снятие блокировки базы и разрешение работы
+       пользователей командой `/C РазрешитьРаботуПользователей`.
     """
     if not params.is_fast_update:
         await one_c.clear_log_file(paths.log_shutdown_users)
@@ -128,13 +130,25 @@ async def run_update_db_process(
             timeout=one_c.USERS_SHUTDOWN_TIMEOUT,
             provider=provider,
         )
-        await messenger.kill_1c_processes(provider=provider)
 
-    await one_c.run_1c_command(
+    code = await one_c.run_1c_command(
         one_c.build_update_db_command(params, log_path, paths),
         paths.log_executor,
         provider=provider,
     )
+    # FR-5: при `/UpdateDBCfg` 1С может завершиться успешно, но не записать текст
+    # в `/Out` — файл остаётся пустым (или с одним BOM-заголовком), и
+    # `/check-update-db` вечно возвращает `202` (наблюдение из эксплуатации:
+    # обновление прошло, а лог пуст). Статус решает факт завершения процесса +
+    # пустой лог, а **не код возврата** (I-4): платформа `CONFIG /UpdateDBCfg`
+    # при успехе может вернуть ненулевой код. Поэтому если процесс вышел
+    # (`code is not None`, не таймаут) и лог эффективно пуст (включая только BOM) —
+    # фиксируем успех сами, чтобы сервер закрыл задачу, а не держал её «в работе»
+    # и не счёл «запуск не состоялся».
+    if code is not None and log_path.exists():
+        text = log_path.read_text(encoding="utf-8", errors="ignore")
+        if one_c.log_text_is_effectively_empty(text):
+            log_path.write_text(one_c.SUCCESS_UPDATE_MSG, encoding="utf-8")
 
     if not params.is_fast_update:
         await one_c.clear_log_file(paths.log_unlock_users)
@@ -273,8 +287,13 @@ class OperationRunner:
 
         Лог обнуляется до возврата `202` (I-3), поэтому «залипший успех»
         предыдущего запуска не может быть принят за результат новой операции.
+        Лог-файл выбирается по типу слияния (`.cf`/`.cfe` из имени файла, Д-16),
+        а не просто по наличию `extension_name`.
         """
-        log_path = self.paths.merge_log(params.extension_name)
+        extension = is_extension_operation(
+            params.is_extension, params.file_name, params.extension_name
+        )
+        log_path = self.paths.merge_log(params.extension_name if extension else None)
         await one_c.clear_log_file(log_path)
         return await self._enqueue(
             operation=OPERATION_MERGE,
@@ -285,8 +304,13 @@ class OperationRunner:
         )
 
     async def submit_update_db(self, params: UpdateParams) -> OperationState:
-        """Принять `POST /run-update-db`: обнулить лог и поставить задачу в очередь."""
-        log_path = self.paths.update_log(params.extension_name)
+        """Принять `POST /run-update-db`: обнулить лог и поставить задачу в очередь.
+
+        Лог-файл выбирается по типу обновления (основная/расширение, Д-17), а не
+        просто по наличию `extension_name`.
+        """
+        extension = is_extension_operation(params.is_extension, "", params.extension_name)
+        log_path = self.paths.update_log(params.extension_name if extension else None)
         await one_c.clear_log_file(log_path)
         return await self._enqueue(
             operation=OPERATION_UPDATE_DB,

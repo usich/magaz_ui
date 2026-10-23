@@ -42,6 +42,35 @@ UPDATE_BODY = {
 HEADERS = {"X-Agent-Token": AGENT_TOKEN}
 
 
+class NonZeroExitProvider(RecordingProvider):
+    """1С `CONFIG /UpdateDBCfg` завершилась **ненулевым кодом** и не записала
+    текст ни в `/Out`, ни в stdout — лог остаётся пустым (реальное поведение
+    платформы при успешном обновлении, I-4: код возврата статус не решает)."""
+
+    async def run_captured(
+        self, args: list[str], *, log_path: Path | None = None, timeout: float | None = None
+    ) -> int | None:
+        self.commands.append(list(args))
+        return 5
+
+
+class BomOnlyExitProvider(RecordingProvider):
+    """1С `CONFIG /UpdateDBCfg` завершилась и оставила в `/Out`-логе **только BOM**
+    (U+FEFF) — реальное поведение платформы: файл создан с BOM-заголовком, но без
+    текста. `str.strip()` BOM не удаляет, поэтому «пустота» должна учитывать его.
+    """
+
+    async def run_captured(
+        self, args: list[str], *, log_path: Path | None = None, timeout: float | None = None
+    ) -> int | None:
+        self.commands.append(list(args))
+        out_path = self._log_path_from(args)
+        if out_path is not None:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("\ufeff", encoding="utf-8")
+        return 5
+
+
 async def wait_until(predicate: Callable[[], bool], *, timeout_sec: float = 2.0) -> None:
     """Дождаться условия: фоновая задача стартует не мгновенно (FR-9)."""
     loop = asyncio.get_running_loop()
@@ -280,7 +309,7 @@ class TestUpdateDbEndpoints:
     async def test_run_update_db_clears_log_and_does_full_cycle(
         self, one_c_config, work_dir: Path
     ) -> None:  # noqa: ANN001
-        """`is_fast_update=false`: сеансы → `taskkill` → `/UpdateDBCfg` → разрешение (FR-6)."""
+        """`is_fast_update=false`: завершение сеансов (1С, без taskkill) → `/UpdateDBCfg` → разрешение (Д-18)."""
         log_path = work_dir / "log-update-db.txt"
         log_path.write_text(SUCCESS_UPDATE_MSG, encoding="utf-8")
         provider = RecordingProvider(blocked=True, success_message=SUCCESS_UPDATE_MSG)
@@ -295,11 +324,116 @@ class TestUpdateDbEndpoints:
             provider.release()
             await app.state.agent_runner.wait_idle()
 
-        assert "/CЗавершитьРаботуПользователей" in provider.commands[0]
+        assert '/CЗавершитьРаботуПользователей,Сообщение="Обновляем конфигурацию"' in provider.commands[0]
         assert any("/UpdateDBCfg" in command for command in provider.commands)
         assert "/CРазрешитьРаботуПользователей" in provider.commands[-1]
-        assert ["taskkill", "/f", "/im", "1cv8.exe"] in provider.quiet_commands
+        assert not any("taskkill" in command for command in provider.quiet_commands), (
+            "Д-18: сеансы закрывает 1С, без принудительного taskkill"
+        )
         assert log_path.read_text(encoding="utf-8") == SUCCESS_UPDATE_MSG
+
+    async def test_run_update_db_empty_log_is_marked_success(
+        self, one_c_config, work_dir: Path
+    ) -> None:  # noqa: ANN001
+        """FR-5: `/UpdateDBCfg` завершился кодом 0, но 1С не записала текст в `/Out`.
+
+        Если оставить лог пустым, `/check-update-db` вечно отвечает `202`, и задача
+        «висит» в работе, хотя обновление прошло. Исполнитель должен сам зафиксировать
+        успех в логе, когда процесс вышел с кодом 0.
+        """
+        log_path = work_dir / "log-update-db.txt"
+        provider = RecordingProvider()  # без success_message: 1С «не пишет» в /Out
+
+        async with agent_api(one_c_config, provider) as (http, app):
+            response = await http.post(
+                "/run-update-db",
+                json={**UPDATE_BODY, "is_fast_update": True},
+                headers=HEADERS,
+            )
+
+            assert response.status_code == 202
+            assert log_path.read_text(encoding="utf-8") == ""
+
+            await app.state.agent_runner.wait_idle()
+
+        assert any("/UpdateDBCfg" in command for command in provider.commands)
+        assert log_path.read_text(encoding="utf-8") == SUCCESS_UPDATE_MSG
+
+    async def test_run_update_db_nonzero_exit_empty_log_is_marked_success(
+        self, one_c_config, work_dir: Path
+    ) -> None:  # noqa: ANN001
+        """FR-5: `/UpdateDBCfg -Extension` вернул ненулевой код, а `/Out`-лог пуст.
+
+        Платформа `CONFIG /UpdateDBCfg` при успешном обновлении может завершиться
+        не кодом `0` (I-4: статус решает лог, а не код возврата). Если процесс вышел
+        и лог пуст — исполнитель всё равно фиксирует успех, иначе сервер счёл бы
+        «запуск не состоялся» и закрыл задачу `failed`.
+        """
+        log_path = work_dir / "log-update-db-extension.txt"
+        provider = NonZeroExitProvider()  # код 5 и пустой лог
+
+        async with agent_api(one_c_config, provider) as (http, app):
+            response = await http.post(
+                "/run-update-db",
+                json={
+                    **UPDATE_BODY,
+                    "is_fast_update": True,
+                    "extension_name": "БГ_Торговоя",
+                },
+                headers=HEADERS,
+            )
+            assert response.status_code == 202
+            assert log_path.read_text(encoding="utf-8") == ""
+
+            await app.state.agent_runner.wait_idle()
+
+            check = await http.get(
+                "/check-update-db",
+                params={"extension": "true"},
+                headers=HEADERS,
+            )
+
+        assert any("/UpdateDBCfg" in command for command in provider.commands)
+        assert log_path.read_text(encoding="utf-8") == SUCCESS_UPDATE_MSG
+        assert check.status_code == 200, "пустой лог после успешного процесса — успех, не «202»"
+        assert check.json()["status"] == "success"
+
+    async def test_run_update_db_bom_only_log_is_marked_success(
+        self, one_c_config, work_dir: Path
+    ) -> None:  # noqa: ANN001
+        """FR-5: лог содержит только BOM (U+FEFF) — фолбэк всё равно дописывает успех.
+
+        1С при `/UpdateDBCfg -Extension` создаёт файл с BOM-заголовком, но без текста.
+        `str.strip()` BOM не удаляет, поэтому без явного учёта BOM фолбэк считал бы
+        лог непустым и не дописал бы строку успеха — задача падала бы как
+        «запуск не состоялся» (лог «Process in progress... <BOM>»).
+        """
+        log_path = work_dir / "log-update-db-extension.txt"
+        provider = BomOnlyExitProvider()  # ненулевой код и лог из одного BOM
+
+        async with agent_api(one_c_config, provider) as (http, app):
+            response = await http.post(
+                "/run-update-db",
+                json={
+                    **UPDATE_BODY,
+                    "is_fast_update": True,
+                    "extension_name": "БГ_Торговоя",
+                },
+                headers=HEADERS,
+            )
+            assert response.status_code == 202
+
+            await app.state.agent_runner.wait_idle()
+
+            check = await http.get(
+                "/check-update-db",
+                params={"extension": "true"},
+                headers=HEADERS,
+            )
+
+        assert log_path.read_text(encoding="utf-8") == SUCCESS_UPDATE_MSG
+        assert check.status_code == 200, "BOM-лог после успешного процесса — успех, не «202»"
+        assert check.json()["status"] == "success"
 
     async def test_check_update_db_states(self, one_c_config, work_dir: Path) -> None:  # noqa: ANN001
         log_path = work_dir / "log-update-db.txt"

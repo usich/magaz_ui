@@ -22,7 +22,9 @@ interface NavItem {
 const navItems: NavItem[] = [
   { label: 'Главная', route: 'dashboard', icon: 'pi pi-home' },
   { label: 'Магазины', route: 'stores', icon: 'pi pi-building' },
+  { label: 'Локальные базы', route: 'local-bases', icon: 'pi pi-database', stage: 'Д-20' },
   { label: 'Файлы', route: 'files', icon: 'pi pi-file', stage: 'Э4' },
+  { label: 'Обновление 1С', route: 'updates', icon: 'pi pi-refresh', stage: 'Д-19' },
   { label: 'Оборудование', route: 'devices', icon: 'pi pi-wifi', stage: 'Э4Б' },
   { label: 'Уведомления', route: 'notifications', icon: 'pi pi-bell', stage: 'Э5' },
   { label: 'Задачи', route: 'jobs', icon: 'pi pi-list', stage: 'Э4' },

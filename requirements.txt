@@ -10,4 +10,6 @@ pydantic-settings==2.15.0
 itsdangerous==2.2.0
 cryptography==50.0.2
 httpx==0.28.1
+# Д-21: проверка наличия бэкапов 1С по SMB (как в исходном скрипте) с сервера
+pysmb==1.2.15
 

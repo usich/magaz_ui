@@ -83,6 +83,23 @@ function askDeleteOne(id: number): void {
   pendingDelete.value = id
 }
 
+/** Прервать незавершённую задачу (Д-22): подтверждение и вызов. */
+const pendingCancel = ref<number | null>(null)
+function askCancel(id: number): void {
+  pendingCancel.value = id
+}
+async function confirmCancel(): Promise<void> {
+  if (typeof pendingCancel.value === 'number') {
+    await jobs.cancelOne(pendingCancel.value)
+  }
+  pendingCancel.value = null
+}
+
+/** Задача в работе (`queued`/`sent`/`running`) — её можно прервать. */
+function isActiveStatus(status: string): boolean {
+  return status === 'queued' || status === 'sent' || status === 'running'
+}
+
 /** Открыть подтверждение удаления выбранных задач. */
 function askDeleteSelected(): void {
   pendingDelete.value = 'selected'
@@ -259,6 +276,17 @@ async function confirmDelete(): Promise<void> {
                   <Button label="Лог" icon="pi pi-list" size="small" text />
                 </RouterLink>
                 <Button
+                  v-if="isActiveStatus(job.status)"
+                  label="Прервать"
+                  icon="pi pi-ban"
+                  size="small"
+                  text
+                  severity="warn"
+                  :disabled="jobs.isDeleting"
+                  :data-test="`job-cancel-${job.id}`"
+                  @click="askCancel(job.id)"
+                />
+                <Button
                   label="Удалить"
                   icon="pi pi-trash"
                   size="small"
@@ -298,6 +326,18 @@ async function confirmDelete(): Promise<void> {
       data-test="jobs-confirm-delete"
       @update:visible="pendingDelete = null"
       @confirm="confirmDelete"
+    />
+
+    <ConfirmDeleteDialog
+      :visible="pendingCancel !== null"
+      header="Прервать задачу?"
+      message="Задача будет переведена в статус «отменена» и снята с контроля диспетчера. Она останется в истории."
+      :details="['Диспетчер больше не будет её опрашивать и ретраить.', 'Если команда уже ушла на кассу — агент может продолжить выполнение; это «снять с контроля сервера».']"
+      :loading="jobs.isDeleting"
+      accept-label="Прервать"
+      data-test="jobs-confirm-cancel"
+      @update:visible="pendingCancel = null"
+      @confirm="confirmCancel"
     />
   </div>
 </template>

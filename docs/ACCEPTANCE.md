@@ -90,11 +90,11 @@ python -m client.tray --ack <id>                             # «Ознаком�
 |---|---|---|---|
 | 2.1 | Карточка магазина: «Скачать файл» (тестовая ИБ, ссылка на Я.Диск) | Файл в `C:\MagazAgent`, имя — basename ссылки; задача в истории «успех» | |
 | 2.2 | «Проверить файлы» | `cf/cfe/xml` с размером и датой; разделители в имени файла → `422` | |
-| 2.3 | Слияние основной конфигурации | В логе команда с `-force` и `-Settings <file>.xml` / `full_merge.xml` | |
-| 2.4 | Слияние расширения | `/MergeCfg <файл>.cfe -Extension <name> -force -Settings <файл>.xml`; settings по умолчанию `full_merge.xml`, при частичном слиянии — заданное имя; имя расширения подставляется из карточки магазина | |
-| 2.5 | Обновление БД | `/UpdateDBCfg /UCКодРазрешения` | |
-| 2.6 | Полный цикл при `is_fast_update=false` | Завершение сеансов → `taskkill 1cv8.exe` → обновление → разрешение пользователей | |
-| 2.7 | `/check-merge`, `/check-update-db` | `202` в работе, `200` успех, `400` ошибка, лог в ответе | |
+| 2.3 | Слияние основной конфигурации | В логе команда с `-force` и `-Settings <file>.xml` / `full_merge.xml`; переключатель «основная» (`is_extension=false`) или `.cf` в имени файла даёт основную конфигурацию, даже при заданном в карточке расширении (Д-16, Д-17) | |
+| 2.4 | Слияние расширения | `/MergeCfg <файл>.cfe -Extension <name> -force -Settings <файл>.xml`; settings по умолчанию `full_merge.xml`, при частичном слиянии — заданное имя; переключатель «расширение» (`is_extension=true`) или `.cfe` в имени файла → расширение, имя подставляется из карточки; `.cf`/«основная» — это основная конфигурация (Д-16, Д-17) | |
+| 2.5 | Обновление БД | `/UpdateDBCfg /UCКодРазрешения`; для расширения — `/UpdateDBCfg -Extension <name> /UC…`; переключатель «основная/расширение» (`is_extension`) решает, добавлять ли `-Extension`, главнее карточки магазина (Д-17); если 1С не записала текст в `/Out` (включая лог из одного BOM U+FEFF), но процесс вышел (не таймаут, код возврата не важен) — лог дополняется строкой успеха (задача не «висит» в `202` и не падает как «запуск не состоялся») | |
+| 2.6 | Полный цикл при `is_fast_update=false` | Завершение сеансов командой `/CЗавершитьРаботуПользователей,Сообщение="Обновляем конфигурацию"` (без `taskkill`, ждём до 3 минут) → `/UpdateDBCfg` → разрешение `/CРазрешитьРаботуПользователей /UCКодРазрешения`; после успеха автоматически приходит уведомление «Можно входить в программу 1С» (Д-18) | |
+| 2.7 | `/check-merge`, `/check-update-db` | `202` в работе, `200` успех, `400` ошибка, лог в ответе; для расширения (имя из карточки магазина) опрос идёт с `?extension=true` — читается `<...>-extension.txt` | |
 | 2.8 | `/run-*` | `202` и сервис не блокируется (дашборд отвечает во время операции) | |
 | 2.9 | Пароль 1С | Не встречается ни в логах (сервер, агент, `log-1cv8-console.txt`), ни в ответах API, ни в HTML, ни в аудите (П-1) | |
 | 2.10 | «Залипший успех» | Лог обнуляется до старта: успех прошлого запуска не показывается как текущий | |
@@ -103,6 +103,7 @@ python -m client.tray --ack <id>                             # «Ознаком�
 | 2.13 | Перезагрузка кассы посреди операции | Операция помечена «прервана» и видна в UI | |
 | 2.14 | Офлайн-касса | Команда в очереди и выполняется при появлении в сети | |
 | 2.15 | Отключение сервера | Агент продолжает работать, `ack` и результаты досылаются после восстановления | |
+| 2.16 | Защита от дубля при разрыве (Д-15) | Разрыв соединения на ответе `/run-merge`/`/run-update-db` («в сеть» кассе) → сервер допрашивает `/check-*`, а не переотправляет; операция выполняется один раз, без дубля | |
 
 ## 3. ФН2: файл по ссылке
 
@@ -166,6 +167,9 @@ python -m client.tray --ack <id>                             # «Ознаком�
 | 5.11 | Диагностика | `magaz-agent.exe --console` работает и пишет в терминал | |
 | 5.12 | Защита агентского API | Неверный токен → `401`; запрос с чужого IP → `403` | живой прогон 14.10.2026: `401` и `403` получены (см. 1.1) |
 | 5.13 | Бэкап и логи | Бэкап `magaz.db` и ротация логов выполняются по `docs/RUNBOOK.md` | |
+| 5.14 | Обновлятор (Д-19/Д-20) | Страница `/updates`: статусы магазинов (онлайн, файлы, merge/update), массовые операции (OperationPanel + компактные кнопки по выбору), журнал операций; вкладка «Локальные базы» (Д-20) — CRUD, группировка по `group`. Отдельная страница `/local-bases` в меню для управления локальными базами | |
+| 5.15 | Бэкапы (Д-21) | Настройка в карточке магазина/базы (путь, сегодня/вчера, логин/пароль SMB), фоновая проверка с 10:00 раз в день + до 5 попыток (интервал 10 мин), кнопка «Проверить не найденные», блок «Бэкапы» на главной «есть N из M» + раздельные списки (магазины / локальные базы) | |
+| 5.16 | Контроль задач и бэкапов (Д-22) | Кнопка «Прервать» для незавершённых задач (`canceled`, в истории); блок «Бэкапы» показывает «следующую автопроверку» и тревогу о пропавших бэкапах (без рассылки) | |
 
 ## 6. Что уже закрыто автотестами
 
@@ -179,16 +183,23 @@ python -m client.tray --ack <id>                             # «Ознаком�
 |---|---|
 | `422` при разделителях в имени файла | `tests/server/test_store_api.py`, `tests/shared/test_paths.py` |
 | `/check-merge`, `/check-update-db`: `202`/`200`/`400` и лог в ответе | `tests/server/test_operations_api.py`, `tests/client/test_agent_one_c_api.py` |
+| FR-4: предупреждение и `?extension=` учитывают имя из карточки магазина; Д-16: явный `.cf`/`.cfe` в имени файла определяет тип слияния | `tests/server/test_operations_api.py::test_merge_extension_from_store_card_*`, `tests/server/test_dispatcher.py::test_update_db_from_store_card_polls_with_extension_flag`, `tests/server/test_operations_api.py::test_merge_cf_file_ignores_store_extension_warning`, `tests/server/test_dispatcher.py::test_merge_cf_file_polls_without_extension_flag`, `tests/client/test_one_c.py::test_cf_file_wins_over_extension_from_card` |
+| FR-5: пустой `/Out`-лог при успешном `/UpdateDBCfg` дополняется строкой успеха (включая ненулевой код возврата и лог из одного BOM, I-4) | `tests/client/test_agent_one_c_api.py::test_run_update_db_empty_log_is_marked_success`, `tests/client/test_agent_one_c_api.py::test_run_update_db_nonzero_exit_empty_log_is_marked_success`, `tests/client/test_agent_one_c_api.py::test_run_update_db_bom_only_log_is_marked_success`, `tests/client/test_one_c.py::test_bom_only_log_means_in_progress` |
 | `/run-*` отвечает `202` и не блокирует сервис | `tests/server/test_operations_api.py`, `tests/client/test_agent_operations.py` |
 | «Залипший успех» невозможен | `tests/server/test_one_c.py`, `tests/client/test_agent_operations.py` |
 | Параллельный merge + update → `409` | `tests/server/test_dispatcher.py`, `frontend/tests/operation-conflict.spec.ts` |
 | R12: одна ИБ в одном запуске → `409` | `tests/server/test_dispatcher.py`, `tests/server/test_command_service.py` |
+| Д-15: разрыв при отправке `/run-*` → допрос `/check-*`, а не дубль операции | `tests/server/test_dispatcher.py::TestNoDuplicateOnBrokenChannel` |
 | `ack` и результаты досылаются после недоступности сервера | `tests/client/test_agent_notifications.py`, `tests/client/test_agent_devices.py` |
 | Учётные данные 1С: доставка, версия профиля, отсутствие пароля в ответах | `tests/server/test_agent_api.py`, `tests/client/test_agent_credentials.py` |
 | Читалка: тост с кнопками, читалка по «Просмотреть», «Ознакомлен» → меню категорий, повтор `critical` (спека 1.21) | `tests/client/test_tray_agent.py`, `tests/client/test_agent_notifications.py` |
 | Отчёт «X из Y» и CSV по уведомлениям | `tests/server/test_notifications_api.py`, `frontend/tests/notifications-view.spec.ts` |
 | Д-8: администраторы (создание, пароль, блокировка, удаление, запреты) | `tests/server/test_admins_api.py`, `tests/server/test_admin_api.py`, `frontend/tests/admins-store.spec.ts`, `frontend/tests/settings-admins.spec.ts` |
 | SPA отдаётся сервером, маршруты живы после F5 | `tests/server/test_spa.py`, `frontend/tests/router-guard.spec.ts` |
+| Д-19: обновлятор — вкладки, статусы магазинов (файлы, merge/update), журнал | `frontend/tests/updates-view.spec.ts` |
+| Д-20: локальные базы — CRUD, пароль наружу не уходит, группировка по `group`, отдельная страница `/local-bases` | `tests/server/test_local_bases_api.py`, `frontend/tests/updates-view.spec.ts`, `frontend/tests/local-bases-view.spec.ts` |
+| Д-21: бэкапы — дата/путь/SMB, монитор «раз в день + 5 попыток», сводка и список | `tests/server/test_backup_service.py`, `tests/server/test_backup_monitor.py`, `tests/server/test_backup_api.py`, `frontend/tests/dashboard-view.spec.ts` |
+| Д-22: прерывание задач, «следующая автопроверка» и тревога бэкапов | `tests/server/test_backup_api.py` (cancel), `frontend/tests/dashboard-view.spec.ts` |
 | Разметка уведомления: санитайз, метки `magaz-image:` без файла, лимиты картинок | `tests/shared/test_richtext.py`, `tests/server/test_notification_images.py`, `frontend/tests/notification-editor.spec.ts` |
 | Кэш картинок на кассе, справочник прочитанного, `delete_after_read` до кассы | `tests/client/test_agent_notifications.py` |
 | Видимость картинки в редакторе, вставка из буфера, размер картинки (кнопки и стиль) | `frontend/tests/notification-editor.spec.ts`, `tests/shared/test_richtext.py` |

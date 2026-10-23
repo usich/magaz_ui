@@ -2,6 +2,7 @@
 
 Соответствие разделам спецификации:
 * `Store`               → §4.1 `stores` (+ `devices_version` из §7.6, Д-1);
+* `LocalBase`           → Д-20 `local_bases` (локальные базы 1С на машине дашборда);
 * `AdminUser`           → §4.2 `admin_users`;
 * `Command`             → §4.3 `commands`;
 * `JobLog`              → §4.4 `job_logs`;
@@ -46,6 +47,7 @@ __all__ = [
     "Command",
     "FileCheck",
     "JobLog",
+    "LocalBase",
     "Notification",
     "NotificationCategory",
     "NotificationReceipt",
@@ -72,7 +74,53 @@ class TimestampMixin:
     )
 
 
-class Store(TimestampMixin, Base):
+class BackupCheckMixin:
+    """Проверка наличия бэкапа 1С (Д-21) — общие поля для магазина и локальной базы.
+
+    История не хранится: только текущий статус `backup_status` и счётчик попыток
+    за день. Пароль SMB (`backup_password_enc`) шифруется Fernet (§8.3), наружу
+    уходит только признак `backup_password_set`.
+    """
+
+    # Настройки проверки (переключатели в карточке объекта)
+    backup_check_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
+    # Путь к бэкапу: локальный `C:\...` или сетевой `\\server\share\...`
+    backup_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Имя машины SMB (client_machine_name, как в исходном скрипте — «ilya»)
+    backup_host: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # `True` — отдельная авторизация (логин/пароль), `False` — «Гость»
+    backup_use_auth: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
+    backup_user: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    backup_password_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Актуальность: `False` — за сегодня, `True` — за вчера
+    backup_check_yesterday: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
+
+    # Текущий статус (не история): ok | missing | '' (не проверено)
+    backup_status: Mapped[str] = mapped_column(
+        String(16), default="", server_default="", nullable=False
+    )
+    backup_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    backup_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Какой день охватывает текущий статус (дата целевой проверки, `YYYY-MM-DD`)
+    backup_checked_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Сколько попыток уже сделано за этот день (для «5 попыток с интервалом 3 мин»)
+    backup_tries: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+
+    @property
+    def backup_password_set(self) -> bool:
+        """Признак «пароль SMB задан» — наружу только его, не значение (§8.3)."""
+        return bool(self.backup_password_enc)
+
+
+class Store(BackupCheckMixin, TimestampMixin, Base):
     """Магазин = одна касса = один агент (§4.1, Q15)."""
 
     __tablename__ = "stores"
@@ -154,6 +202,52 @@ class Store(TimestampMixin, Base):
 
     def __repr__(self) -> str:  # pragma: no cover - отладка
         return f"<Store id={self.id} name={self.name!r} ip={self.ip_address!r}>"
+
+
+class LocalBase(BackupCheckMixin, TimestampMixin, Base):
+    """Локальная база 1С на машине дашборда (§Д-19, Д-20).
+
+    Отличается от магазина тем, что это не касса с агентом, а база на этой же
+    машине: обновление идёт напрямую, без отправки задач агенту. Пароль 1С
+    хранится шифрованным (`password_enc`, §8.3) и наружу уходит только признак
+    `password_set`. Поле `group` — группировка в админке: базы с одинаковым
+    значением собираются в одну секцию («Бухгалтерия», «Торговля» и т.п.).
+    """
+
+    __tablename__ = "local_bases"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+
+    # Подключение к базе 1С (аналоги §4.1, но локально, без агента и IP)
+    version_1c: Mapped[str] = mapped_column(String(64), nullable=False)
+    cluster_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    database_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    extension_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    # П-1: логин и пароль 1С хранятся на сервере; пароль — только шифрованным (§8.3)
+    user_name_1c: Mapped[str] = mapped_column(String(200), nullable=False)
+    password_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credentials_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
+
+    # Д-20: поле группировки — одинаковые значения собирают базы в одну секцию
+    group: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    @property
+    def password_set(self) -> bool:
+        """Признак «пароль задан» — наружу отдаём только его, не значение (§8.3)."""
+        return bool(self.password_enc)
+
+    def __repr__(self) -> str:  # pragma: no cover - отладка
+        return f"<LocalBase id={self.id} name={self.name!r} group={self.group!r}>"
 
 
 class AdminUser(TimestampMixin, Base):

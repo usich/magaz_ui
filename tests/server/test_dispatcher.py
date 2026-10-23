@@ -16,6 +16,7 @@ from datetime import timedelta
 from collections.abc import Iterator
 from uuid import uuid4
 
+import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -24,15 +25,22 @@ from server.config import Settings
 from server.core.client_http import AgentProtocolError
 from server.core.dispatcher import CommandDispatcher, build_1c_payload
 from server.core.security import SecretBox
-from server.db.models import Command, FileCheck, JobLog, Store
+from server.db.models import Command, FileCheck, JobLog, Notification, Store
 from server.db.session import DatabaseManager
-from server.services import command_service, device_service, settings_service
+from server.services import (
+    command_service,
+    device_service,
+    notification_service,
+    settings_service,
+)
 from shared.enums import CommandKind, CommandStatus
 from shared.timeutil import utcnow
 from tests.server.agent_mock import (
     ScriptedAgent,
+    health_body,
     status_transport,
     timeout_transport,
+    transport_from_handler,
 )
 
 #: Пароль 1С в тестах — им же проверяется, что он нигде не «утекает» (I-7)
@@ -373,6 +381,64 @@ class TestReferenceScenario:
         assert body["is_fast_update"] is False
         assert fresh(session, command.id).status == CommandStatus.SUCCESS
 
+    async def test_update_db_from_store_card_polls_with_extension_flag(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        """FR-4: `/check-update-db` обязан опрашивать расширение с `extension=true`.
+
+        Когда имя расширения живёт в карточке магазина, а в `params` операции его
+        нет, сервер всё равно отправляет агента на расширение (как в
+        `build_1c_payload`). Если бы `/check-update-db` вызывался без
+        `extension=true`, агент читал бы `log-update-db.txt`, а команда пишет в
+        `log-update-db-extension.txt` — сервер не нашёл бы результат (задача
+        «не может прочитать файл лога»).
+        """
+        seed_settings(session)
+        store = make_store(session, online=True, extension_name="БГ_Торговоя")
+        command = add_command(
+            session, store, CommandKind.RUN_UPDATE_DB, {"is_fast_update": False}
+        )
+        agent = ScriptedAgent()
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+
+        await dispatcher.process_once()
+        await dispatcher.process_once()
+
+        check_calls = [
+            item["query"] for item in agent.requests if item["path"] == "/check-update-db"
+        ]
+        assert check_calls, "агент должен опрашивать /check-update-db"
+        assert all(item.get("extension") == "true" for item in check_calls)
+        assert fresh(session, command.id).status == CommandStatus.SUCCESS
+
+    async def test_merge_cf_file_polls_without_extension_flag(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        """Д-16: `.cf`-имя файла → опрос `/check-merge` без `?extension=true`.
+
+        Даже когда в карточке магазина прописано расширение, явный `.cf` в имени
+        файла означает слияние основной конфигурации: флаг опроса обязан быть
+        `false`, иначе агент читал бы `log-merge-extension.txt`, а команда пишет
+        в `log-merge.txt`.
+        """
+        seed_settings(session)
+        store = make_store(session, online=True, extension_name="БГ_Торговоя")
+        command = add_command(
+            session, store, CommandKind.RUN_MERGE, {"file_name": "1cv8.cf"}
+        )
+        agent = ScriptedAgent()
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+
+        await dispatcher.process_once()
+        await dispatcher.process_once()
+
+        check_calls = [
+            item["query"] for item in agent.requests if item["path"] == "/check-merge"
+        ]
+        assert check_calls, "агент должен опрашивать /check-merge"
+        assert all(item.get("extension") == "false" for item in check_calls)
+        assert fresh(session, command.id).status == CommandStatus.SUCCESS
+
     async def test_full_reference_chain_download_check_merge_update(
         self,
         manager: DatabaseManager,
@@ -432,9 +498,17 @@ class TestReferenceScenario:
         # I-7: пароль не встречается ни в одном теле запроса к кассе
         assert STORE_PASSWORD not in json.dumps(agent.json_bodies(), ensure_ascii=False)
         assert "/credentials" not in agent.paths(), "версии совпали — push не нужен"
-        assert {
-            stored.status for stored in command_service.list_commands(session)
-        } == {CommandStatus.SUCCESS}
+        # Д-18: после полного обновления создаётся notify-задача «Можно входить»
+        # — она в очереди, а не завершена в этом же цикле.
+        statuses = {
+            stored.status
+            for stored in command_service.list_commands(session)
+            if stored.kind != str(CommandKind.NOTIFY)
+        }
+        assert statuses == {CommandStatus.SUCCESS}
+        notify_jobs = command_service.list_commands(session, kind="notify")
+        assert len(notify_jobs) == 1, "после полного обновления создано уведомление"
+        assert notify_jobs[0].status == str(CommandStatus.QUEUED)
 
     async def test_send_message_reports_killed_process(
         self, manager: DatabaseManager, settings: Settings, session: Session
@@ -519,6 +593,170 @@ class TestUnfinishedOperation:
         state = fresh(session, command.id)
         assert state.status == CommandStatus.TIMEOUT
         assert "предел ожидания" in (state.last_error or "")
+
+
+class TestNoDuplicateOnBrokenChannel:
+    """Вариант B (Д-15): разрыв при отправке `/run-*` не должен давать дубль.
+
+    Когда ответ агента на `/run-merge`/`/run-update-db` не дошёл (касса «в сети»),
+    сервер не знает, принял ли агент команду. Переотправка на свободную кассу
+    привела бы к двойному выполнению операции. Вместо этого задача переводится
+    в `SENT` и допрашивается через `/check-*`: если агент выполнил — успех;
+    если агент не знает об операции — возврат в `queued` для честной повторной
+    отправки.
+    """
+
+    def _broken_send_transport(
+        self, *, agent_executed: bool, requests: list[dict[str, object]]
+    ) -> httpx.MockTransport:
+        """Транспорт: `/run-*` рвётся, `/check-*` знает результат операции."""
+        busy = {"merge": False, "update": False}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            requests.append({"method": request.method, "path": path})
+            if path == "/health":
+                return httpx.Response(200, json=health_body(busy=busy))
+            if path == "/run-merge":
+                raise httpx.ConnectError(
+                    "соединение разорвано: удалённый хост не ответил", request=request
+                )
+            if path == "/check-merge":
+                if agent_executed:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "status": "success",
+                            "message": "Merge completed successfully.",
+                            "logs": "Объединение конфигураций успешно завершено",
+                        },
+                    )
+                return httpx.Response(
+                    202,
+                    json={
+                        "status": "not_found",
+                        "message": "Operation is in progress.",
+                        "logs": "",
+                    },
+                )
+            return httpx.Response(404, json={"detail": f"Неизвестный путь {path}"})
+
+        return transport_from_handler(handler)
+
+    async def test_agent_executed_but_response_lost_gets_polled_not_resent(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        """Агент выполнил merge, но ответ `/run-merge` не дошёл — допрос, не дубль."""
+        seed_settings(session)
+        store = make_store(session, online=True)
+        command = add_command(session, store, CommandKind.RUN_MERGE, {"file_name": "update"})
+        requests: list[dict[str, object]] = []
+        dispatcher = build_dispatcher(
+            manager,
+            settings,
+            transport=self._broken_send_transport(agent_executed=True, requests=requests),
+        )
+
+        first = await dispatcher.process_once()  # разрыв на отправке
+        state = fresh(session, command.id)
+        assert state.status == CommandStatus.SENT, (
+            "задача переходит в SENT и допрашивается, а не возвращается в queued"
+        )
+        assert state.attempts == 0, "неудачная отправка не «тратит» попытку"
+        assert first.retried == 0, "это не retry, а досыл опроса"
+        assert first.waiting == 1
+        assert [r["path"] for r in requests].count("/run-merge") == 1
+
+        await dispatcher.process_once()  # /check-merge → 200: агент уже выполнил
+
+        state = fresh(session, command.id)
+        assert state.status == CommandStatus.SUCCESS, "опрос подтверждает успех"
+        assert "/check-merge" in [r["path"] for r in requests]
+        assert (
+            [r["path"] for r in requests].count("/run-merge") == 1
+        ), "операция не отправляется повторно — дубля merge нет"
+
+    async def test_agent_never_received_goes_back_to_queue_and_resent(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        """Разрыв до доставки: `/check-*` не знает операцию → возврат в очередь."""
+        seed_settings(session)
+        store = make_store(session, online=True)
+        command = add_command(session, store, CommandKind.RUN_MERGE, {"file_name": "update"})
+        requests: list[dict[str, object]] = []
+        dispatcher = build_dispatcher(
+            manager,
+            settings,
+            transport=self._broken_send_transport(agent_executed=False, requests=requests),
+        )
+
+        await dispatcher.process_once()  # разрыв на отправке → SENT (провизорный)
+        assert fresh(session, command.id).status == CommandStatus.SENT
+
+        await dispatcher.process_once()  # /check-merge → 202 not_found, касса свободна
+        assert fresh(session, command.id).status == CommandStatus.QUEUED, (
+            "агент не знает операцию — задача возвращается в очередь"
+        )
+
+        await dispatcher.process_once()  # повторная отправка снова рвётся
+        state = fresh(session, command.id)
+        assert state.status == CommandStatus.SENT
+        # Честная повторная отправка выполняется заново, а не «висит» в опросе
+        assert state.attempts == 0
+        assert [r["path"] for r in requests].count("/run-merge") == 2
+
+
+class TestNotifyAfterFullUpdate:
+    """Д-18: после успешного **полного** обновления БД кассирам ставится уведомление
+    «Можно входить в программу 1С» (важно, без подтверждения, удаляется после
+    прочтения, без категории)."""
+
+    async def test_full_update_creates_can_login_notification(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        seed_settings(session)
+        store = make_store(session, online=True)
+        command = add_command(
+            session, store, CommandKind.RUN_UPDATE_DB, {"is_fast_update": False}
+        )
+        agent = ScriptedAgent()
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+
+        await dispatcher.process_once()  # отправка
+        await dispatcher.process_once()  # /check-update-db → 200 success
+
+        assert fresh(session, command.id).status == CommandStatus.SUCCESS
+
+        notifications = list(session.scalars(select(Notification)))
+        assert len(notifications) == 1, "после полного обновления создано уведомление"
+        assert notifications[0].title == "Можно входить в программу 1С"
+        assert notifications[0].severity == "important"
+        assert notifications[0].requires_ack is False
+        assert notifications[0].delete_after_read is True
+
+        notify_jobs = list(
+            session.scalars(select(Command).where(Command.kind == str(CommandKind.NOTIFY)))
+        )
+        assert len(notify_jobs) == 1, "поставлена notify-задача на кассу"
+        assert notify_jobs[0].params == {"notification_id": notifications[0].id}
+
+    async def test_fast_update_does_not_notify(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        seed_settings(session)
+        store = make_store(session, online=True)
+        command = add_command(
+            session, store, CommandKind.RUN_UPDATE_DB, {"is_fast_update": True}
+        )
+        agent = ScriptedAgent()
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+
+        await dispatcher.process_once()
+        await dispatcher.process_once()
+
+        assert fresh(session, command.id).status == CommandStatus.SUCCESS
+        notifications = list(session.scalars(select(Notification)))
+        assert notifications == [], "быстрое обновление — без уведомления «Можно входить»"
 
 
 class TestCredentialsPush:
@@ -853,6 +1091,7 @@ class TestPayloadHelpers:
             "user_name": "Администратор",
             "file_name": "update",
             "full_merge": True,
+            "is_extension": False,
         }
 
     def test_build_1c_payload_fills_extension_from_store(self, session: Session) -> None:
@@ -877,6 +1116,58 @@ class TestPayloadHelpers:
 
         payload = build_1c_payload(store, command)
         assert payload["extension_name"] == "ДругоеРасширение"
+
+    def test_build_1c_payload_update_db_is_extension_controls_extension(
+        self, session: Session
+    ) -> None:
+        """Д-17: явный `is_extension` для update-db главнее карточки магазина."""
+        store = make_store(session, online=False, extension_name="БГ_Торговоя")
+
+        main = add_command(
+            session,
+            store,
+            CommandKind.RUN_UPDATE_DB,
+            {"is_fast_update": False, "is_extension": False},
+        )
+        payload = build_1c_payload(store, main)
+        assert "extension_name" not in payload, "основная конфигурация — без расширения"
+
+        ext = add_command(
+            session,
+            store,
+            CommandKind.RUN_UPDATE_DB,
+            {"is_fast_update": False, "is_extension": True},
+        )
+        payload = build_1c_payload(store, ext)
+        assert payload["extension_name"] == "БГ_Торговоя"
+
+    def test_build_1c_payload_cf_file_ignores_store_extension(
+        self, session: Session
+    ) -> None:
+        """Д-16: явный `.cf` в имени файла → основная конфигурация, без расширения.
+
+        Иначе `.cf`-слияние на магазине с настроенным расширением было бы
+        невозможно: карточка подменяла бы `.cf` на `.cfe`.
+        """
+        store = make_store(session, online=False, extension_name="БГ_Торговоя")
+        command = add_command(
+            session, store, CommandKind.RUN_MERGE, {"file_name": "1cv8.cf"}
+        )
+
+        payload = build_1c_payload(store, command)
+        assert "extension_name" not in payload
+
+    def test_build_1c_payload_cfe_file_keeps_store_extension(
+        self, session: Session
+    ) -> None:
+        """Д-16: явный `.cfe` в имени файла → расширение; имя — из карточки."""
+        store = make_store(session, online=False, extension_name="БГ_Торговоя")
+        command = add_command(
+            session, store, CommandKind.RUN_MERGE, {"file_name": "1cv8.cfe"}
+        )
+
+        payload = build_1c_payload(store, command)
+        assert payload["extension_name"] == "БГ_Торговоя"
 
     @pytest.mark.parametrize(
         ("url", "name", "kind"),

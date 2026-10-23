@@ -35,7 +35,7 @@ from server.core.client_http import (
 from server.core.context import AppContext
 from server.core.dependencies import get_client_ip, get_context, get_db, require_active_admin
 from server.db.models import AdminUser, Store
-from server.services import audit_service, settings_service, store_service
+from server.services import audit_service, backup_service, settings_service, store_service
 from shared.schemas import AgentSession, BusyState
 from shared.timeutil import to_iso_z, utcnow
 
@@ -83,6 +83,19 @@ class StoreOut(BaseModel):
     is_active: bool
     comment: str | None = None
     extension_name: str | None = None
+    # Д-21: проверка бэкапа
+    backup_check_enabled: bool = False
+    backup_path: str | None = None
+    backup_host: str | None = None
+    backup_use_auth: bool = False
+    backup_user: str | None = None
+    backup_password_set: bool = False
+    backup_check_yesterday: bool = False
+    backup_status: str = ""
+    backup_error: str | None = None
+    backup_checked_at: str | None = None
+    backup_checked_date: str | None = None
+    backup_tries: int = 0
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -114,6 +127,18 @@ class StoreOut(BaseModel):
             is_active=store.is_active,
             comment=store.comment,
             extension_name=store.extension_name,
+            backup_check_enabled=store.backup_check_enabled,
+            backup_path=store.backup_path,
+            backup_host=store.backup_host,
+            backup_use_auth=store.backup_use_auth,
+            backup_user=store.backup_user,
+            backup_password_set=store.backup_password_set,
+            backup_check_yesterday=store.backup_check_yesterday,
+            backup_status=store.backup_status or "",
+            backup_error=store.backup_error,
+            backup_checked_at=to_iso_z(store.backup_checked_at),
+            backup_checked_date=store.backup_checked_date,
+            backup_tries=store.backup_tries,
             created_at=to_iso_z(store.created_at),
             updated_at=to_iso_z(store.updated_at),
         )
@@ -165,6 +190,15 @@ class StoreUpdateRequest(BaseModel):
     comment: str | None = None
     extension_name: str | None = None
     is_active: bool | None = None
+    # Д-21: настройки проверки бэкапа (передаются только изменяемые поля)
+    backup_check_enabled: bool | None = None
+    backup_path: str | None = None
+    backup_host: str | None = None
+    backup_use_auth: bool | None = None
+    backup_user: str | None = None
+    backup_password: str | None = None
+    backup_clear_password: bool = False
+    backup_check_yesterday: bool | None = None
 
 
 class CredentialsRequest(BaseModel):
@@ -378,18 +412,47 @@ def update_store_endpoint(
     payload: StoreUpdateRequest,
     request: Request,
     admin: Annotated[AdminUser, Depends(require_active_admin)],
+    context: Annotated[AppContext, Depends(get_context)],
     session: Annotated[Session, Depends(get_db)],
 ) -> StoreOut:
     """Изменить реквизиты магазина; смена логина 1С поднимает `credentials_version`."""
     store = _get_or_404(session, store_id)
+
+    backup_keys = {
+        "backup_check_enabled",
+        "backup_path",
+        "backup_host",
+        "backup_use_auth",
+        "backup_user",
+        "backup_password",
+        "backup_clear_password",
+        "backup_check_yesterday",
+    }
     changed = payload.model_dump(exclude_unset=True, exclude_none=True)
+    ordinary = {k: v for k, v in changed.items() if k not in backup_keys}
 
     try:
-        store_service.update_store(session, store, **changed)
+        store_service.update_store(session, store, **ordinary)
     except store_service.StoreValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
+
+    # Д-21: настройки проверки бэкапа — отдельным хелпером (пароль шифруется)
+    if any(k in changed for k in backup_keys):
+        backup_service.apply_backup_settings(
+            store,
+            enabled=changed.get("backup_check_enabled"),
+            path=changed.get("backup_path"),
+            host=changed.get("backup_host"),
+            use_auth=changed.get("backup_use_auth"),
+            user=changed.get("backup_user"),
+            password=changed.get("backup_password"),
+            clear_password=payload.backup_clear_password,
+            check_yesterday=changed.get("backup_check_yesterday"),
+            secret_box=context.secret_box,
+        )
+        session.flush()
 
     audit_service.record(
         session,

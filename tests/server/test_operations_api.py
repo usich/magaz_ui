@@ -51,6 +51,7 @@ def add_store(
     cluster: str,
     database: str = "trade",
     active: bool = True,
+    extension_name: str | None = None,
 ) -> Store:
     """Второй магазин для массовых операций (§11.4).
 
@@ -67,6 +68,7 @@ def add_store(
         user_name_1c="Администратор",
         agent_token=f"token-{ip.replace('.', '-')}",
         is_active=active,
+        extension_name=extension_name,
     )
     session.add(store)
     session.commit()
@@ -161,6 +163,60 @@ class TestSingleAction:
         assert response.status_code == 202
         assert response.json()["warning"] is None, "для расширения нужен .cfe, а он есть"
 
+    def test_merge_extension_from_store_card_is_checked_against_cfe(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """FR-4: имя расширения из карточки магазина (без `extension_name` в params).
+
+        При массовой операции админ не повторяет имя в форме — оно берётся из
+        карточки магазина. Предупреждение обязано проверять `.cfe`, а не `.cf`.
+        """
+        store.extension_name = "БГ_Торговоя"
+        session.add(
+            FileCheck(
+                store_id=store.id,
+                filename="update",
+                cf_exists=False,
+                cfe_exists=True,
+                xml_exists=True,
+                checked_at=utcnow(),
+            )
+        )
+        session.commit()
+
+        response = auth_client.post(
+            actions_url(store.id),
+            json={"action": "run_merge", "params": {"file_name": "update"}},
+        )
+
+        assert response.status_code == 202
+        assert response.json()["warning"] is None, "имя из карточки: нужен .cfe, а он есть"
+
+    def test_merge_extension_from_store_card_warns_about_cfe(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """FR-4: когда `.cfe` нет, предупреждение говорит про `.cfe` (имя из карточки)."""
+        store.extension_name = "БГ_Торговоя"
+        session.add(
+            FileCheck(
+                store_id=store.id,
+                filename="update",
+                cf_exists=True,
+                cfe_exists=False,
+                xml_exists=False,
+                checked_at=utcnow(),
+            )
+        )
+        session.commit()
+
+        response = auth_client.post(
+            actions_url(store.id),
+            json={"action": "run_merge", "params": {"file_name": "update"}},
+        )
+
+        assert response.status_code == 202
+        assert "update.cfe" in (response.json()["warning"] or "")
+
     def test_merge_extension_without_cfe_warns(
         self, auth_client: TestClient, session: Session, store: Store
     ) -> None:
@@ -187,6 +243,35 @@ class TestSingleAction:
         assert response.status_code == 202
         assert "update.cfe" in (response.json()["warning"] or "")
 
+    def test_merge_cf_file_ignores_store_extension_warning(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """Д-16: явный `.cf` в имени файла → предупреждение про `.cf`, не `.cfe`.
+
+        Даже когда в карточке магазина прописано расширение, имя `1cv8.cf`
+        означает слияние основной конфигурации: проверяется наличие `.cf`.
+        """
+        store.extension_name = "БГ_Торговоя"
+        session.add(
+            FileCheck(
+                store_id=store.id,
+                filename="1cv8",
+                cf_exists=False,
+                cfe_exists=True,
+                xml_exists=False,
+                checked_at=utcnow(),
+            )
+        )
+        session.commit()
+
+        response = auth_client.post(
+            actions_url(store.id),
+            json={"action": "run_merge", "params": {"file_name": "1cv8.cf"}},
+        )
+
+        assert response.status_code == 202
+        assert "1cv8.cf" in (response.json()["warning"] or "")
+
     def test_merge_action_is_quiet_when_file_exists(
         self, auth_client: TestClient, session: Session, store: Store
     ) -> None:
@@ -209,6 +294,25 @@ class TestSingleAction:
         assert response.status_code == 202
         assert response.json()["warning"] is None
 
+    def test_merge_action_keeps_is_extension(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """Д-17: явный `is_extension` для слияния сохраняется в `commands.params`."""
+        response = auth_client.post(
+            actions_url(store.id),
+            json={
+                "action": "run_merge",
+                "params": {"file_name": "update", "is_extension": False},
+            },
+        )
+
+        assert response.status_code == 202
+        assert jobs(session)[0].params == {
+            "file_name": "update",
+            "full_merge": False,
+            "is_extension": False,
+        }
+
     def test_update_db_action_keeps_flag(
         self, auth_client: TestClient, session: Session, store: Store
     ) -> None:
@@ -220,6 +324,21 @@ class TestSingleAction:
         assert response.status_code == 202
         assert jobs(session)[0].kind == CommandKind.RUN_UPDATE_DB
         assert jobs(session)[0].params == {"is_fast_update": True}
+
+    def test_update_db_action_keeps_is_extension(
+        self, auth_client: TestClient, session: Session, store: Store
+    ) -> None:
+        """Д-17: явный `is_extension` из формы сохраняется в `commands.params`."""
+        response = auth_client.post(
+            actions_url(store.id),
+            json={
+                "action": "run_update_db",
+                "params": {"is_fast_update": True, "is_extension": False},
+            },
+        )
+
+        assert response.status_code == 202
+        assert jobs(session)[0].params == {"is_fast_update": True, "is_extension": False}
 
     def test_password_from_request_is_dropped(
         self, auth_client: TestClient, session: Session, store: Store

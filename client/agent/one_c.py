@@ -27,7 +27,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from client.agent.processes import DEFAULT_PROVIDER
-from shared.paths import UPDATE_FILE_SUFFIXES, validate_file_name
+from shared.paths import (
+    UPDATE_FILE_SUFFIXES,
+    is_extension_merge,
+    is_extension_operation,
+    split_merge_file_name,
+    validate_file_name,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - только для аннотаций
     from client.agent.processes import ProcessProvider
@@ -67,6 +73,7 @@ __all__ = [
     "clear_log_file",
     "delete_update_files",
     "format_command",
+    "log_text_is_effectively_empty",
     "mask_command",
     "run_1c_command",
 ]
@@ -89,9 +96,12 @@ UPDATE_PERMISSION_CODE = "КодРазрешения"
 # --- Сеансовые параметры ключа /C --------------------------------------------
 CMD_SHUTDOWN_USERS = "ЗавершитьРаботуПользователей"
 CMD_ENABLE_USERS = "РазрешитьРаботуПользователей"
+#: Д-18: текст предупреждения кассиру при завершении сеансов (1С: «Сообщение=»)
+SHUTDOWN_USERS_MESSAGE = "Обновляем конфигурацию"
 
 # --- Таймауты (секунды), перенос v2 -----------------------------------------
-USERS_SHUTDOWN_TIMEOUT = 15
+#: Д-18: завершение сеансов ждём до 3 минут — 1С сама закрывает сеансы, без taskkill
+USERS_SHUTDOWN_TIMEOUT = 180
 USERS_UNLOCK_TIMEOUT = 60
 
 # --- Имена файлов в рабочей папке (§7.1: имена — как в v2, менять нельзя) ----
@@ -245,16 +255,21 @@ def build_merge_command(params: MergeParams, log_path: Path, paths: OneCPaths) -
     """Слияние основной конфигурации (FR-3) или расширения (FR-4).
 
     Оба случая идут через `/MergeCfg <файл> [-Extension <имя>] -force -Settings <файл>.xml`.
-    Для основной конфигурации settings-файл: `full_merge.xml` при `full_merge=true`,
-    иначе `<file_name>.xml`. Для расширения — всегда `full_merge.xml` по умолчанию,
+    Тип — по фактическому файлу (`is_extension_merge`): явное расширение `.cf`/`.cfe`
+    в имени файла главнее `extension_name` из карточки (Д-16). Для основной
+    конфигурации settings-файл: `full_merge.xml` при `full_merge=true`, иначе
+    `<file_name>.xml`. Для расширения — всегда `full_merge.xml` по умолчанию,
     а при частичном слиянии (`settings_file_name` задан) — `<settings_file_name>.xml`.
     Порядок `-Extension <имя>` сразу после файла и `-force -Settings` подтверждён
     рабочим вызовом на 8.3.27 (успешное слияние).
     """
     args = [str(paths.executable(params.version_1c)), "CONFIG", *_connection_args(params)]
 
-    if params.extension_name:
-        source_file = paths.update_file(params.file_name, ".cfe")
+    stem, _ = split_merge_file_name(params.file_name)
+    if is_extension_operation(
+        params.is_extension, params.file_name, params.extension_name
+    ):
+        source_file = paths.update_file(stem, ".cfe")
         if params.settings_file_name:
             setting_file = paths.update_file(params.settings_file_name, ".xml")
         else:
@@ -273,8 +288,8 @@ def build_merge_command(params: MergeParams, log_path: Path, paths: OneCPaths) -
             str(setting_file),
         ]
     else:
-        source_file = paths.update_file(params.file_name, ".cf")
-        setting_file = paths.merge_settings(params.file_name, full_merge=params.full_merge)
+        source_file = paths.update_file(stem, ".cf")
+        setting_file = paths.merge_settings(stem, full_merge=params.full_merge)
         args += ["/MergeCfg", str(source_file), "-force", "-Settings", str(setting_file)]
 
     args += [f"/UC{MERGE_PERMISSION_CODE}", "/Out", str(log_path)]
@@ -282,26 +297,38 @@ def build_merge_command(params: MergeParams, log_path: Path, paths: OneCPaths) -
 
 
 def build_update_db_command(params: UpdateParams, log_path: Path, paths: OneCPaths) -> list[str]:
-    """Обновление конфигурации БД (FR-5): `/UpdateDBCfg /UCКодРазрешения` (перенос v2)."""
+    """Обновление конфигурации БД (FR-5): `/UpdateDBCfg /UCКодРазрешения` (перенос v2).
+
+    Для расширения флаг — **`-Extension <имя>`** (с минусом, как в `/MergeCfg`),
+    а не `/Extension`. Порядок должен повторять рабочий вызов 1С на 8.3.27:
+    `/UpdateDBCfg -Extension <имя> /UC… /Out <лог>` — `/UC` нельзя ставить раньше
+    `-Extension`, иначе обновление не выполняется (проверено в эксплуатации).
+    """
     args = [str(paths.executable(params.version_1c)), "CONFIG", *_connection_args(params)]
-    if params.extension_name:
-        args += ["/Extension", params.extension_name]
-    args += ["/UpdateDBCfg", f"/UC{UPDATE_PERMISSION_CODE}", "/Out", str(log_path)]
+    args += ["/UpdateDBCfg"]
+    if is_extension_operation(params.is_extension, "", params.extension_name):
+        args += ["-Extension", params.extension_name]
+    args += [f"/UC{UPDATE_PERMISSION_CODE}", "/Out", str(log_path)]
     return args
 
 
 def build_shutdown_users_command(
     params: Base1CParams, log_path: Path, paths: OneCPaths
 ) -> list[str]:
-    """Завершение работы пользователей перед обновлением БД (перенос v2, FR-6)."""
+    """Завершение работы пользователей перед обновлением БД (Д-18, FR-6).
+
+    Д-18: вместо принудительного `taskkill` 1С сама закрывает сеансы по команде
+    `/C ЗавершитьРаботуПользователей,Сообщение="Обновляем конфигурацию"`. Команда
+    проверена на 8.3.27: `ENTERPRISE /S… /N… /WA- /AU- /DisableStartupMessages
+    /C ЗавершитьРаботуПользователей,Сообщение=…` — без `-force` и без `/Out`.
+    """
     return [
         str(paths.executable(params.version_1c)),
         "ENTERPRISE",
         *_connection_args(params),
         "/WA-",
         "/AU-",
-        "-force",
-        f"/C{CMD_SHUTDOWN_USERS}",
+        f"/C{CMD_SHUTDOWN_USERS},Сообщение=\"{SHUTDOWN_USERS_MESSAGE}\"",
         "/Out",
         str(log_path),
     ]
@@ -310,12 +337,18 @@ def build_shutdown_users_command(
 def build_enable_users_command(
     params: Base1CParams, log_path: Path, paths: OneCPaths
 ) -> list[str]:
-    """Снятие блокировки базы и разрешение работы пользователей (перенос v2, FR-6)."""
+    """Снятие блокировки базы и разрешение работы пользователей (Д-18, FR-6).
+
+    Д-18: `ENTERPRISE /S… /N… /WA- /AU- /DisableStartupMessages
+    /C РазрешитьРаботуПользователей /UC КодРазрешения` — без `-force` и без
+    `/Out` (проверено на 8.3.27).
+    """
     return [
         str(paths.executable(params.version_1c)),
         "ENTERPRISE",
         *_connection_args(params),
-        "-force",
+        "/WA-",
+        "/AU-",
         f"/C{CMD_ENABLE_USERS}",
         f"/UC{UPDATE_PERMISSION_CODE}",
         "/Out",
@@ -335,6 +368,17 @@ def _truncate_log(log_path: Path) -> None:
 def _read_log_text(log_path: Path) -> str:
     """Прочитать лог 1С: битые символы кодировки не должны ломать статус."""
     return log_path.read_text(encoding="utf-8", errors="ignore")
+
+
+def log_text_is_effectively_empty(text: str) -> bool:
+    """Пуст ли лог-файл, даже если в нём есть BOM (U+FEFF) или пробелы.
+
+    1С при `/UpdateDBCfg` может создать лог с BOM-заголовком, но без текста —
+    по I-4 такой лог пуст (не успех и не ошибка), и фолбэк FR-5 должен его
+    дополнить строкой успеха. `str.strip()` BOM не удаляет, поэтому отдельно
+    вырезаем `\ufeff`.
+    """
+    return not text.replace("\ufeff", "").strip()
 
 
 async def clear_log_file(log_path: Path) -> None:
@@ -357,7 +401,7 @@ async def check_log_file(log_path: Path, success_message: str) -> tuple[str, str
 
     content = await asyncio.to_thread(_read_log_text, log_path)
 
-    if not content.strip():
+    if log_text_is_effectively_empty(content):
         return LOG_STATE_IN_PROGRESS, "Log file is empty or process is not started yet."
     if success_message in content:
         return LOG_STATE_SUCCESS, content

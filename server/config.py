@@ -110,6 +110,12 @@ class Settings(BaseSettings):
     dispatcher_enabled: bool = True
     #: Пауза перед первым циклом диспетчера, с
     dispatcher_startup_delay_sec: float = 0.0
+
+    #: --- Проверка бэкапов 1С (Д-21) ---
+    #: Фоновая задача опроса бэкапов по SMB/файловой системе (можно выключить в тестах)
+    backup_monitor_enabled: bool = True
+    #: Пауза перед первым циклом проверки бэкапов, с
+    backup_monitor_startup_delay_sec: float = 0.0
     #: Таймаут одного запроса сервера к агенту: операции живут минуты, но сам
     #: HTTP-вызов (`/run-*`, `/check-*`) должен отвечать быстро (§5.1.1)
     agent_request_timeout_sec: float = 15.0

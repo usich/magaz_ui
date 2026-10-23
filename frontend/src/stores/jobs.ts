@@ -114,6 +114,20 @@ export const useJobsStore = defineStore('jobs', () => {
     }
   }
 
+  /** Прервать незавершённую задачу (Д-22): `canceled`, затем перечитать список. */
+  async function cancelOne(id: number): Promise<void> {
+    isDeleting.value = true
+    try {
+      await jobsApi.cancel(id)
+      await load()
+    } catch (error) {
+      errorMessage.value =
+        error instanceof ApiError ? error.message : 'Не удалось прервать задачу'
+    } finally {
+      isDeleting.value = false
+    }
+  }
+
   /** Удалить выбранные задачи и перечитать список. */
   async function removeSelected(): Promise<void> {
     const ids = [...selectedIds.value]
@@ -206,6 +220,7 @@ export const useJobsStore = defineStore('jobs', () => {
     clearSelection,
     removeOne,
     removeSelected,
+    cancelOne,
     startPolling,
     stopPolling,
   }

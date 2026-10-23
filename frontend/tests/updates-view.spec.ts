@@ -1,0 +1,191 @@
+/** Тесты страницы «Обновление 1С» (§Д-19): вкладки, статусы merge/update, журнал. */
+
+import { createPinia, type Pinia } from 'pinia'
+import { createMemoryHistory, createRouter, type Router } from 'vue-router'
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import UpdatesView from '@/views/UpdatesView.vue'
+
+const toastAdd = vi.fn()
+vi.mock('primevue/usetoast', () => ({ useToast: () => ({ add: toastAdd }) }))
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+function makeStore(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 1, name: 'Магазин №5', ip_address: '10.10.5.10', agent_port: 8383,
+    cluster_name: 'srv-1c', database_name: 'trade', version_1c: '8.3.24.1548',
+    user_name_1c: 'Администратор', password_set: true, credentials_version: 1,
+    devices_version: 1, agent_version: '1.0.0', os_info: null,
+    last_seen_at: '2026-10-13T10:00:00Z', is_online: true, is_active: true,
+    comment: null, extension_name: null, created_at: null, updated_at: null, ...overrides,
+  }
+}
+
+function makeJob(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 7, store_id: 1, store_name: 'Магазин №5', kind: 'run_merge', status: 'success',
+    params: {}, attempts: 0, last_error: null, log_files: [],
+    created_by: 'admin', created_at: '2026-10-13T10:00:00Z',
+    started_at: '2026-10-13T10:00:01Z', finished_at: '2026-10-13T10:00:10Z',
+    last_message: null, excerpt_preview: null, ...overrides,
+  }
+}
+
+function makeMatrixRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    store_id: 1, store_name: 'Магазин №5', ip_address: '10.10.5.10', cluster_name: 'srv-1c',
+    is_active: true, is_online: true, filename: 'update', checked_at: '2026-10-13T10:05:00Z',
+    cf_exists: true, cfe_exists: false, xml_exists: true,
+    cf_size: 1024, cfe_size: null, xml_size: 512, ...overrides,
+  }
+}
+
+function makeLocalBase(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 2, name: 'Бухгалтерия', version_1c: '8.3.24.1548', cluster_name: 'srv-1c',
+    database_name: 'buh', user_name_1c: 'Администратор', password_set: true,
+    credentials_version: 1, base_path: 'C:\\1C\\buh', extension_name: 'БГ_Бухгалтерия',
+    group: 'Финансы', is_active: true, comment: null, created_at: null, updated_at: null, ...overrides,
+  }
+}
+
+function apiMock(
+  stores: unknown[],
+  rows: unknown[],
+  merge: unknown[],
+  upd: unknown[],
+  recent: unknown[],
+  localBases: unknown[] = [],
+) {
+  return async (url: string): Promise<Response> => {
+    if (url.includes('/admin/stores')) return jsonResponse(stores)
+    if (url.includes('/admin/local-bases')) return jsonResponse(localBases)
+    if (url.includes('/admin/files/matrix')) return jsonResponse({ rows, total: rows.length, present: 1, missing: 0 })
+    if (url.includes('/admin/jobs')) {
+      if (url.includes('kind=run_merge')) return jsonResponse({ items: merge, counts: {}, total: 0, active: 0 })
+      if (url.includes('kind=run_update_db')) return jsonResponse({ items: upd, counts: {}, total: 0, active: 0 })
+      return jsonResponse({ items: recent, counts: {}, total: 0, active: 0 })
+    }
+    return jsonResponse({ detail: 'не найдено' }, 404)
+  }
+}
+
+const stubs = {
+  Button: { props: ['label'], template: '<button>{{ label }}</button>' },
+  Tag: { props: ['value'], template: '<span class="tag">{{ value }}</span>' },
+  Checkbox: { props: ['modelValue'], template: '<input type="checkbox" />' },
+  RadioButton: { template: '<span />' },
+  InputText: { props: ['modelValue'], template: '<input />' },
+  Dialog: { props: ['visible'], template: '<div v-if="visible"><slot /></div>' },
+  OperationPanel: { template: '<div data-test="operation-panel" />' },
+}
+
+async function mountUpdates(fetchMock: ReturnType<typeof vi.fn>): Promise<VueWrapper> {
+  vi.stubGlobal('fetch', fetchMock)
+  const pinia: Pinia = createPinia()
+  const router: Router = createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      { path: '/updates', name: 'updates', component: UpdatesView },
+      { path: '/stores/:id(\\d+)', name: 'store-detail', component: { template: '<div />' } },
+    ],
+  })
+  await router.push('/updates')
+  await router.isReady()
+  const wrapper = mount(UpdatesView, { global: { plugins: [pinia, router], stubs } })
+  await flushPromises()
+  return wrapper
+}
+
+describe('страница «Обновление 1С»', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('вкладки, таблица магазинов со статусами merge/update и журнал (Д-19)', async () => {
+    fetchMock.mockImplementation(
+      apiMock(
+        [makeStore()],
+        [makeMatrixRow()],
+        [makeJob({ kind: 'run_merge', status: 'success' })],
+        [makeJob({ kind: 'run_update_db', status: 'running' })],
+        [
+          makeJob({ kind: 'run_merge', status: 'success' }),
+          makeJob({ kind: 'run_update_db', status: 'running' }),
+        ],
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+
+    expect(wrapper.find('[data-test="updates-tab-stores"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="updates-tab-local"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="operation-panel"]').exists()).toBe(true)
+
+    const row = wrapper.find('[data-test="updates-store-1"]')
+    expect(row.exists()).toBe(true)
+    expect(row.text()).toContain('Магазин №5')
+    expect(row.text()).toContain('✓') // файл из матрицы
+    expect(row.text()).toContain('успех') // merge
+    expect(row.text()).toContain('выполняется') // update
+    expect(wrapper.text()).toContain('Журнал операций')
+    wrapper.unmount()
+  })
+
+  it('вкладка «Локальные базы»: группировка по `group` и реквизиты базы (Д-20)', async () => {
+    fetchMock.mockImplementation(
+      apiMock([], [], [], [], [], [
+        makeLocalBase(),
+        makeLocalBase({ id: 3, name: 'Торговля', database_name: 'trade', group: 'Продажи' }),
+        makeLocalBase({ id: 4, name: 'Зарплата', database_name: 'zp', group: 'Финансы' }),
+      ]),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    // Две секции групп, базы внутри распределены
+    expect(wrapper.find('[data-test="lb-group-Финансы"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lb-group-Продажи"]').exists()).toBe(true)
+    expect(wrapper.findAll('[data-test^="lb-group-"]')).toHaveLength(2)
+
+    const finance = wrapper.find('[data-test="lb-group-Финансы"]')
+    expect(finance.findAll('[data-test^="lb-row-"]')).toHaveLength(2)
+    expect(finance.text()).toContain('Бухгалтерия')
+    expect(finance.text()).toContain('Зарплата')
+
+    // Реквизиты базы: кластер/БД, путь, расширение, признак пароля
+    const row = wrapper.find('[data-test="lb-row-2"]')
+    expect(row.text()).toContain('buh')
+    expect(row.text()).toContain('C:\\1C\\buh')
+    expect(row.text()).toContain('БГ_Бухгалтерия')
+    expect(row.text()).toContain('пароль задан')
+    wrapper.unmount()
+  })
+
+  it('вкладка «Локальные базы»: кнопка «Добавить базу» открывает форму', async () => {
+    fetchMock.mockImplementation(apiMock([], [], [], [], [], []))
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+
+    await wrapper.find('[data-test="updates-local-add"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-dialog"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lb-name"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lb-group"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+})

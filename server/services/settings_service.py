@@ -42,6 +42,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "device_check_interval_sec": "60",
     "device_online_window_sec": "180",
     "device_ping_timeout_ms": "1000",
+    # Д-21: проверка бэкапов 1С — интервал обхода, час начала запросов (10:00),
+    # лимит попыток в день и интервал между повторными попытками (10 мин)
+    "backup_interval_sec": "60",
+    "backup_start_hour": "10",
+    "backup_max_tries": "5",
+    "backup_retry_interval_sec": "600",
 }
 
 #: Ключи, значение которых обязано быть неотрицательным целым

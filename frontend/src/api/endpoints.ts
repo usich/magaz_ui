@@ -27,6 +27,11 @@ import type {
   JobFilters,
   JobsBulkDelete,
   JobsPage,
+  LocalBaseCreatePayload,
+  LocalBaseItem,
+  LocalBaseUpdatePayload,
+  BackupStatus,
+  BackupListItem,
   LoginPayload,
   NotificationCategory,
   NotificationCategoryPayload,
@@ -198,6 +203,10 @@ export const jobsApi = {
 
   /** Удалить выбранные задачи (`POST /jobs/bulk-delete`, §11.6, Э10). */
   removeBulk: (ids: number[]) => api.post<JobsBulkDelete>('/admin/jobs/bulk-delete', { ids }),
+
+  /** Прервать незавершённую задачу (`POST /jobs/{id}/cancel`, Д-22): статус `canceled`. */
+  cancel: (id: number) =>
+    api.post<{ job_id: number; status: string; message: string }>(`/admin/jobs/${id}/cancel`),
 }
 
 /** Матрица файлов обновления (§11.3, Q52). */
@@ -376,4 +385,48 @@ export const categoriesApi = {
       `/admin/notification-categories/${id}`,
     ),
 }
+
+/** Локальные базы 1С (`/admin/local-bases`, Д-20) — CRUD и учётные данные 1С. */
+export const localBasesApi = {
+  list: (params: { search?: string; group?: string; includeInactive?: boolean } = {}) => {
+    const query = new URLSearchParams()
+    if (params.search?.trim()) query.set('search', params.search.trim())
+    if (params.group) query.set('group', params.group)
+    if (params.includeInactive) query.set('include_inactive', 'true')
+    const suffix = query.toString() ? `?${query}` : ''
+    return api.get<LocalBaseItem[]>(`/admin/local-bases${suffix}`)
+  },
+
+  create: (payload: LocalBaseCreatePayload) =>
+    api.post<LocalBaseItem>('/admin/local-bases', payload),
+
+  update: (id: number, payload: LocalBaseUpdatePayload) =>
+    api.put<LocalBaseItem>(`/admin/local-bases/${id}`, payload),
+
+  /** Мягкое удаление: `is_active=false`, база уходит из списка (§5.2.2). */
+  remove: (id: number) => api.delete<LocalBaseItem>(`/admin/local-bases/${id}`),
+
+  /** Учётные данные 1С (П-1): логин и/или пароль, либо `clear_password`. */
+  setCredentials: (
+    id: number,
+    payload: { user_name_1c?: string; password?: string; clear_password?: boolean },
+  ) => api.put<LocalBaseItem>(`/admin/local-bases/${id}/credentials`, payload),
+}
+
+/** Бэкапы 1С (`/admin/backup/*`, Д-21): сводка, раздельные списки, ручная проверка. */
+export const backupApi = {
+  /** Сводка «есть N из M» отдельно по магазинам и локальным базам. */
+  status: () => api.get<BackupStatus>('/admin/backup/status'),
+
+  /** Отдельный список бэкапов по магазинам (для провала из блока). */
+  storeList: () => api.get<BackupListItem[]>('/admin/backup/stores'),
+
+  /** Отдельный список бэкапов по локальным базам. */
+  localBaseList: () => api.get<BackupListItem[]>('/admin/backup/local-bases'),
+
+  /** Ручная проверка: опросить только не найденные бэкапы (без лишних запросов). */
+  check: () => api.post<{ checked: number }>('/admin/backup/check'),
+}
+
+
 

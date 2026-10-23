@@ -87,6 +87,10 @@ class MergeParams(Base1CParams):
     file_name: str
     full_merge: bool = False
     extension_name: str | None = None
+    # Д-16/Д-17: явный тип слияния. `True` — расширение (`.cfe`), `False` — основная
+    # конфигурация (`.cf`); `None` — не задан, тип решают файл/карточка
+    # (`shared.paths.is_extension_operation`).
+    is_extension: bool | None = None
     # Частичное слияние расширения: имя xml-настроек без расширения; если не задано —
     # по умолчанию `full_merge.xml`.
     settings_file_name: str | None = None
@@ -109,6 +113,9 @@ class UpdateParams(Base1CParams):
 
     is_fast_update: bool = False
     extension_name: str | None = None
+    # Д-17: явный тип обновления. `True` — расширение, `False` — основная конфигурация;
+    # `None` — не задан (тогда — карточка магазина, как раньше).
+    is_extension: bool | None = None
 
 
 class MessageParams(BaseModel):

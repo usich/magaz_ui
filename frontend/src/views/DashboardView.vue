@@ -6,17 +6,23 @@
  * `counts.jobs_active` (задачи в очереди и в работе у диспетчера).
  * Автообновление — polling каждые ~10 с.
  */
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import Button from 'primevue/button'
+import Dialog from 'primevue/dialog'
 import Message from 'primevue/message'
 import Tag from 'primevue/tag'
 
 import StatusTile from '@/components/StatusTile.vue'
+import { useBackupStore } from '@/stores/backup'
 import { useStoresStore } from '@/stores/stores'
 import { useSystemStore } from '@/stores/system'
 
 const system = useSystemStore()
 const stores = useStoresStore()
+const backups = useBackupStore()
+/** Какой список бэкапов открыт в модалке: магазины или локальные базы (`null` — закрыта). */
+const backupListKind = ref<'stores' | 'local-bases' | null>(null)
+const isBackupListOpen = ref(false)
 
 const counts = computed(() => system.counts)
 const info = computed(() => system.info)
@@ -49,11 +55,53 @@ const storesHint = computed(() =>
   inactiveStores.value ? `активных · отключено ${inactiveStores.value}` : 'активных магазинов',
 )
 
-onMounted(() => stores.startPolling())
+onMounted(() => {
+  stores.startPolling()
+  void backups.load()
+})
 onUnmounted(() => stores.stopPolling())
 
 async function refresh(): Promise<void> {
-  await Promise.all([system.load(), stores.load()])
+  await Promise.all([system.load(), stores.load(), backups.load()])
+}
+
+function backupLabel(cat: { total: number; ok: number }): string {
+  return cat.total ? `есть ${cat.ok} из ${cat.total}` : 'не настроены'
+}
+
+function backupBadge(status: string): string {
+  if (status === 'ok') return 'есть'
+  if (status === 'missing') return 'нет'
+  return 'не проверено'
+}
+
+/** Следующая автоматическая проверка бэкапов (Д-21, показываем локальное время). */
+const nextCheckLabel = computed(() => {
+  const iso = backups.status.next_check_iso
+  if (!iso) return ''
+  const date = new Date(iso)
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString('ru-RU')
+})
+
+/** Тревога о пропавших бэкапах (Д-21, без рассылки на кассы): текст или ''. */
+const backupAlertText = computed(() => {
+  const storeMissing = backups.status.stores.missing
+  const baseMissing = backups.status.local_bases.missing
+  const parts: string[] = []
+  if (storeMissing > 0) parts.push(`магазинов — ${storeMissing}`)
+  if (baseMissing > 0) parts.push(`баз — ${baseMissing}`)
+  return parts.length ? `Нет бэкапа у: ${parts.join(', ')}` : ''
+})
+
+
+function openBackupList(kind: 'stores' | 'local-bases'): void {
+  backupListKind.value = kind
+  isBackupListOpen.value = true
+}
+
+/** Ручная проверка не найденных бэкапов (без лишних запросов по найденным). */
+async function runBackupCheck(): Promise<void> {
+  await backups.checkMissing()
 }
 
 function formatTime(value: string | null): string {
@@ -125,6 +173,87 @@ function formatTime(value: string | null): string {
       />
     </section>
 
+    <!-- Д-21: блок «Бэкапы» на главной -->
+    <section class="rounded-xl border border-slate-200 bg-white p-5" data-test="backup-dashboard">
+      <header class="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 class="font-semibold">Бэкапы 1С</h2>
+          <p class="magaz-muted text-xs">Проверка наличия бэкапов (Backup Monitor, Д-21)</p>
+        </div>
+        <Button
+          label="Проверить не найденные"
+          icon="pi pi-refresh"
+          size="small"
+          text
+          :loading="backups.isChecking"
+          :disabled="backups.isChecking"
+          data-test="backup-check-missing"
+          @click="runBackupCheck"
+        />
+      </header>
+
+      <!-- Д-21: тревога о пропавших бэкапах (без рассылки на кассы) -->
+      <div
+        v-if="backupAlertText"
+        class="mt-3 flex items-center gap-2 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700"
+        data-test="backup-alert"
+      >
+        <i class="pi pi-exclamation-triangle" />
+        <span>{{ backupAlertText }}</span>
+      </div>
+      <p v-if="nextCheckLabel" class="magaz-muted mt-3 text-xs" data-test="backup-next-check">
+        Следующая автопроверка: {{ nextCheckLabel }}
+      </p>
+
+
+      <div class="mt-4 grid gap-4 sm:grid-cols-2">
+        <button
+          type="button"
+          class="text-left"
+          data-test="backup-stores"
+          @click="openBackupList('stores')"
+        >
+          <div class="rounded-xl border border-slate-200 p-4 hover:border-blue-300">
+            <div class="flex items-center justify-between">
+              <span class="font-medium">Магазины</span>
+              <span
+                :class="backups.status.stores.missing > 0 ? 'text-rose-600' : 'text-emerald-600'"
+                class="text-sm font-semibold"
+              >
+                {{ backupLabel(backups.status.stores) }}
+              </span>
+            </div>
+            <p class="magaz-muted mt-1 text-xs">
+              проверено {{ backups.status.stores.checked }} · нет бэкапа у
+              {{ backups.status.stores.missing }}
+            </p>
+          </div>
+        </button>
+
+        <button
+          type="button"
+          class="text-left"
+          data-test="backup-local-bases"
+          @click="openBackupList('local-bases')"
+        >
+          <div class="rounded-xl border border-slate-200 p-4 hover:border-blue-300">
+            <div class="flex items-center justify-between">
+              <span class="font-medium">Локальные базы</span>
+              <span
+                :class="backups.status.local_bases.missing > 0 ? 'text-rose-600' : 'text-emerald-600'"
+                class="text-sm font-semibold"
+              >
+                {{ backupLabel(backups.status.local_bases) }}
+              </span>
+            </div>
+            <p class="magaz-muted mt-1 text-xs">
+              проверено {{ backups.status.local_bases.checked }} · нет бэкапа у
+              {{ backups.status.local_bases.missing }}
+            </p>
+          </div>
+        </button>
+      </div>
+    </section>
     <section class="rounded-xl border border-slate-200 bg-white p-5">
       <div class="flex items-center justify-between">
         <h2 class="font-semibold">Магазины</h2>
@@ -141,35 +270,35 @@ function formatTime(value: string | null): string {
 
       <table class="magaz-table mt-4">
         <thead>
-          <tr>
+          <tr class="magaz-muted text-left text-xs font-medium">
             <th class="w-8"></th>
-            <th>Магазин</th>
-            <th class="w-40">IP</th>
-            <th class="w-40">Кластер</th>
-            <th class="w-32">База</th>
-            <th class="w-32">Версия 1С</th>
-            <th class="w-24">Статус</th>
-            <th class="w-44">Последняя активность</th>
+            <th class="whitespace-nowrap px-2">Магазин</th>
+            <th class="w-40 whitespace-nowrap px-2">IP</th>
+            <th class="w-40 whitespace-nowrap px-2">Кластер</th>
+            <th class="w-32 whitespace-nowrap px-2">База</th>
+            <th class="w-32 whitespace-nowrap px-2">Версия 1С</th>
+            <th class="w-24 whitespace-nowrap px-2">Статус</th>
+            <th class="w-44 whitespace-nowrap px-2">Последняя активность</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="store in stores.items" :key="store.id" data-test="dashboard-store-row">
             <td colspan="8" class="p-0">
               <details class="group">
-                <summary class="flex cursor-pointer items-center gap-3 py-2">
+                <summary class="flex cursor-pointer items-center py-2">
                   <span class="magaz-muted w-8 text-center text-xs">▸</span>
-                  <span class="flex-1 font-medium">{{ store.name }}</span>
-                  <span class="magaz-mono w-40">{{ store.ip_address }}</span>
-                  <span class="w-40">{{ store.cluster_name }}</span>
-                  <span class="w-32">{{ store.database_name }}</span>
-                  <span class="magaz-mono w-32">{{ store.version_1c }}</span>
-                  <span class="w-24">
+                  <span class="flex-1 truncate px-2 font-medium">{{ store.name }}</span>
+                  <span class="magaz-mono w-40 truncate px-2">{{ store.ip_address }}</span>
+                  <span class="w-40 truncate px-2">{{ store.cluster_name }}</span>
+                  <span class="w-32 truncate px-2">{{ store.database_name }}</span>
+                  <span class="magaz-mono w-32 truncate px-2">{{ store.version_1c }}</span>
+                  <span class="w-24 px-2">
                     <Tag
                       :value="store.is_online ? 'онлайн' : 'офлайн'"
                       :severity="store.is_online ? 'success' : 'danger'"
                     />
                   </span>
-                  <span class="magaz-muted w-44 text-sm">{{ formatTime(store.last_seen_at) }}</span>
+                  <span class="magaz-muted w-44 whitespace-nowrap px-2 text-sm">{{ formatTime(store.last_seen_at) }}</span>
                 </summary>
 
                 <div class="magaz-muted grid gap-2 bg-slate-50 px-6 py-3 text-sm md:grid-cols-3">
@@ -201,7 +330,59 @@ function formatTime(value: string | null): string {
       </table>
     </section>
 
-    <section class="grid gap-4 lg:grid-cols-2">
+
+    <Dialog
+      v-model:visible="isBackupListOpen"
+      :header="backupListKind === 'stores' ? 'Список бэкапов — магазины' : 'Список бэкапов — локальные базы'"
+      modal
+      :style="{ width: '720px' }"
+      data-test="backup-list-dialog"
+    >
+      <div
+        v-if="backupListKind === 'stores' ? !backups.storeList.length : !backups.localBaseList.length"
+        class="magaz-muted py-6 text-center text-sm"
+      >
+        Проверка бэкапов не настроена {{ backupListKind === 'stores' ? 'ни у одного магазина' : 'ни у одной локальной базы' }}.
+      </div>
+      <table v-else class="w-full text-sm">
+        <thead>
+          <tr class="magaz-muted border-b border-slate-200 text-left text-xs">
+            <th class="py-2 pr-3 font-medium">Название</th>
+            <th class="py-2 pr-3 font-medium">Статус</th>
+            <th class="py-2 pr-3 font-medium">За дату</th>
+            <th class="py-2 pr-3 font-medium">Ошибка</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="item in backupListKind === 'stores' ? backups.storeList : backups.localBaseList"
+            :key="item.id"
+            class="border-b border-slate-100"
+          >
+            <td class="py-2 pr-3 font-medium">{{ item.name }}</td>
+            <td class="py-2 pr-3">
+              <Tag
+                :value="backupBadge(item.backup_status)"
+                :severity="item.backup_status === 'ok' ? 'success' : item.backup_status === 'missing' ? 'danger' : 'secondary'"
+              />
+            </td>
+            <td class="py-2 pr-3 whitespace-nowrap">
+              {{ item.backup_checked_date ?? '—' }}
+              <span class="magaz-muted text-xs">{{ item.backup_check_yesterday ? '(вчера)' : '(сегодня)' }}</span>
+            </td>
+            <td class="magaz-muted max-w-xs truncate py-2 pr-3" :title="item.backup_error ?? ''">
+              {{ item.backup_error ?? '—' }}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <template #footer>
+        <Button label="Закрыть" size="small" text @click="isBackupListOpen = false" />
+      </template>
+    </Dialog>
+
+
+    <section>
       <div class="rounded-xl border border-slate-200 bg-white p-5">
         <div class="flex items-center justify-between">
           <h2 class="font-semibold">Состояние сервера</h2>
@@ -246,23 +427,6 @@ function formatTime(value: string | null): string {
             <dd class="font-medium">{{ info?.settings_keys ?? '—' }}</dd>
           </div>
         </dl>
-      </div>
-
-      <div class="rounded-xl border border-slate-200 bg-white p-5">
-        <h2 class="font-semibold">Что появится дальше</h2>
-        <ul class="mt-4 space-y-3 text-sm text-slate-700">
-          <li class="flex gap-2">
-            <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э7</span>
-            <span>Приёмка на стенде заказчика: живой 1С, `msg.exe`, службы под LocalSystem.</span>
-          </li>
-          <li class="flex gap-2">
-            <span class="magaz-muted w-12 shrink-0 text-xs font-semibold">Э9</span>
-            <span>
-              Уведомления 2.0: редактор с форматированием и картинками, окно в углу экрана на
-              кассе, вкладки по важности со счётчиками, удаление после прочтения.
-            </span>
-          </li>
-        </ul>
       </div>
     </section>
   </div>

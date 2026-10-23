@@ -83,13 +83,22 @@ function makeStore(overrides: Record<string, unknown> = {}): Record<string, unkn
   }
 }
 
-/** Мок API: счётчики и список магазинов (сервер отдаёт только активные). */
+/** Мок API: счётчики, список магазинов и бэкапы (Д-21). */
 function apiMock(
   counts: Record<string, unknown>,
   stores: unknown[],
+  backupStatus: Record<string, unknown> = {
+    stores: { total: 0, checked: 0, ok: 0, missing: 0 },
+    local_bases: { total: 0, checked: 0, ok: 0, missing: 0 },
+  },
+  backupStores: unknown[] = [],
+  backupBases: unknown[] = [],
 ): (url: string) => Promise<Response> {
   return async (url: string) => {
     if (url.includes('/admin/system/info')) return jsonResponse(makeSystemInfo(counts))
+    if (url.includes('/admin/backup/status')) return jsonResponse(backupStatus)
+    if (url.includes('/admin/backup/stores')) return jsonResponse(backupStores)
+    if (url.includes('/admin/backup/local-bases')) return jsonResponse(backupBases)
     return jsonResponse(stores)
   }
 }
@@ -99,6 +108,7 @@ const stubs = {
   Button: { props: ['label'], template: '<button>{{ label }}</button>' },
   Tag: { props: ['value'], template: '<span class="tag">{{ value }}</span>' },
   Message: { template: '<div class="stub-message"><slot /></div>' },
+  Dialog: { props: ['visible'], template: '<div v-if="visible"><slot /></div>' },
 }
 
 async function mountDashboard(fetchMock: ReturnType<typeof vi.fn>): Promise<VueWrapper> {
@@ -159,4 +169,34 @@ describe('главная страница', () => {
     expect(wrapper.find('[data-test="tile-stores"]').text()).toContain('активных магазинов')
     wrapper.unmount()
   })
+
+  it('блок «Бэкапы» показывает «есть N из M» по магазинам и локальным базам (Д-21)', async () => {
+    fetchMock.mockImplementation(
+      apiMock(
+        makeCounts(),
+        [makeStore()],
+        {
+          stores: { total: 30, checked: 28, ok: 28, missing: 2 },
+          local_bases: { total: 3, checked: 3, ok: 3, missing: 0 },
+        },
+        [
+          { kind: 'store', id: 1, name: 'Магазин №5', backup_status: 'missing', backup_error: 'нет', backup_checked_date: '2026-10-22', backup_check_yesterday: false },
+        ],
+      ),
+    )
+
+    const wrapper = await mountDashboard(fetchMock)
+
+    expect(wrapper.find('[data-test="backup-dashboard"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="backup-stores"]').text()).toContain('есть 28 из 30')
+    expect(wrapper.find('[data-test="backup-local-bases"]').text()).toContain('есть 3 из 3')
+
+    // провал в список
+    await wrapper.find('[data-test="backup-stores"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-test="backup-list-dialog"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('Магазин №5')
+    wrapper.unmount()
+  })
+
 })

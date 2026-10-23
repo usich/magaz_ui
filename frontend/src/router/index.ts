@@ -59,6 +59,18 @@ export const routes: RouteRecordRaw[] = [
     meta: { title: 'Файлы обновления', stage: 'Э4' },
   },
   {
+    path: '/updates',
+    name: 'updates',
+    component: () => import('@/views/UpdatesView.vue'),
+    meta: { title: 'Обновление 1С', stage: 'Д-19' },
+  },
+  {
+    path: '/local-bases',
+    name: 'local-bases',
+    component: () => import('@/views/LocalBasesView.vue'),
+    meta: { title: 'Локальные базы 1С', stage: 'Д-20' },
+  },
+  {
     path: '/devices',
     name: 'devices',
     component: () => import('@/views/DevicesView.vue'),

@@ -43,7 +43,7 @@ from server.services import (
     settings_service,
 )
 from shared.enums import ActionKind, CommandKind, CommandStatus, TargetType
-from shared.paths import UPDATE_FILE_SUFFIXES
+from shared.paths import UPDATE_FILE_SUFFIXES, is_extension_operation, split_merge_file_name
 from shared.schemas import CheckFilesParams
 from shared.timeutil import to_iso_z, utcnow
 
@@ -341,6 +341,8 @@ def _validate_action(action: str, params: dict[str, Any]) -> tuple[str, dict[str
             )
         clean["file_name"] = _validate_filename(file_name)
         clean["full_merge"] = bool(raw.get("full_merge"))
+        if raw.get("is_extension") is not None:
+            clean["is_extension"] = bool(raw.get("is_extension"))
         extension_name = str(raw.get("extension_name") or "").strip()
         if extension_name:
             clean["extension_name"] = extension_name
@@ -350,6 +352,8 @@ def _validate_action(action: str, params: dict[str, Any]) -> tuple[str, dict[str
 
     elif name == str(ActionKind.RUN_UPDATE_DB):
         clean["is_fast_update"] = bool(raw.get("is_fast_update"))
+        if raw.get("is_extension") is not None:
+            clean["is_extension"] = bool(raw.get("is_extension"))
         extension_name = str(raw.get("extension_name") or "").strip()
         if extension_name:
             clean["extension_name"] = extension_name
@@ -412,17 +416,34 @@ def resolve_target_stores(
 
 
 def _merge_warning(
-    session: Session, store: Store, *, file_name: str, extension_name: str | None
+    session: Session,
+    store: Store,
+    *,
+    file_name: str,
+    extension_name: str | None,
+    is_extension: bool | None = None,
 ) -> str | None:
     """Предупреждение об отсутствии файла на кассе — Q53 (не блокирует запуск).
 
     Источник — последний снимок `file_checks` (§4.5), поэтому проверка ничего не
     стоит: за свежестью следит админ кнопкой «Проверить файлы» (§11.3).
+
+    FR-4/Д-16/Д-17: тип слияния решает `is_extension_operation` (явный флаг →
+    `.cf`/`.cfe` в имени → `extension_name`), а `extension_name` подставляется из
+    карточки магазина только когда слияние идёт на расширение — ровно то же
+    правило, что в `dispatcher.build_1c_payload` при фактической отправке. Иначе
+    предупреждение проверяло бы `.cf` и лгало про расширение (и наоборот).
     """
-    column = "cfe" if extension_name else "cf"
+    stem, _ = split_merge_file_name(file_name)
+    if is_extension_operation(
+        is_extension, file_name, extension_name or store.extension_name
+    ):
+        column = "cfe"
+    else:
+        column = "cf"
     stmt = (
         select(FileCheck)
-        .where(FileCheck.store_id == store.id, FileCheck.filename == file_name)
+        .where(FileCheck.store_id == store.id, FileCheck.filename == stem)
         .order_by(FileCheck.id.desc())
         .limit(1)
     )
@@ -436,7 +457,7 @@ def _merge_warning(
         return None
     checked_at = to_iso_z(snapshot.checked_at) or "—"
     return (
-        f"На кассе нет файла {file_name}.{column} (последняя проверка {checked_at}): "
+        f"На кассе нет файла {stem}.{column} (последняя проверка {checked_at}): "
         "слияние может завершиться ошибкой"
     )
 
@@ -604,6 +625,7 @@ def _dispatch_bulk(
                 store,
                 file_name=str(params.get("file_name") or ""),
                 extension_name=params.get("extension_name"),
+                is_extension=params.get("is_extension"),
             )
 
     return results, warning
@@ -666,6 +688,7 @@ def store_action(  # noqa: PLR0913 - параметры HTTP-точки
             store,
             file_name=str(params.get("file_name") or ""),
             extension_name=params.get("extension_name"),
+            is_extension=params.get("is_extension"),
         )
 
     audit_service.record(
@@ -872,6 +895,53 @@ def delete_job(
     session.commit()
     logger.info("Задача id=%s удалена администратором %s", job_id, admin.username)
     return JobDeleteOut(job_id=job_id, deleted=True, message="Задача удалена")
+
+
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=dict[str, str | int],
+    summary="Прервать задачу",
+)
+def cancel_job(
+    job_id: int,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+) -> dict[str, str | int]:
+    """Прервать незавершённую задачу (Д-22): `queued`/`sent`/`running` → `canceled`.
+
+    Задача остаётся в истории со статусом «отменена» (в отличие от удаления),
+    диспетчер больше её не опрашивает и не ретраит. Агент, если команда уже
+    ушла, может продолжать выполнение на кассе — это «снять с контроля сервера».
+    """
+    command = command_service.get_command(session, job_id)
+    if command is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Задача id={job_id} не найдена"
+        )
+
+    if str(command.status) not in command_service.ACTIVE_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Задача id={job_id} уже завершена (статус: {command.status})",
+        )
+
+    command_service.set_status(session, command, CommandStatus.CANCELED)
+    command_service.add_log(
+        session, command, f"Задача прервана администратором {admin.username}"
+    )
+    audit_service.record(
+        session,
+        action="job_cancel",
+        actor=admin.username,
+        entity="job",
+        entity_id=job_id,
+        details={"kind": str(command.kind), "previous_status": str(command.status)},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    logger.info("Задача id=%s прервана администратором %s", job_id, admin.username)
+    return {"job_id": job_id, "status": str(command.status), "message": "Задача отменена"}
 
 
 @router.post(

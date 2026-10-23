@@ -81,6 +81,49 @@ class TestBuildMergeCommand:
         assert args[args.index("-Settings") + 1].endswith("1cv8.xml")
         assert args[args.index("/MergeCfg") + 1].endswith("1cv8.cf")
 
+    def test_cf_file_wins_over_extension_from_card(self, one_c_paths) -> None:  # noqa: ANN001
+        """Д-16: явное `.cf` в имени файла главнее `extension_name` из карточки.
+
+        Если админ указал `1cv8.cf`, слияние идёт на основную конфигурацию, даже
+        когда в карточке магазина прописано расширение — иначе `.cf`-обновление
+        на таком магазине было бы невозможно.
+        """
+        args = build_merge_command(
+            make_merge_params(file_name="1cv8.cf", extension_name="МоеРасширение"),
+            LOG_PATH,
+            one_c_paths,
+        )
+        assert args[args.index("/MergeCfg") + 1].endswith("1cv8.cf")
+        assert "-Extension" not in args, "`.cf`-имя даёт основную конфигурацию, без -Extension"
+
+    def test_is_extension_flag_wins_over_file_and_card(self, one_c_paths) -> None:  # noqa: ANN001
+        """Д-17: явный флаг `is_extension` главнее расширения в имени и карточки.
+
+        Массовая операция передаёт `is_extension`, а не полагается на имя файла
+        (оно без расширения) или на карточку магазина.
+        """
+        # is_extension=False главнее .cfe в имени → основная конфигурация
+        args = build_merge_command(
+            make_merge_params(file_name="1cv8.cfe", is_extension=False),
+            LOG_PATH,
+            one_c_paths,
+        )
+        assert args[args.index("/MergeCfg") + 1].endswith("1cv8.cf")
+        assert "-Extension" not in args
+
+        # is_extension=True + имя без расширения + расширение из карточки → .cfe
+        args = build_merge_command(
+            make_merge_params(
+                file_name="1cv8",
+                extension_name="МоеРасширение",
+                is_extension=True,
+            ),
+            LOG_PATH,
+            one_c_paths,
+        )
+        assert args[args.index("/MergeCfg") + 1].endswith("1cv8.cfe")
+        assert args[args.index("-Extension") + 1] == "МоеРасширение"
+
     def test_full_merge_uses_full_merge_xml(self, one_c_paths) -> None:  # noqa: ANN001
         args = build_merge_command(make_merge_params(full_merge=True), LOG_PATH, one_c_paths)
         assert args[args.index("-Settings") + 1].endswith("full_merge.xml")
@@ -168,17 +211,45 @@ class TestBuildUpdateAndServiceCommands:
         args = build_update_db_command(
             make_update_params(extension_name="МоеРасширение"), LOG_PATH, one_c_paths
         )
-        assert "/Extension" in args
-        assert args[args.index("/Extension") + 1] == "МоеРасширение"
+        # Флаг — `-Extension` (с минусом), как в `/MergeCfg`, сразу после
+        # `/UpdateDBCfg` и до `/UC` — порядок рабочей команды 1С (8.3.27).
+        assert "-Extension" in args
+        assert args[args.index("-Extension") + 1] == "МоеРасширение"
+        assert args.index("-Extension") == args.index("/UpdateDBCfg") + 1
+        assert args.index("/UCКодРазрешения") > args.index("-Extension")
+
+    def test_update_db_is_extension_flag_controls_extension_key(
+        self, one_c_paths
+    ) -> None:  # noqa: ANN001
+        """Д-17: явный `is_extension` решает, добавлять ли `-Extension`.
+
+        Даже если в карточке магазина (эмулируем через `extension_name`) стоит
+        расширение, `is_extension=False` даёт обновление основной конфигурации —
+        без `-Extension`.
+        """
+        args = build_update_db_command(
+            make_update_params(extension_name='МоеРасширение', is_extension=False),
+            LOG_PATH,
+            one_c_paths,
+        )
+        assert '-Extension' not in args, "основная конфигурация обновляется без -Extension"
+
+        args = build_update_db_command(
+            make_update_params(extension_name='МоеРасширение', is_extension=True),
+            LOG_PATH,
+            one_c_paths,
+        )
+        assert args[args.index('-Extension') + 1] == 'МоеРасширение'
+
 
     def test_shutdown_users_command(self, one_c_paths) -> None:  # noqa: ANN001
         args = build_shutdown_users_command(make_update_params(), LOG_PATH, one_c_paths)
 
         assert "ENTERPRISE" in args
-        assert "/CЗавершитьРаботуПользователей" in args
+        assert '/CЗавершитьРаботуПользователей,Сообщение="Обновляем конфигурацию"' in args
         assert "/WA-" in args
         assert "/AU-" in args
-        assert args[args.index("/Out") + 1] == str(LOG_PATH)
+        assert "-force" not in args, "Д-18: сеансы закрывает 1С, без taskkill/-force"
 
     def test_enable_users_command(self, one_c_paths) -> None:  # noqa: ANN001
         args = build_enable_users_command(make_update_params(), LOG_PATH, one_c_paths)
@@ -186,7 +257,7 @@ class TestBuildUpdateAndServiceCommands:
         assert "ENTERPRISE" in args
         assert "/CРазрешитьРаботуПользователей" in args
         assert "/UCКодРазрешения" in args
-        assert args[args.index("/Out") + 1] == str(LOG_PATH)
+        assert "-force" not in args, "Д-18: без -force (рабочая команда 8.3.27)"
 
 
 class TestLogFileState:
@@ -204,6 +275,17 @@ class TestLogFileState:
 
         state, _ = await check_log_file(one_c_paths.log_merge, SUCCESS_MERGE_MSG)
         assert state == LOG_STATE_IN_PROGRESS
+
+    async def test_bom_only_log_means_in_progress(self, one_c_paths) -> None:  # noqa: ANN001
+        """Лог с одним BOM (U+FEFF) — пуст по I-4, а не «Process in progress... ».
+
+        1С при `/UpdateDBCfg` может создать файл с BOM-заголовком, но без текста;
+        `str.strip()` BOM не удаляет, поэтому «пустота» учитывает его отдельно.
+        """
+        one_c_paths.log_merge.write_text("\ufeff", encoding="utf-8")
+        state, message = await check_log_file(one_c_paths.log_merge, SUCCESS_MERGE_MSG)
+        assert state == LOG_STATE_IN_PROGRESS
+        assert "Log file is empty" in message
 
     async def test_success_state(self, one_c_paths) -> None:  # noqa: ANN001
         one_c_paths.log_merge.write_text(SUCCESS_MERGE_MSG, encoding="utf-8")
