@@ -17,6 +17,7 @@ import OperationPanel from '@/components/OperationPanel.vue'
 import StatusTile from '@/components/StatusTile.vue'
 import LocalBaseFormDialog from '@/components/LocalBaseFormDialog.vue'
 import LocalBaseUpdateDialog from '@/components/LocalBaseUpdateDialog.vue'
+import LocalOperationPanel from '@/components/LocalOperationPanel.vue'
 import { useFilesStore } from '@/stores/files'
 import { useLocalBasesStore } from '@/stores/local_bases'
 import { JOB_KIND_LABELS, JOB_STATUS_LABELS, jobStatusSeverity } from '@/stores/jobs'
@@ -548,83 +549,77 @@ onUnmounted(() => {
     </div>
 
     <div v-else class="space-y-6">
-      <div class="flex flex-wrap items-center justify-between gap-2">
-        <h2 class="font-semibold">Локальные базы 1С</h2>
-        <div class="flex flex-wrap gap-2">
-          <Button
-            label="Выбрать все"
-            severity="secondary"
-            size="small"
-            outlined
-            :data-test="`updates-local-select-all-${localAllSelected ? 'on' : 'off'}`"
-            @click="toggleLocalAll"
-          />
-          <Button
-            label="Проверить файлы"
-            size="small"
-            :disabled="!localSelected.length"
-            data-test="updates-local-check-selected"
-            @click="openLocalBulkCheck"
-          />
-          <Button
-            label="Слияние…"
-            size="small"
-            :disabled="!localSelected.length"
-            data-test="updates-local-merge-selected"
-            @click="openLocalBulkMerge"
-          />
-          <Button
-            label="Обновить базу…"
-            size="small"
-            :disabled="!localSelected.length"
-            data-test="updates-local-update-selected"
-            @click="openLocalBulkUpdate"
-          />
-          <Button label="Добавить базу" icon="pi pi-plus" size="small" data-test="updates-local-add" @click="openBaseCreate" />
-        </div>
-      </div>
-      <p class="magaz-muted max-w-2xl text-sm">
-        Базы 1С на этой машине. Группируются по полю «Группа»: одинаковое значение
-        (например «Бухгалтерия») собирает базы в одну секцию. Конвейер как у магазинов:
-        сначала «Проверить файлы» (файл <span class="magaz-mono">.cf/.cfe</span> в
-        <span class="magaz-mono">local_update_dir</span>), затем «Слияние…», затем
-        «Обновить базу».
-      </p>
+      <LocalOperationPanel
+        :local-base-ids="localSelected"
+        :all="!localSelected.length"
+        :all-bases="localBases.items"
+        title="Массовые операции по локальным базам"
+        @submitted="loadJobs"
+      />
 
-      <template v-if="localBases.groups.length">
-        <section
-          v-for="group in localBases.groups"
-          :key="group"
-          class="rounded-xl border border-slate-200 bg-white"
-          :data-test="`lb-group-${group || 'без-группы'}`"
-        >
-          <header class="border-b border-slate-200 px-4 py-2">
-            <h3 class="font-semibold text-blue-700">{{ group || 'Без группы' }}</h3>
-          </header>
+      <section class="rounded-xl border border-slate-200 bg-white p-5">
+        <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <h2 class="font-semibold">Локальные базы и статусы обновления</h2>
+          <div class="flex flex-wrap gap-2">
+            <Button
+              label="Выбрать все"
+              severity="secondary"
+              size="small"
+              outlined
+              :data-test="`updates-local-select-all-${localAllSelected ? 'on' : 'off'}`"
+              @click="toggleLocalAll"
+            />
+            <Button
+              label="Проверить файлы"
+              size="small"
+              :disabled="!localSelected.length"
+              data-test="updates-local-check-selected"
+              @click="openLocalBulkCheck"
+            />
+            <Button
+              label="Слияние…"
+              size="small"
+              :disabled="!localSelected.length"
+              data-test="updates-local-merge-selected"
+              @click="openLocalBulkMerge"
+            />
+            <Button
+              label="Обновить базу…"
+              size="small"
+              :disabled="!localSelected.length"
+              data-test="updates-local-update-selected"
+              @click="openLocalBulkUpdate"
+            />
+            <Button label="Добавить базу" icon="pi pi-plus" size="small" data-test="updates-local-add" @click="openBaseCreate" />
+          </div>
+        </div>
+
+
+        <div class="overflow-x-auto">
           <table class="w-full text-sm">
             <thead>
-              <tr class="magaz-muted border-b border-slate-100 text-left text-xs">
-                <th class="px-4 py-2 font-medium"><span class="sr-only">выбор</span></th>
-                <th class="px-4 py-2 font-medium">Название</th>
+              <tr class="magaz-muted border-b border-slate-200 text-left text-xs">
+                <th class="py-2 pr-3 font-medium"><span class="sr-only">выбор</span></th>
+                <th class="py-2 pr-3 font-medium">База</th>
                 <th class="py-2 pr-3 font-medium">Версия 1С</th>
                 <th class="py-2 pr-3 font-medium">Кластер / БД</th>
-                <th class="py-2 pr-3 font-medium">Пользователь 1С</th>
                 <th class="py-2 pr-3 font-medium">Путь к базе</th>
                 <th class="py-2 pr-3 font-medium">Расширение</th>
                 <th class="py-2 pr-3 font-medium">Проверка</th>
                 <th class="py-2 pr-3 font-medium">Слияние</th>
                 <th class="py-2 pr-3 font-medium">Обновление</th>
+                <th class="py-2 pr-3 font-medium">Последнее обновление</th>
                 <th class="py-2 pr-3 text-right font-medium">Действия</th>
               </tr>
             </thead>
             <tbody>
               <tr
-                v-for="base in localBases.items.filter((item) => item.group === group)"
+                v-for="base in localBases.items"
                 :key="base.id"
-                class="border-b border-slate-100 last:border-0"
+                class="border-b border-slate-100"
                 :data-test="`lb-row-${base.id}`"
               >
-                <td class="px-4 py-2">
+                <td class="py-2 pr-3">
                   <Checkbox
                     :model-value="localSelected.includes(base.id)"
                     binary
@@ -632,7 +627,7 @@ onUnmounted(() => {
                     @update:model-value="toggleLocalSelect(base.id)"
                   />
                 </td>
-                <td class="px-4 py-2 font-medium">
+                <td class="py-2 pr-3 font-medium">
                   {{ base.name }}
                   <div v-if="base.comment" class="magaz-muted text-xs">{{ base.comment }}</div>
                 </td>
@@ -640,13 +635,6 @@ onUnmounted(() => {
                 <td class="py-2 pr-3">
                   <div>{{ base.cluster_name }}</div>
                   <div class="magaz-muted text-xs">{{ base.database_name }}</div>
-                </td>
-                <td class="py-2 pr-3 whitespace-nowrap">
-                  {{ base.user_name_1c }}
-                  <Tag
-                    :value="base.password_set ? 'пароль задан' : 'пароль не задан'"
-                    :severity="base.password_set ? 'success' : 'secondary'"
-                  />
                 </td>
                 <td class="py-2 pr-3">
                   <span v-if="base.base_path" class="magaz-mono text-xs">{{ base.base_path }}</span>
@@ -677,52 +665,24 @@ onUnmounted(() => {
                     :data-test="`lb-status-${base.id}`"
                   />
                 </td>
-                <td class="py-2 pr-3 text-right whitespace-nowrap">
-                  <Button
-                    label="Проверить файлы"
-                    size="small"
-                    text
-                    :data-test="`lb-check-${base.id}`"
-                    @click="openLocalCheck(base)"
-                  />
-                  <Button
-                    label="Слияние…"
-                    size="small"
-                    text
-                    :data-test="`lb-merge-${base.id}`"
-                    @click="openLocalMerge(base)"
-                  />
-                  <Button
-                    label="Обновить базу"
-                    size="small"
-                    text
-                    :data-test="`lb-update-${base.id}`"
-                    @click="openLocalUpdate(base)"
-                  />
-                  <Button
-                    label="Изменить"
-                    size="small"
-                    text
-                    :data-test="`lb-edit-${base.id}`"
-                    @click="openBaseEdit(base)"
-                  />
-                  <Button
-                    label="Отключить"
-                    size="small"
-                    severity="danger"
-                    text
-                    :data-test="`lb-remove-${base.id}`"
-                    @click="removeLocalBase(base.id)"
-                  />
+                <td class="py-2 pr-3 whitespace-nowrap magaz-muted">
+                  {{ lastOkAt(lastLocalFor(localJobs, base.id)) }}
                 </td>
+                <td class="py-2 pr-3 text-right whitespace-nowrap">
+                  <Button label="Проверить файлы" size="small" text :data-test="`lb-check-${base.id}`" @click="openLocalCheck(base)" />
+                  <Button label="Слияние…" size="small" text :data-test="`lb-merge-${base.id}`" @click="openLocalMerge(base)" />
+                  <Button label="Обновить базу" size="small" text :data-test="`lb-update-${base.id}`" @click="openLocalUpdate(base)" />
+                  <Button label="Изменить" size="small" text :data-test="`lb-edit-${base.id}`" @click="openBaseEdit(base)" />
+                  <Button label="Отключить" size="small" severity="danger" text :data-test="`lb-remove-${base.id}`" @click="removeLocalBase(base.id)" />
+                </td>
+              </tr>
+              <tr v-if="!localBases.items.length && !localBases.isLoading">
+                <td colspan="11" class="magaz-muted py-6 text-center">Локальные базы ещё не добавлены — нажмите «Добавить базу».</td>
               </tr>
             </tbody>
           </table>
-        </section>
-      </template>
-      <div v-else class="magaz-muted rounded-xl border border-dashed border-slate-300 p-6 text-sm">
-        Локальные базы ещё не добавлены — нажмите «Добавить базу».
-      </div>
+        </div>
+      </section>
 
       <section class="rounded-xl border border-slate-200 bg-white p-5">
         <h2 class="mb-3 font-semibold">Журнал операций по локальным базам</h2>

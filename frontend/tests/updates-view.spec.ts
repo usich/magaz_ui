@@ -209,7 +209,7 @@ describe('страница «Обновление 1С»', () => {
     wrapper.unmount()
   })
 
-  it('вкладка «Локальные базы»: группировка по `group` и реквизиты базы (Д-20)', async () => {
+  it('вкладка «Локальные базы»: плоская таблица базы, панель операций и реквизиты (Д-20/Д-26)', async () => {
     fetchMock.mockImplementation(
       apiMock([], [], [], [], [], [
         makeLocalBase(),
@@ -222,22 +222,15 @@ describe('страница «Обновление 1С»', () => {
     await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
     await flushPromises()
 
-    // Две секции групп, базы внутри распределены
-    expect(wrapper.find('[data-test="lb-group-Финансы"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="lb-group-Продажи"]').exists()).toBe(true)
-    expect(wrapper.findAll('[data-test^="lb-group-"]')).toHaveLength(2)
+    // Все базы в одной плоской таблице (как вкладка «Магазины»), без секций групп
+    expect(wrapper.findAll('[data-test^="lb-row-"]')).toHaveLength(3)
+    expect(wrapper.find('[data-test="local-operation-panel"]').exists()).toBe(true)
 
-    const finance = wrapper.find('[data-test="lb-group-Финансы"]')
-    expect(finance.findAll('[data-test^="lb-row-"]')).toHaveLength(2)
-    expect(finance.text()).toContain('Бухгалтерия')
-    expect(finance.text()).toContain('Зарплата')
-
-    // Реквизиты базы: кластер/БД, путь, расширение, признак пароля
+    // Реквизиты базы: кластер/БД, путь, расширение
     const row = wrapper.find('[data-test="lb-row-2"]')
     expect(row.text()).toContain('buh')
     expect(row.text()).toContain('C:\\1C\\buh')
     expect(row.text()).toContain('БГ_Бухгалтерия')
-    expect(row.text()).toContain('пароль задан')
     wrapper.unmount()
   })
 
@@ -515,6 +508,42 @@ describe('страница «Обновление 1С»', () => {
       local_base_ids: [2, 3],
       kind: 'run_merge_local',
       file_name: 'update',
+    })
+    wrapper.unmount()
+  })
+
+  it('вкладка «Локальные базы»: панель операций «Обновить» шлёт bulk/update по всем базам (Д-26)', async () => {
+    const bulkBodies: unknown[] = []
+    fetchMock.mockImplementation(
+      apiMock(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [makeLocalBase(), makeLocalBase({ id: 3, name: 'Торговля', database_name: 'trade' })],
+        [],
+        [],
+        [],
+        undefined,
+        (body) => bulkBodies.push(body),
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-operation-panel"]').exists()).toBe(true)
+    await wrapper.find('[data-test="local-run-update"]').trigger('click')
+    await flushPromises()
+
+    expect(bulkBodies).toHaveLength(1)
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      kind: 'run_update_db_local',
+      local_base_ids: [2, 3],
+      is_fast_update: false,
+      is_extension: false,
     })
     wrapper.unmount()
   })
