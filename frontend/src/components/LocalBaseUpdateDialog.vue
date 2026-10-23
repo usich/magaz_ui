@@ -24,10 +24,10 @@ const props = withDefaults(
     visible: boolean
     /** База, которую обновляем (открывает диалог из строки таблицы). */
     base?: LocalBaseItem | null
-    /** Массовый режим (Д-25): обновить эти базы одним запуском (без карточки `base`). */
+    /** Массовый режим (Д-25): выполнить операцию для этих баз одним запуском. */
     bulkBaseIds?: number[]
-    /** Режим операции (Д-26): слияние `/MergeCfg` или обновление БД `/UpdateDBCfg`. */
-    mode?: 'merge' | 'update'
+    /** Режим операции (Д-26): проверка файлов, слияние или обновление БД. */
+    mode?: 'check' | 'merge' | 'update'
   }>(),
   { base: null, bulkBaseIds: () => [], mode: 'update' },
 )
@@ -52,12 +52,18 @@ const formError = ref('')
 
 const isBulk = computed(() => props.bulkBaseIds.length > 0)
 const isMerge = computed(() => props.mode === 'merge')
+const isCheck = computed(() => props.mode === 'check')
 const dialogTitle = computed(() => {
-  if (isBulk.value) return `Обновление баз (выбрано: ${props.bulkBaseIds.length})`
-  if (isMerge.value) return `Слияние базы «${props.base?.name ?? ''}»`
-  return `Обновление базы «${props.base?.name ?? ''}»`
+  if (isBulk.value) return `Операция по базам (выбрано: ${props.bulkBaseIds.length})`
+  const name = props.base?.name ?? ''
+  if (isCheck.value) return `Проверка файлов базы «${name}»`
+  if (isMerge.value) return `Слияние базы «${name}»`
+  return `Обновление базы «${name}»`
 })
-const isFormValid = computed(() => Boolean(form.file_name.trim()))
+// Имя файла нужно только для проверки и слияния; обновление БД файла не требует.
+const isFormValid = computed(() =>
+  isCheck.value || isMerge.value ? Boolean(form.file_name.trim()) : true,
+)
 
 function reset(): void {
   // По умолчанию — обновление основной конфигурации (.cf), быстрое выключено.
@@ -82,48 +88,57 @@ function close(): void {
 async function run(): Promise<void> {
   const canRunSingle = Boolean(props.base) && !isBulk.value
   const canRunBulk = isBulk.value && props.bulkBaseIds.length > 0
-  if ((!canRunSingle && !canRunBulk) || !form.file_name.trim()) return
+  if (!canRunSingle && !canRunBulk) return
+  if ((isCheck.value || isMerge.value) && !form.file_name.trim()) return
   isRunning.value = true
   formError.value = ''
-  const payload = {
-    file_name: form.file_name.trim(),
+
+  const filePayload = form.file_name.trim() ? { file_name: form.file_name.trim() } : {}
+  const mergePayload = {
+    ...filePayload,
+    is_extension: form.is_extension,
+    ...(form.is_extension && form.extension_name.trim()
+      ? { extension_name: form.extension_name.trim() }
+      : {}),
+  }
+  const updatePayload = {
     is_fast_update: form.is_fast_update,
     is_extension: form.is_extension,
     ...(form.is_extension && form.extension_name.trim()
       ? { extension_name: form.extension_name.trim() }
       : {}),
   }
+  const singleLabel = isCheck.value
+    ? 'Проверка файлов поставлена в очередь'
+    : isMerge.value
+      ? 'Слияние поставлено в очередь'
+      : 'Обновление поставлено в очередь'
+
   try {
     if (isBulk.value) {
-      const kind = isMerge.value ? 'run_merge_local' : 'run_update_db_local'
-      const response = await localBasesApi.bulkUpdate({
+      const kind: 'check_files_local' | 'run_merge_local' | 'run_update_db_local' = isCheck.value
+        ? 'check_files_local'
+        : isMerge.value
+          ? 'run_merge_local'
+          : 'run_update_db_local'
+      const bulkBody = {
         local_base_ids: props.bulkBaseIds,
         kind,
-        ...(isMerge.value ? { full_merge: false } : {}),
-        ...payload,
-      })
-      toast.add({
-        severity: 'success',
-        summary: isMerge.value ? 'Слияние поставлено в очередь' : 'Обновление поставлено в очередь',
-        detail: response.message,
-        life: 5000,
-      })
+        ...(isCheck.value || isMerge.value ? filePayload : {}),
+        ...(isMerge.value ? mergePayload : {}),
+        ...(isCheck.value ? {} : updatePayload),
+      }
+      const response = await localBasesApi.bulkUpdate(bulkBody)
+      toast.add({ severity: 'success', summary: singleLabel, detail: response.message, life: 5000 })
+    } else if (isCheck.value) {
+      const response = await localBasesApi.checkFiles(props.base!.id, filePayload)
+      toast.add({ severity: 'success', summary: singleLabel, detail: response.message, life: 5000 })
     } else if (isMerge.value) {
-      const response = await localBasesApi.runMerge(props.base!.id, payload)
-      toast.add({
-        severity: 'success',
-        summary: 'Слияние поставлено в очередь',
-        detail: response.message,
-        life: 5000,
-      })
+      const response = await localBasesApi.runMerge(props.base!.id, mergePayload)
+      toast.add({ severity: 'success', summary: singleLabel, detail: response.message, life: 5000 })
     } else {
-      const response = await localBasesApi.runUpdate(props.base!.id, payload)
-      toast.add({
-        severity: 'success',
-        summary: 'Обновление поставлено в очередь',
-        detail: response.message,
-        life: 5000,
-      })
+      const response = await localBasesApi.runUpdate(props.base!.id, updatePayload)
+      toast.add({ severity: 'success', summary: singleLabel, detail: response.message, life: 5000 })
     }
     emit('submitted')
     close()
@@ -133,7 +148,7 @@ async function run(): Promise<void> {
         ? error.messages.join('; ')
         : error instanceof ApiError
           ? error.message
-          : 'Не удалось поставить обновление'
+          : 'Не удалось поставить операцию'
     formError.value = message
     toast.add({ severity: 'error', summary: 'Операция не выполнена', detail: message, life: 6000 })
   } finally {
@@ -152,13 +167,14 @@ async function run(): Promise<void> {
     @update:visible="(v: boolean) => emit('update:visible', v)"
   >
     <div class="space-y-3">
-      <label class="block space-y-1">
-        <span class="magaz-muted text-xs">Имя файла обновления (без расширения или с ним)</span>
+      <!-- Имя файла нужно только для проверки и слияния; обновление БД файла не требует -->
+      <label v-if="isCheck || isMerge" class="block space-y-1">
+        <span class="magaz-muted text-xs">Имя файла (без расширения)</span>
         <InputText v-model="form.file_name" class="w-full" placeholder="update" data-test="lbu-file" />
       </label>
 
-      <div class="flex items-center gap-4 text-sm">
-        <span class="magaz-muted text-xs">Обновляем:</span>
+      <div v-if="!isCheck" class="flex items-center gap-4 text-sm">
+        <span class="magaz-muted text-xs">{{ isMerge ? 'Сливаем:' : 'Обновляем:' }}</span>
         <label class="flex items-center gap-1">
           <RadioButton v-model="form.is_extension" :value="false" data-test="lbu-cf" />
           <span>Основная (.cf)</span>
@@ -169,12 +185,12 @@ async function run(): Promise<void> {
         </label>
       </div>
 
-      <label v-if="form.is_extension" class="block space-y-1">
+      <label v-if="!isCheck && form.is_extension" class="block space-y-1">
         <span class="magaz-muted text-xs">Имя расширения</span>
         <InputText v-model="form.extension_name" class="w-full" placeholder="БГ_Бухгалтерия" data-test="lbu-extension" />
       </label>
 
-      <label v-if="!isMerge" class="flex items-center gap-2 text-sm">
+      <label v-if="!isCheck && !isMerge" class="flex items-center gap-2 text-sm">
         <Checkbox v-model="form.is_fast_update" binary />
         <span>Быстрое обновление (без завершения сеансов)</span>
       </label>
@@ -186,7 +202,11 @@ async function run(): Promise<void> {
         <template v-if="isBulk">
           Задачу получит каждая выбранная база; сколько из них выполняется параллельно —
           настраивается в «Настройках» (`local_update_concurrency`, по умолчанию 5).
-          Базы, которые уже обновляются, будут пропущены.
+          Базы, которые уже заняты операцией, будут пропущены.
+        </template>
+        <template v-else-if="isCheck">
+          Сервер проверит наличие файла <span class="magaz-mono">.cf/.cfe/.xml</span> в
+          <span class="magaz-mono">local_update_dir</span> на этой машине.
         </template>
         <template v-else-if="isMerge">
           Слияние выполнит сервер напрямую на этой машине (файл `.cf/.cfe` из
@@ -194,8 +214,8 @@ async function run(): Promise<void> {
           заблокирован.
         </template>
         <template v-else>
-          Задачу выполнит сервер напрямую на этой машине. Пока база обновляется, повторный запуск
-          для неё заблокирован.
+          Обновление БД выполнит сервер напрямую на этой машине. Пока база обновляется,
+          повторный запуск для неё заблокирован.
         </template>
       </p>
     </div>
@@ -203,7 +223,7 @@ async function run(): Promise<void> {
     <template #footer>
       <Button label="Отмена" text size="small" @click="close" />
       <Button
-        :label="isMerge ? 'Запустить слияние' : 'Запустить'"
+        :label="isCheck ? 'Проверить' : isMerge ? 'Запустить слияние' : 'Запустить'"
         size="small"
         :loading="isRunning"
         :disabled="!isFormValid"

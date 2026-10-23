@@ -15,7 +15,7 @@ import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
 import { ApiError } from '@/api/client'
-import { jobsApi, localBasesApi } from '@/api/endpoints'
+import { jobsApi } from '@/api/endpoints'
 import type { JobItem, LocalBaseItem } from '@/api/types'
 import LocalBaseFormDialog from '@/components/LocalBaseFormDialog.vue'
 import LocalBaseUpdateDialog from '@/components/LocalBaseUpdateDialog.vue'
@@ -68,7 +68,7 @@ function lastLocalFor(jobs: JobItem[], localBaseId: number): JobItem | null {
 // Диалог операции локальной базы (Д-24/Д-26); Д-25: массовое обновление
 const updateBase = ref<LocalBaseItem | null>(null)
 const bulkBaseIds = ref<number[]>([])
-const localDialogMode = ref<'merge' | 'update'>('update')
+const localDialogMode = ref<'check' | 'merge' | 'update'>('update')
 const localUpdateVisible = computed({
   get: () => updateBase.value !== null || bulkBaseIds.value.length > 0,
   set: (value: boolean) => {
@@ -104,42 +104,18 @@ function openLocalBulkMerge(): void {
   localDialogMode.value = 'merge'
   localUpdateVisible.value = true
 }
-async function runLocalBulkCheck(): Promise<void> {
+function openLocalBulkCheck(): void {
   if (!localSelected.value.length) return
-  try {
-    const response = await localBasesApi.bulkUpdate({
-      local_base_ids: [...localSelected.value],
-      kind: 'check_files_local',
-      file_name: 'update',
-    })
-    toast.add({
-      severity: 'success',
-      summary: 'Проверка файлов поставлена в очередь',
-      detail: response.message,
-      life: 5000,
-    })
-    void loadJobs()
-  } catch (error) {
-    const message =
-      error instanceof ApiError ? error.message : 'Не удалось поставить проверку файлов'
-    toast.add({ severity: 'error', summary: 'Операция не выполнена', detail: message, life: 6000 })
-  }
+  updateBase.value = null
+  bulkBaseIds.value = [...localSelected.value]
+  localDialogMode.value = 'check'
+  localUpdateVisible.value = true
 }
-async function runLocalCheck(base: LocalBaseItem): Promise<void> {
-  try {
-    const response = await localBasesApi.checkFiles(base.id, { file_name: 'update' })
-    toast.add({
-      severity: 'success',
-      summary: 'Проверка файлов поставлена в очередь',
-      detail: response.message,
-      life: 5000,
-    })
-    void loadJobs()
-  } catch (error) {
-    const message =
-      error instanceof ApiError ? error.message : 'Не удалось поставить проверку файлов'
-    toast.add({ severity: 'error', summary: 'Операция не выполнена', detail: message, life: 6000 })
-  }
+function openLocalCheck(base: LocalBaseItem): void {
+  bulkBaseIds.value = []
+  localDialogMode.value = 'check'
+  updateBase.value = base
+  localUpdateVisible.value = true
 }
 function onLocalUpdateSubmitted(): void {
   void loadJobs()
@@ -240,7 +216,7 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
           size="small"
           :disabled="!localSelected.length"
           data-test="lb-check-selected"
-          @click="runLocalBulkCheck"
+          @click="openLocalBulkCheck"
         />
         <Button
           label="Слияние…"
@@ -354,7 +330,7 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
                   size="small"
                   text
                   :data-test="`lb-check-${base.id}`"
-                  @click="runLocalCheck(base)"
+                  @click="openLocalCheck(base)"
                 />
                 <Button
                   label="Слияние…"

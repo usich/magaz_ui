@@ -175,7 +175,9 @@ describe('страница «Локальные базы»', () => {
     await flushPromises()
 
     expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="lbu-file"]').exists()).toBe(true)
+    // В режиме «Обновить базу» поле имени файла не нужно (файл нужен для слияния/проверки)
+    expect(wrapper.find('[data-test="lbu-file"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="lbu-cf"]').exists()).toBe(true)
     wrapper.unmount()
   })
 
@@ -203,14 +205,13 @@ describe('страница «Локальные базы»', () => {
 
     expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
 
-    await wrapper.find('[data-test="lbu-file"]').setValue('update')
     await wrapper.find('[data-test="lbu-run"]').trigger('click')
     await flushPromises()
 
     expect(bulkBodies).toHaveLength(1)
     expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
       local_base_ids: [2, 3],
-      file_name: 'update',
+      kind: 'run_update_db_local',
       is_fast_update: false,
       is_extension: false,
     })
@@ -224,6 +225,11 @@ describe('страница «Локальные базы»', () => {
     const wrapper = await mountView(fetchMock)
 
     await wrapper.find('[data-test="lb-check-2"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
+    await wrapper.find('[data-test="lbu-file"]').setValue('update')
+    await wrapper.find('[data-test="lbu-run"]').trigger('click')
     await flushPromises()
 
     expect(checkBodies).toHaveLength(1)
@@ -269,6 +275,11 @@ describe('страница «Локальные базы»', () => {
     await flushPromises()
 
     await wrapper.find('[data-test="lb-check-selected"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
+    await wrapper.find('[data-test="lbu-file"]').setValue('update')
+    await wrapper.find('[data-test="lbu-run"]').trigger('click')
     await flushPromises()
 
     expect(bulkBodies).toHaveLength(1)

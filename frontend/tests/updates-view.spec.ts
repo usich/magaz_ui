@@ -299,7 +299,8 @@ describe('страница «Обновление 1С»', () => {
     await flushPromises()
 
     expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="lbu-file"]').exists()).toBe(true)
+    // В режиме «Обновить базу» поле имени файла не нужно (файл нужен для слияния/проверки)
+    expect(wrapper.find('[data-test="lbu-file"]').exists()).toBe(false)
     expect(wrapper.find('[data-test="lbu-cf"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="lbu-cfe"]').exists()).toBe(true)
     wrapper.unmount()
@@ -318,7 +319,6 @@ describe('страница «Обновление 1С»', () => {
     await wrapper.find('[data-test="lb-update-2"]').trigger('click')
     await flushPromises()
 
-    await wrapper.find('[data-test="lbu-file"]').setValue('update')
     await wrapper.find('[data-test="lbu-cfe"]').trigger('click')
     await flushPromises()
 
@@ -327,8 +327,8 @@ describe('страница «Обновление 1С»', () => {
     await flushPromises()
 
     expect(runUpdateBody).toHaveLength(1)
+    // Имя файла обновление БД не требует — в запрос оно не попадает
     expect(JSON.parse(String(runUpdateBody[0]))).toMatchObject({
-      file_name: 'update',
       is_extension: true,
       extension_name: 'БГ_Бухгалтерия',
       is_fast_update: false,
@@ -367,14 +367,13 @@ describe('страница «Обновление 1С»', () => {
 
     expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
 
-    await wrapper.find('[data-test="lbu-file"]').setValue('update')
     await wrapper.find('[data-test="lbu-run"]').trigger('click')
     await flushPromises()
 
     expect(bulkBodies).toHaveLength(1)
     expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
       local_base_ids: [2, 3],
-      file_name: 'update',
+      kind: 'run_update_db_local',
       is_fast_update: false,
       is_extension: false,
     })
@@ -394,6 +393,11 @@ describe('страница «Обновление 1С»', () => {
     await flushPromises()
 
     await wrapper.find('[data-test="lb-check-2"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
+    await wrapper.find('[data-test="lbu-file"]').setValue('update')
+    await wrapper.find('[data-test="lbu-run"]').trigger('click')
     await flushPromises()
 
     expect(checkBodies).toHaveLength(1)
@@ -424,7 +428,7 @@ describe('страница «Обновление 1С»', () => {
     expect(mergeBodies).toHaveLength(1)
     expect(JSON.parse(String(mergeBodies[0]))).toMatchObject({
       file_name: 'update',
-      is_fast_update: false,
+      is_extension: false,
     })
     wrapper.unmount()
   })
@@ -456,6 +460,11 @@ describe('страница «Обновление 1С»', () => {
     await flushPromises()
 
     await wrapper.find('[data-test="updates-local-check-selected"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
+    await wrapper.find('[data-test="lbu-file"]').setValue('update')
+    await wrapper.find('[data-test="lbu-run"]').trigger('click')
     await flushPromises()
 
     expect(bulkBodies).toHaveLength(1)
