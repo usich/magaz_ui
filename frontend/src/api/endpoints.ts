@@ -34,6 +34,10 @@ import type {
   LocalBaseUpdatePayload,
   LocalBulkUpdatePayload,
   LocalBulkUpdateResponse,
+  LocalCheckFilesPayload,
+  LocalCheckFilesResponse,
+  LocalMergePayload,
+  LocalMergeResponse,
   BackupStatus,
   BackupListItem,
   LoginPayload,
@@ -420,6 +424,14 @@ export const localBasesApi = {
   /** Обновить локальную базу 1С (Д-24): поставить задачу `run_update_db_local` в очередь. */
   runUpdate: (id: number, payload: LocalBaseRunUpdatePayload) =>
     api.post<LocalBaseRunUpdateResponse>(`/admin/local-bases/${id}/run-update`, payload),
+
+  /** Проверить файлы обновления локальной базы в `local_update_dir` (Д-26). */
+  checkFiles: (id: number, payload: LocalCheckFilesPayload) =>
+    api.post<LocalCheckFilesResponse>(`/admin/local-bases/${id}/check-files`, payload),
+
+  /** Слияние конфигурации/расширения локальной базы (Д-26): `/MergeCfg` на этой машине. */
+  runMerge: (id: number, payload: LocalMergePayload) =>
+    api.post<LocalMergeResponse>(`/admin/local-bases/${id}/run-merge`, payload),
 
   /** Массовое обновление выбранных локальных баз (Д-25): по задаче на базу. */
   bulkUpdate: (payload: LocalBulkUpdatePayload) =>

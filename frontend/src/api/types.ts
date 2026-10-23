@@ -244,6 +244,32 @@ export interface LocalBaseRunUpdateResponse {
   job: LocalBaseRunUpdateJob
 }
 
+/** Тело `POST /admin/local-bases/{id}/check-files` (Д-26): имя файла для проверки. */
+export interface LocalCheckFilesPayload {
+  file_name?: string
+}
+
+/** Ответ `POST /admin/local-bases/{id}/check-files` (Д-26). */
+export interface LocalCheckFilesResponse {
+  message: string
+  job: LocalBaseRunUpdateJob
+}
+
+/** Тело `POST /admin/local-bases/{id}/run-merge` (Д-26): слияние конфигурации/расширения. */
+export interface LocalMergePayload {
+  file_name?: string
+  full_merge?: boolean
+  is_extension?: boolean | null
+  extension_name?: string | null
+  settings_file_name?: string | null
+}
+
+/** Ответ `POST /admin/local-bases/{id}/run-merge` (Д-26). */
+export interface LocalMergeResponse {
+  message: string
+  job: LocalBaseRunUpdateJob
+}
+
 /** Тело `POST /admin/local-bases/bulk/update` (Д-25): пачка баз + файл и режим. */
 export interface LocalBulkUpdatePayload {
   /** id выбранных локальных баз. */

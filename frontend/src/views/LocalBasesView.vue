@@ -15,7 +15,7 @@ import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
 import { ApiError } from '@/api/client'
-import { jobsApi } from '@/api/endpoints'
+import { jobsApi, localBasesApi } from '@/api/endpoints'
 import type { JobItem, LocalBaseItem } from '@/api/types'
 import LocalBaseFormDialog from '@/components/LocalBaseFormDialog.vue'
 import LocalBaseUpdateDialog from '@/components/LocalBaseUpdateDialog.vue'
@@ -40,14 +40,22 @@ const visibleItems = computed(() => {
   )
 })
 
-// Д-24: операции обновления локальных баз — статус по базе из run_update_db_local
+// Д-24/Д-26: операции локальных баз по видам (обновление / слияние / проверка файлов)
 const localJobs = ref<JobItem[]>([])
+const localMergeJobs = ref<JobItem[]>([])
+const localCheckJobs = ref<JobItem[]>([])
 async function loadJobs(): Promise<void> {
-  const page = await jobsApi.list({ kind: 'run_update_db_local', limit: 200 })
-  localJobs.value = page.items
+  const [update, merge, check] = await Promise.all([
+    jobsApi.list({ kind: 'run_update_db_local', limit: 200 }),
+    jobsApi.list({ kind: 'run_merge_local', limit: 200 }),
+    jobsApi.list({ kind: 'check_files_local', limit: 200 }),
+  ])
+  localJobs.value = update.items
+  localMergeJobs.value = merge.items
+  localCheckJobs.value = check.items
 }
 
-/** Последняя задача обновления по локальной базе (Д-24). */
+/** Последняя задача по локальной базе в заданном списке (Д-24). */
 function lastLocalFor(jobs: JobItem[], localBaseId: number): JobItem | null {
   let best: JobItem | null = null
   for (const job of jobs) {
@@ -57,9 +65,10 @@ function lastLocalFor(jobs: JobItem[], localBaseId: number): JobItem | null {
   return best
 }
 
-// Диалог «Обновить базу» для локальной базы (Д-24); Д-25: массовое обновление
+// Диалог операции локальной базы (Д-24/Д-26); Д-25: массовое обновление
 const updateBase = ref<LocalBaseItem | null>(null)
 const bulkBaseIds = ref<number[]>([])
+const localDialogMode = ref<'merge' | 'update'>('update')
 const localUpdateVisible = computed({
   get: () => updateBase.value !== null || bulkBaseIds.value.length > 0,
   set: (value: boolean) => {
@@ -71,6 +80,13 @@ const localUpdateVisible = computed({
 })
 function openLocalUpdate(base: LocalBaseItem): void {
   bulkBaseIds.value = []
+  localDialogMode.value = 'update'
+  updateBase.value = base
+  localUpdateVisible.value = true
+}
+function openLocalMerge(base: LocalBaseItem): void {
+  bulkBaseIds.value = []
+  localDialogMode.value = 'merge'
   updateBase.value = base
   localUpdateVisible.value = true
 }
@@ -78,7 +94,24 @@ function openLocalBulkUpdate(): void {
   if (!localSelected.value.length) return
   updateBase.value = null
   bulkBaseIds.value = [...localSelected.value]
+  localDialogMode.value = 'update'
   localUpdateVisible.value = true
+}
+async function runLocalCheck(base: LocalBaseItem): Promise<void> {
+  try {
+    const response = await localBasesApi.checkFiles(base.id, { file_name: 'update' })
+    toast.add({
+      severity: 'success',
+      summary: 'Проверка файлов поставлена в очередь',
+      detail: response.message,
+      life: 5000,
+    })
+    void loadJobs()
+  } catch (error) {
+    const message =
+      error instanceof ApiError ? error.message : 'Не удалось поставить проверку файлов'
+    toast.add({ severity: 'error', summary: 'Операция не выполнена', detail: message, life: 6000 })
+  }
 }
 function onLocalUpdateSubmitted(): void {
   void loadJobs()
@@ -211,6 +244,8 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               <th class="py-2 pr-3 font-medium">Пользователь</th>
               <th class="py-2 pr-3 font-medium">Путь к базе</th>
               <th class="py-2 pr-3 font-medium">Бэкап</th>
+              <th class="py-2 pr-3 font-medium">Проверка</th>
+              <th class="py-2 pr-3 font-medium">Слияние</th>
               <th class="py-2 pr-3 font-medium">Обновление</th>
               <th class="py-2 pr-3 text-right font-medium">Действия</th>
             </tr>
@@ -252,12 +287,40 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               </td>
               <td class="py-2 pr-3 whitespace-nowrap">
                 <Tag
+                  :value="stageStatus(lastLocalFor(localCheckJobs, base.id)).label"
+                  :severity="stageStatus(lastLocalFor(localCheckJobs, base.id)).severity"
+                  :data-test="`lb-check-status-${base.id}`"
+                />
+              </td>
+              <td class="py-2 pr-3 whitespace-nowrap">
+                <Tag
+                  :value="stageStatus(lastLocalFor(localMergeJobs, base.id)).label"
+                  :severity="stageStatus(lastLocalFor(localMergeJobs, base.id)).severity"
+                  :data-test="`lb-merge-status-${base.id}`"
+                />
+              </td>
+              <td class="py-2 pr-3 whitespace-nowrap">
+                <Tag
                   :value="stageStatus(lastLocalFor(localJobs, base.id)).label"
                   :severity="stageStatus(lastLocalFor(localJobs, base.id)).severity"
                   :data-test="`lb-status-${base.id}`"
                 />
               </td>
               <td class="py-2 pr-3 text-right whitespace-nowrap">
+                <Button
+                  label="Проверить файлы"
+                  size="small"
+                  text
+                  :data-test="`lb-check-${base.id}`"
+                  @click="runLocalCheck(base)"
+                />
+                <Button
+                  label="Слияние…"
+                  size="small"
+                  text
+                  :data-test="`lb-merge-${base.id}`"
+                  @click="openLocalMerge(base)"
+                />
                 <Button
                   label="Обновить базу"
                   size="small"
@@ -284,7 +347,7 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               </td>
             </tr>
             <tr v-if="!visibleItems.filter((item) => item.group === group).length">
-              <td colspan="9" class="magaz-muted py-4 text-center">Нет баз в этой группе</td>
+              <td colspan="11" class="magaz-muted py-4 text-center">Нет баз в этой группе</td>
             </tr>
           </tbody>
         </table>
@@ -300,6 +363,7 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
       v-model:visible="localUpdateVisible"
       :base="updateBase"
       :bulk-base-ids="bulkBaseIds"
+      :mode="localDialogMode"
       @submitted="onLocalUpdateSubmitted"
     />
   </div>

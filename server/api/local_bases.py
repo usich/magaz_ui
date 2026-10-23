@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from server.core.context import AppContext
 from server.core.dependencies import get_client_ip, get_context, get_db, require_active_admin
-from server.db.models import AdminUser, LocalBase
+from server.db.models import AdminUser, Command, LocalBase
 from server.services import audit_service, backup_service, local_base_service, command_service
 from shared.enums import CommandKind, CommandStatus
 from shared.timeutil import to_iso_z
@@ -607,4 +607,179 @@ def bulk_update_local_bases(
         message=f"Задачи поставлены: {created} из {len(results)} баз",
         total=len(results),
         jobs=results,
+    )
+
+
+#: Локальные виды, меняющие ИБ 1С, — `command_service.LOCAL_IB_KINDS` (Д-26)
+
+
+class LocalCheckFilesRequest(BaseModel):
+    """Тело `POST /local-bases/{id}/check-files`: имя файла для проверки (Д-26)."""
+
+    file_name: str = "update"
+
+
+class LocalMergeRequest(BaseModel):
+    """Тело `POST /local-bases/{id}/run-merge`: слияние конфигурации/расширения (Д-26)."""
+
+    file_name: str = "update"
+    full_merge: bool = False
+    is_extension: bool | None = None
+    extension_name: str | None = None
+    settings_file_name: str | None = None
+
+
+class LocalCheckFilesOut(BaseModel):
+    """Ответ `POST /local-bases/{id}/check-files` (Д-26)."""
+
+    message: str
+    job: LocalUpdateJobOut
+
+
+class LocalMergeOut(BaseModel):
+    """Ответ `POST /local-bases/{id}/run-merge` (Д-26)."""
+
+    message: str
+    job: LocalUpdateJobOut
+
+
+def _run_local_operation(
+    session: Session,
+    row: LocalBase,
+    kind: CommandKind,
+    params: dict[str, object],
+    admin: AdminUser,
+) -> Command:
+    """Создать локальную задачу под `dispatch_guard` (Д-26).
+
+    Для видов, меняющих ИБ 1С (`run_merge_local`, `run_update_db_local`), сначала
+    проверяется запрет R12 «одна база — одно обновление»; проверка файлов не
+    блокируется (файлы в папке ИБ не трогают).
+    """
+    with command_service.dispatch_guard():
+        if str(kind) in command_service.LOCAL_IB_KINDS:
+            busy = command_service.find_local_update_conflict(session, row.id)
+            if busy is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"База «{row.name}» уже обновляется (задача #{busy.id}) — "
+                        "дождитесь завершения операции"
+                    ),
+                )
+        job = command_service.create_local_command(
+            session,
+            local_base_id=row.id,
+            kind=kind,
+            params=params,
+            created_by=admin.username,
+        )
+        session.commit()
+    return job
+
+
+def _local_job_out(job: Command, row: LocalBase) -> LocalUpdateJobOut:
+    """Собрать ответную строку задачи локальной базы (Д-26)."""
+    return LocalUpdateJobOut(
+        id=job.id,
+        local_base_id=row.id,
+        local_base_name=row.name,
+        kind=job.kind,
+        status=job.status,
+        created_at=to_iso_z(job.created_at),
+    )
+
+
+@router.post(
+    "/{base_id}/check-files",
+    response_model=LocalCheckFilesOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Проверить файлы обновления локальной базы 1С (Д-26)",
+)
+def check_files_local_base(
+    base_id: int,
+    payload: LocalCheckFilesRequest,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+) -> LocalCheckFilesOut:
+    """Поставить задачу `check_files_local`: проверить файлы `.cf/.cfe/.xml` (Д-26).
+
+    Аналог «Проверить файлы» у магазина, но файлы смотрятся в `local_update_dir`
+    на этой машине — без сети и без запуска `1cv8.exe`.
+    """
+    from shared.paths import validate_file_name
+
+    row = _get_or_404(session, base_id)
+    file_name = validate_file_name(payload.file_name)
+    job = _run_local_operation(
+        session, row, CommandKind.CHECK_FILES_LOCAL, {"file_name": file_name}, admin
+    )
+    audit_service.record(
+        session,
+        action="local_base_check_files",
+        actor=admin.username,
+        entity="local_base",
+        entity_id=base_id,
+        details={"file_name": file_name, "job_id": job.id},
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    logger.info("Проверка файлов локальной базы id=%s поставлена в очередь (задача #%s)", row.id, job.id)
+    return LocalCheckFilesOut(
+        message=f"Проверка файлов базы «{row.name}» поставлена в очередь",
+        job=_local_job_out(job, row),
+    )
+
+
+@router.post(
+    "/{base_id}/run-merge",
+    response_model=LocalMergeOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Слияние конфигурации локальной базы 1С (Д-26)",
+)
+def run_merge_local_base(
+    base_id: int,
+    payload: LocalMergeRequest,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+) -> LocalMergeOut:
+    """Поставить задачу `run_merge_local`: `/MergeCfg` на этой машине (Д-26).
+
+    Аналог шага «Слияние» у магазина (FR-3/FR-4): файл `.cf/.cfe` в
+    `local_update_dir` сливается в конфигурацию/расширение локальной базы.
+    """
+    from shared.paths import validate_file_name
+
+    row = _get_or_404(session, base_id)
+    params: dict[str, object] = {
+        "file_name": validate_file_name(payload.file_name),
+        "full_merge": payload.full_merge,
+        "is_extension": payload.is_extension,
+    }
+    if payload.extension_name:
+        params["extension_name"] = payload.extension_name
+    if payload.settings_file_name:
+        params["settings_file_name"] = validate_file_name(payload.settings_file_name)
+    job = _run_local_operation(session, row, CommandKind.RUN_MERGE_LOCAL, params, admin)
+    audit_service.record(
+        session,
+        action="local_base_run_merge",
+        actor=admin.username,
+        entity="local_base",
+        entity_id=base_id,
+        details={
+            "file_name": payload.file_name,
+            "full_merge": payload.full_merge,
+            "is_extension": params.get("is_extension"),
+            "job_id": job.id,
+        },
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    logger.info("Слияние локальной базы id=%s поставлено в очередь (задача #%s)", row.id, job.id)
+    return LocalMergeOut(
+        message=f"Слияние базы «{row.name}» поставлено в очередь",
+        job=_local_job_out(job, row),
     )

@@ -24,19 +24,31 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from client.agent.one_c import OneCPaths, build_update_db_command, log_text_is_effectively_empty
+from client.agent.one_c import (
+    OneCPaths,
+    build_merge_command,
+    build_update_db_command,
+    log_text_is_effectively_empty,
+)
 from client.agent.processes import DEFAULT_PROVIDER, ProcessProvider, SubprocessProvider
 from server.config import Settings
 from server.core.security import SecretBox
 from server.db.models import Command, LocalBase
 from server.db.session import DatabaseManager
 from server.services import command_service, settings_service
-from shared.enums import CommandStatus
-from shared.schemas import UpdateParams
+from shared.enums import CommandKind, CommandStatus
+from shared.schemas import MergeParams, UpdateParams
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["LocalUpdateMonitor", "build_update_params", "update_db_cycle"]
+__all__ = [
+    "LocalUpdateMonitor",
+    "build_update_params",
+    "build_merge_params",
+    "check_files_cycle",
+    "merge_cycle",
+    "update_db_cycle",
+]
 
 STOP_TIMEOUT_SEC = 10
 INTERVAL_SETTING = "local_update_interval_sec"
@@ -45,6 +57,8 @@ CONCURRENCY_SETTING = "local_update_concurrency"
 
 #: Сообщение успеха обновления БД (перенос v2, §7.1 «менять нельзя»)
 SUCCESS_UPDATE_MSG = "Обновление конфигурации успешно завершено"
+#: Сообщение успеха слияния (перенос v2, §7.1 «менять нельзя»)
+SUCCESS_MERGE_MSG = "Объединение конфигураций успешно завершено"
 
 
 def build_update_params(base: LocalBase, params: dict[str, Any] | None, *, password: str) -> UpdateParams:
@@ -66,6 +80,80 @@ def build_update_params(base: LocalBase, params: dict[str, Any] | None, *, passw
         extension_name=(params.get("extension_name") or base.extension_name) or None,
         is_extension=params.get("is_extension"),
     )
+
+def build_merge_params(base: LocalBase, params: dict[str, Any] | None, *, password: str) -> MergeParams:
+    """Собрать параметры слияния конфигурации/расширения локальной базы (Д-26).
+
+    Реквизиты — из карточки локальной базы, пароль расшифровывается SecretBox-ом
+    и в `commands.params` не хранится (I-7). Тип слияния (`is_extension`) и имя
+    файла — из `command.params`.
+    """
+    params = params or {}
+    return MergeParams(
+        server_name=base.cluster_name,
+        base_name=base.database_name,
+        version_1c=base.version_1c,
+        user_name=base.user_name_1c,
+        password=password,
+        file_name=str(params.get("file_name") or "update"),
+        full_merge=bool(params.get("full_merge")),
+        extension_name=(params.get("extension_name") or base.extension_name) or None,
+        is_extension=params.get("is_extension"),
+        settings_file_name=params.get("settings_file_name"),
+    )
+
+
+async def merge_cycle(
+    up: MergeParams,
+    paths: OneCPaths,
+    *,
+    provider: ProcessProvider,
+) -> tuple[CommandStatus, str]:
+    """Выполнить слияние конфигурации/расширения локальной базы (Д-26, FR-3/FR-4).
+
+    Одна команда `/MergeCfg <файл> [-Extension <имя>] -force -Settings <файл>.xml`
+    (аналог шага «слияние» у магазина). Итог — по содержимому лога слияния (I-4).
+    """
+    from client.agent import one_c  # локально: импорт хелперов не тормозит старт
+
+    log_path = paths.merge_log(up.extension_name)
+    await one_c.clear_log_file(log_path)
+    args = build_merge_command(up, log_path, paths)
+    await one_c.run_1c_command(args, paths.log_executor, provider=provider)
+
+    state, message = await one_c.check_log_file(log_path, SUCCESS_MERGE_MSG)
+    if state == one_c.LOG_STATE_SUCCESS:
+        return CommandStatus.SUCCESS, SUCCESS_MERGE_MSG
+    if state == one_c.LOG_STATE_FAILED:
+        tail = (message or "")[-500:]
+        return CommandStatus.FAILED, f"Слияние локальной базы не выполнено: {tail}"
+    if state == one_c.LOG_STATE_NOT_FOUND:
+        return CommandStatus.FAILED, "Лог слияния не создан — запуск 1С не состоялся"
+    return CommandStatus.ERROR, f"Слияние не завершилось: {message}"
+
+
+def check_files_cycle(base: LocalBase, file_name: str, paths: OneCPaths) -> tuple[CommandStatus, str]:
+    """Проверить наличие файлов обновления локальной базы в `local_update_dir` (Д-26).
+
+    Аналог `/check-files` магазина, но без сети: файлы `.cf/.cfe/.xml` смотрятся
+    прямо в рабочей папке сервера. Не требует запуска `1cv8.exe`.
+    """
+    from client.agent import one_c
+
+    stem = one_c.split_merge_file_name(file_name)[0]
+    names: dict[str, str] = {
+        ".cf": f"{stem}.cf",
+        ".cfe": f"{stem}.cfe",
+        ".xml": f"{stem}.xml",
+    }
+    found: list[str] = []
+    for suffix, name in names.items():
+        if paths.update_file(stem, suffix).is_file():
+            found.append(name)
+    if found:
+        return CommandStatus.SUCCESS, f"Файлы «{stem}» найдены: {', '.join(found)}"
+    return CommandStatus.FAILED, f"Файлы «{stem}» не найдены в {paths.work_dir}"
+
 
 async def update_db_cycle(
     up: UpdateParams,
@@ -194,7 +282,11 @@ class LocalUpdateMonitor:
         return len(command_ids)
 
     async def _run_one(self, command_id: int, paths: OneCPaths) -> None:
-        """Выполнить одну локальную задачу по её id в собственной сессии."""
+        """Выполнить одну локальную задачу по её id в собственной сессии (Д-26).
+
+        Вид задачи решает, что делать: проверка файлов (`check_files_local`),
+        слияние (`run_merge_local`) или обновление БД (`run_update_db_local`).
+        """
         with self._db.session() as session:
             command = command_service.get_command(session, command_id)
             if command is None:
@@ -207,21 +299,40 @@ class LocalUpdateMonitor:
                 return
 
             password = self._secret_box.decrypt(base.password_enc) if base.password_enc else ""
-            up = build_update_params(base, command.params, password=password)
             # RUNNING: `set_status` проставит `started_at`, чтобы UI видел «идёт N сек»
             command_service.set_status(session, command, CommandStatus.RUNNING)
-            command_service.add_log(session, command, f"Запуск обновления локальной базы «{base.name}»")
+            command_service.add_log(session, command, f"Запуск {self._label(command)} «{base.name}»")
             # Коммитим статус до долгой операции 1С — UI успевает показать прогресс
             session.commit()
-            status, message = await update_db_cycle(
-                up, paths, provider=self._provider, log_update=paths.log_update_db
-            )
+
+            if command.kind == str(CommandKind.CHECK_FILES_LOCAL):
+                file_name = str((command.params or {}).get("file_name") or "update")
+                status, message = check_files_cycle(base, file_name, paths)
+            elif command.kind == str(CommandKind.RUN_MERGE_LOCAL):
+                up = build_merge_params(base, command.params, password=password)
+                status, message = await merge_cycle(up, paths, provider=self._provider)
+            else:
+                up = build_update_params(base, command.params, password=password)
+                status, message = await update_db_cycle(
+                    up, paths, provider=self._provider, log_update=paths.log_update_db
+                )
+
             if status == CommandStatus.SUCCESS:
                 command_service.add_log(session, command, message)
             else:
                 command_service.add_log(session, command, message, level="error")
             command_service.set_status(session, command, status)
             session.commit()
+
+    @staticmethod
+    def _label(command: Command) -> str:
+        """Человекочитаемое название задачи для журнала (Д-26)."""
+        labels = {
+            str(CommandKind.CHECK_FILES_LOCAL): "проверку файлов локальной базы",
+            str(CommandKind.RUN_MERGE_LOCAL): "слияние конфигурации локальной базы",
+            str(CommandKind.RUN_UPDATE_DB_LOCAL): "обновление локальной базы",
+        }
+        return labels.get(command.kind, f"задачу {command.kind}")
 
     async def run(self) -> None:
         await asyncio.sleep(max(0.0, float(self._settings.local_updater_startup_delay_sec)))

@@ -44,6 +44,7 @@ __all__ = [
     "ACTIVE_STATUSES",
     "FINISHED_STATUSES",
     "KIND_LABELS",
+    "LOCAL_IB_KINDS",
     "LOCAL_UPDATE_KIND",
     "UPDATE_KINDS",
     "UpdateConflict",
@@ -108,11 +109,20 @@ UPDATE_KINDS: tuple[str, ...] = (str(CommandKind.RUN_MERGE), str(CommandKind.RUN
 #: `find_local_update_conflict()` — одну локальную базу обновляет одна задача.
 LOCAL_UPDATE_KIND: str = str(CommandKind.RUN_UPDATE_DB_LOCAL)
 
+#: Локальные виды, меняющие ИБ 1С (Д-26): на них действует запрет R12
+#: «одна база — одно обновление» (`run_merge_local`, `run_update_db_local`).
+LOCAL_IB_KINDS: tuple[str, ...] = (
+    str(CommandKind.RUN_MERGE_LOCAL),
+    str(CommandKind.RUN_UPDATE_DB_LOCAL),
+)
+
 #: Человекочитаемые названия операций обновления — для текстов конфликтов R12
 KIND_LABELS: dict[str, str] = {
     str(CommandKind.RUN_MERGE): "слияние конфигурации",
     str(CommandKind.RUN_UPDATE_DB): "обновление конфигурации БД",
     LOCAL_UPDATE_KIND: "обновление локальной базы",
+    str(CommandKind.CHECK_FILES_LOCAL): "проверка файлов локальной базы",
+    str(CommandKind.RUN_MERGE_LOCAL): "слияние конфигурации локальной базы",
 }
 
 #: Замок критического участка «проверка R12 → создание задач» (FR-28, §14.1)
@@ -640,18 +650,20 @@ def dispatch_guard() -> Iterator[None]:
 
 
 def find_local_update_conflict(session: Session, local_base_id: int) -> Command | None:
-    """Вернуть активную задачу обновления той же **локальной** базы, если есть (Д-24).
+    """Вернуть активную задачу, меняющую ИБ той же **локальной** базы, если есть (Д-24/Д-26).
 
     Аналог R12 для магазинов, но без «общей серверной ИБ»: локальная база — одна
     на машину, поэтому достаточно запрета «одна база — одно обновление». Активной
-    считается задача `run_update_db_local` в статусе `queued`/`running`. Вызывается
-    под `dispatch_guard()`, чтобы два администратора не проскочили запрет.
+    считается любая локальная задача, меняющая ИБ (`run_merge_local`,
+    `run_update_db_local`), в статусе `queued`/`running`. Проверка файлов не
+    блокируется — файлы в папке ИБ не трогают. Вызывается под `dispatch_guard()`,
+    чтобы два администратора не проскочили запрет.
     """
     stmt = (
         select(Command)
         .where(
             Command.local_base_id == local_base_id,
-            Command.kind == LOCAL_UPDATE_KIND,
+            Command.kind.in_(list(LOCAL_IB_KINDS)),
             Command.status.in_(ACTIVE_STATUSES),
         )
         .order_by(Command.id)

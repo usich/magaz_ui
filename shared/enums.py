@@ -44,6 +44,10 @@ class CommandKind(StrEnum):
     #: Д-24: обновление **локальной** базы 1С напрямую на машине дашборда
     #: (без агента) — выполняет LocalUpdateMonitor, а не диспетчер
     RUN_UPDATE_DB_LOCAL = "run_update_db_local"
+    #: Д-26: проверка файлов обновления **локальной** базы в `local_update_dir`
+    CHECK_FILES_LOCAL = "check_files_local"
+    #: Д-26: слияние конфигурации/расширения **локальной** базы на машине дашборда
+    RUN_MERGE_LOCAL = "run_merge_local"
 
 
 class CommandStatus(StrEnum):

@@ -56,6 +56,11 @@ class TestEnumValues:
             "notify_cancel",
             #: Э10: удаление файлов обновления на кассе
             "delete_file",
+            #: Д-24: обновление локальной базы
+            "run_update_db_local",
+            #: Д-26: проверка файлов и слияние локальной базы
+            "check_files_local",
+            "run_merge_local",
         }
 
     def test_command_statuses_match_spec(self) -> None:

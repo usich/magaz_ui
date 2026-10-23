@@ -26,8 +26,10 @@ const props = withDefaults(
     base?: LocalBaseItem | null
     /** Массовый режим (Д-25): обновить эти базы одним запуском (без карточки `base`). */
     bulkBaseIds?: number[]
+    /** Режим операции (Д-26): слияние `/MergeCfg` или обновление БД `/UpdateDBCfg`. */
+    mode?: 'merge' | 'update'
   }>(),
-  { base: null, bulkBaseIds: () => [] },
+  { base: null, bulkBaseIds: () => [], mode: 'update' },
 )
 
 const emit = defineEmits<{
@@ -49,11 +51,12 @@ const isRunning = ref(false)
 const formError = ref('')
 
 const isBulk = computed(() => props.bulkBaseIds.length > 0)
-const dialogTitle = computed(() =>
-  isBulk.value
-    ? `Обновление баз (выбрано: ${props.bulkBaseIds.length})`
-    : `Обновление базы «${props.base?.name ?? ''}»`,
-)
+const isMerge = computed(() => props.mode === 'merge')
+const dialogTitle = computed(() => {
+  if (isBulk.value) return `Обновление баз (выбрано: ${props.bulkBaseIds.length})`
+  if (isMerge.value) return `Слияние базы «${props.base?.name ?? ''}»`
+  return `Обновление базы «${props.base?.name ?? ''}»`
+})
 const isFormValid = computed(() => Boolean(form.file_name.trim()))
 
 function reset(): void {
@@ -99,6 +102,14 @@ async function run(): Promise<void> {
       toast.add({
         severity: 'success',
         summary: 'Обновление поставлено в очередь',
+        detail: response.message,
+        life: 5000,
+      })
+    } else if (isMerge.value) {
+      const response = await localBasesApi.runMerge(props.base!.id, payload)
+      toast.add({
+        severity: 'success',
+        summary: 'Слияние поставлено в очередь',
         detail: response.message,
         life: 5000,
       })
@@ -160,7 +171,7 @@ async function run(): Promise<void> {
         <InputText v-model="form.extension_name" class="w-full" placeholder="БГ_Бухгалтерия" data-test="lbu-extension" />
       </label>
 
-      <label class="flex items-center gap-2 text-sm">
+      <label v-if="!isMerge" class="flex items-center gap-2 text-sm">
         <Checkbox v-model="form.is_fast_update" binary />
         <span>Быстрое обновление (без завершения сеансов)</span>
       </label>
@@ -174,6 +185,11 @@ async function run(): Promise<void> {
           настраивается в «Настройках» (`local_update_concurrency`, по умолчанию 5).
           Базы, которые уже обновляются, будут пропущены.
         </template>
+        <template v-else-if="isMerge">
+          Слияние выполнит сервер напрямую на этой машине (файл `.cf/.cfe` из
+          `local_update_dir`). Пока база занята операцией, повторный запуск для неё
+          заблокирован.
+        </template>
         <template v-else>
           Задачу выполнит сервер напрямую на этой машине. Пока база обновляется, повторный запуск
           для неё заблокирован.
@@ -184,7 +200,7 @@ async function run(): Promise<void> {
     <template #footer>
       <Button label="Отмена" text size="small" @click="close" />
       <Button
-        label="Запустить"
+        :label="isMerge ? 'Запустить слияние' : 'Запустить'"
         size="small"
         :loading="isRunning"
         :disabled="!isFormValid"

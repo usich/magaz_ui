@@ -62,10 +62,34 @@ function apiMock(
   recent: unknown[],
   localBases: unknown[] = [],
   localJobs: unknown[] = [],
+  localMergeJobs: unknown[] = [],
+  localCheckJobs: unknown[] = [],
   onRunUpdate?: (body: unknown) => void,
   onBulkUpdate?: (body: unknown) => void,
+  onCheckFiles?: (body: unknown) => void,
+  onRunMerge?: (body: unknown) => void,
 ) {
   return async (url: string, init: RequestInit = {}): Promise<Response> => {
+    if (init.method === 'POST' && url.includes('/check-files')) {
+      onCheckFiles?.(init.body)
+      return jsonResponse(
+        {
+          message: 'Проверка файлов базы поставлена в очередь',
+          job: { id: 12, local_base_id: 2, local_base_name: 'Бухгалтерия', kind: 'check_files_local', status: 'queued', created_at: '2026-10-13T10:00:00Z' },
+        },
+        202,
+      )
+    }
+    if (init.method === 'POST' && url.includes('/run-merge')) {
+      onRunMerge?.(init.body)
+      return jsonResponse(
+        {
+          message: 'Слияние базы поставлено в очередь',
+          job: { id: 13, local_base_id: 2, local_base_name: 'Бухгалтерия', kind: 'run_merge_local', status: 'queued', created_at: '2026-10-13T10:00:00Z' },
+        },
+        202,
+      )
+    }
     if (init.method === 'POST' && url.includes('/bulk/update')) {
       onBulkUpdate?.(init.body)
       return jsonResponse(
@@ -94,8 +118,10 @@ function apiMock(
     if (url.includes('/admin/local-bases')) return jsonResponse(localBases)
     if (url.includes('/admin/files/matrix')) return jsonResponse({ rows, total: rows.length, present: 1, missing: 0 })
     if (url.includes('/admin/jobs')) {
-      if (url.includes('kind=run_merge')) return jsonResponse({ items: merge, counts: {}, total: 0, active: 0 })
+      if (url.includes('kind=run_merge_local')) return jsonResponse({ items: localMergeJobs, counts: {}, total: 0, active: 0 })
+      if (url.includes('kind=check_files_local')) return jsonResponse({ items: localCheckJobs, counts: {}, total: 0, active: 0 })
       if (url.includes('kind=run_update_db_local')) return jsonResponse({ items: localJobs, counts: {}, total: 0, active: 0 })
+      if (url.includes('kind=run_merge')) return jsonResponse({ items: merge, counts: {}, total: 0, active: 0 })
       if (url.includes('kind=run_update_db')) return jsonResponse({ items: upd, counts: {}, total: 0, active: 0 })
       return jsonResponse({ items: recent, counts: {}, total: 0, active: 0 })
     }
@@ -282,7 +308,7 @@ describe('страница «Обновление 1С»', () => {
   it('вкладка «Локальные базы»: запуск шлёт POST .../run-update (Д-24)', async () => {
     const runUpdateBody: unknown[] = []
     fetchMock.mockImplementation(
-      apiMock([], [], [], [], [], [makeLocalBase()], [], (body) => runUpdateBody.push(body)),
+      apiMock([], [], [], [], [], [makeLocalBase()], [], [], [], (body) => runUpdateBody.push(body)),
     )
 
     const wrapper = await mountUpdates(fetchMock)
@@ -321,6 +347,8 @@ describe('страница «Обновление 1С»', () => {
         [],
         [makeLocalBase(), makeLocalBase({ id: 3, name: 'Торговля', database_name: 'trade', group: 'Продажи' })],
         [],
+        [],
+        [],
         undefined,
         (body) => bulkBodies.push(body),
       ),
@@ -349,6 +377,54 @@ describe('страница «Обновление 1С»', () => {
       file_name: 'update',
       is_fast_update: false,
       is_extension: false,
+    })
+    wrapper.unmount()
+  })
+
+  it('вкладка «Локальные базы»: «Проверить файлы» шлёт POST .../check-files (Д-26)', async () => {
+    const checkBodies: unknown[] = []
+    fetchMock.mockImplementation(
+      apiMock([], [], [], [], [], [makeLocalBase()], [], [], [], undefined, undefined, (body) =>
+        checkBodies.push(body),
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('[data-test="lb-check-2"]').trigger('click')
+    await flushPromises()
+
+    expect(checkBodies).toHaveLength(1)
+    expect(JSON.parse(String(checkBodies[0]))).toMatchObject({ file_name: 'update' })
+    wrapper.unmount()
+  })
+
+  it('вкладка «Локальные базы»: «Слияние…» открывает диалог и шлёт POST .../run-merge (Д-26)', async () => {
+    const mergeBodies: unknown[] = []
+    fetchMock.mockImplementation(
+      apiMock([], [], [], [], [], [makeLocalBase()], [], [], [], undefined, undefined, undefined, (body) =>
+        mergeBodies.push(body),
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('[data-test="lb-merge-2"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
+    await wrapper.find('[data-test="lbu-file"]').setValue('update')
+    await wrapper.find('[data-test="lbu-run"]').trigger('click')
+    await flushPromises()
+
+    expect(mergeBodies).toHaveLength(1)
+    expect(JSON.parse(String(mergeBodies[0]))).toMatchObject({
+      file_name: 'update',
+      is_fast_update: false,
     })
     wrapper.unmount()
   })

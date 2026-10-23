@@ -58,15 +58,16 @@ def add_local_base(session: Session, secret_box, **overrides) -> LocalBase:
 
 
 class _FakeProvider:
-    """Провайдер, имитирующий 1С: пишет в лог обновления нужный текст и выходит."""
+    """Провайдер, имитирующий 1С: пишет в лог операции нужный текст и выходит."""
 
-    def __init__(self, work_dir: Path, text: str) -> None:
+    def __init__(self, work_dir: Path, text: str, log_name: str = "log-update-db.txt") -> None:
         self.work_dir = Path(work_dir)
         self.text = text
+        self.log_name = log_name
 
     async def run_captured(self, args, *, log_path=None, timeout=None):  # noqa: ANN001
-        # 1С пишет итог в лог `/Out` (log-update-db.txt) — имитируем это:
-        target = self.work_dir / "log-update-db.txt"
+        # 1С пишет итог в лог `/Out` (log-update-db.txt / log-merge.txt) — имитируем:
+        target = self.work_dir / self.log_name
         target.write_text(self.text, encoding="utf-8")
         return 0
 
@@ -318,5 +319,134 @@ def test_monitor_poll_once_runs_multiple_concurrently(tmp_path, secret_box) -> N
         with manager.session() as session:
             assert command_service.get_command(session, c1_id).status == "success"
             assert command_service.get_command(session, c2_id).status == "success"
+    finally:
+        engine.dispose()
+
+
+
+def test_check_files_local_creates_job(auth_client: TestClient) -> None:
+    """`POST .../check-files` ставит задачу `check_files_local` (Д-26)."""
+    base = auth_client.post(BASE_URL, json=make_payload()).json()
+    response = auth_client.post(
+        f"{BASE_URL}/{base['id']}/check-files", json={"file_name": "update"}
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["job"]["kind"] == "check_files_local"
+    assert body["job"]["local_base_id"] == base["id"]
+    assert body["job"]["status"] == "queued"
+
+
+def test_run_merge_local_creates_job(auth_client: TestClient) -> None:
+    """`POST .../run-merge` ставит задачу `run_merge_local` (Д-26)."""
+    base = auth_client.post(BASE_URL, json=make_payload()).json()
+    response = auth_client.post(
+        f"{BASE_URL}/{base['id']}/run-merge", json={"file_name": "update"}
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["job"]["kind"] == "run_merge_local"
+    assert body["job"]["local_base_id"] == base["id"]
+    assert body["job"]["status"] == "queued"
+
+
+def test_run_merge_local_conflict_is_409(auth_client: TestClient) -> None:
+    """Повторный merge/update при активной задаче той же базы — `409` (Д-26)."""
+    base = auth_client.post(BASE_URL, json=make_payload()).json()
+    auth_client.post(f"{BASE_URL}/{base['id']}/run-merge", json={"file_name": "update"})
+    second = auth_client.post(f"{BASE_URL}/{base['id']}/run-merge", json={"file_name": "update"})
+    assert second.status_code == 409
+    assert "уже обновляется" in second.text
+
+
+def test_check_files_cycle_found(tmp_path) -> None:
+    """`check_files_cycle` находит `.cf`/`.cfe` в рабочей папке (Д-26)."""
+    from server.core.local_updater import check_files_cycle
+    from server.db.models import LocalBase
+
+    (tmp_path / "update.cf").write_text("x", encoding="utf-8")
+    (tmp_path / "update.xml").write_text("y", encoding="utf-8")
+    base = LocalBase(
+        name="Бухгалтерия", version_1c="8.3.24.1548", cluster_name="srv-1c",
+        database_name="buh", user_name_1c="Администратор", group="Финансы",
+    )
+    paths = OneCPaths(work_dir=tmp_path, base_1c_path=tmp_path / "1c")
+    status, message = check_files_cycle(base, "update", paths)
+    assert status == CommandStatus.SUCCESS
+    assert "update.cf" in message
+
+
+def test_check_files_cycle_missing(tmp_path) -> None:
+    """`check_files_cycle` сообщает, если файлов нет (Д-26)."""
+    from server.core.local_updater import check_files_cycle
+    from server.db.models import LocalBase
+
+    base = LocalBase(
+        name="Бухгалтерия", version_1c="8.3.24.1548", cluster_name="srv-1c",
+        database_name="buh", user_name_1c="Администратор", group="Финансы",
+    )
+    paths = OneCPaths(work_dir=tmp_path, base_1c_path=tmp_path / "1c")
+    status, message = check_files_cycle(base, "update", paths)
+    assert status == CommandStatus.FAILED
+    assert "не найдены" in message
+
+
+async def test_merge_cycle_success(tmp_path) -> None:
+    """Слияние по логу успеха закрывает задачу `success` (Д-26)."""
+    from server.core.local_updater import build_merge_params, merge_cycle
+    from server.db.models import LocalBase
+
+    base = LocalBase(
+        name="Бухгалтерия", version_1c="8.3.24.1548", cluster_name="srv-1c",
+        database_name="buh", user_name_1c="Администратор", group="Финансы",
+    )
+    up = build_merge_params(base, {"file_name": "update", "is_extension": False}, password="p")
+    paths = OneCPaths(work_dir=tmp_path, base_1c_path=tmp_path / "1c")
+    provider = _FakeProvider(
+        tmp_path, "Объединение конфигураций успешно завершено", log_name="log-merge.txt"
+    )
+    status, _message = await merge_cycle(up, paths, provider=provider)
+    assert status == CommandStatus.SUCCESS
+
+
+def test_monitor_poll_once_runs_merge_local(tmp_path, secret_box) -> None:
+    """LocalUpdateMonitor исполняет локальную merge-задачу (Д-26)."""
+    from server.core.local_updater import LocalUpdateMonitor
+    from server.db.base import Base
+    from server.db.session import DatabaseManager, create_db_engine
+
+    db_url = f"sqlite:///{(tmp_path / 'm3.db').as_posix()}"
+    engine = create_db_engine(db_url)
+    Base.metadata.create_all(engine)
+    manager = DatabaseManager(db_url)
+    try:
+        with manager.session() as session:
+            base = add_local_base(session, secret_box)
+            cmd = command_service.create_local_command(
+                session,
+                local_base_id=base.id,
+                kind=CommandKind.RUN_MERGE_LOCAL,
+                params={"file_name": "update", "is_extension": False},
+                created_by="admin",
+            )
+            session.commit()
+            cmd_id = cmd.id
+
+        settings = SimpleNamespace(
+            local_1c_path=str(tmp_path / "1c"),
+            local_update_dir=tmp_path,
+            local_updater_startup_delay_sec=0,
+            local_updater_interval_sec=5,
+        )
+        provider = _FakeProvider(
+            tmp_path, "Объединение конфигураций успешно завершено", log_name="log-merge.txt"
+        )
+        monitor = LocalUpdateMonitor(
+            manager, settings, secret_box=secret_box, provider=provider, concurrency_override=1
+        )
+        processed = asyncio.run(monitor.poll_once())
+        assert processed == 1
+        with manager.session() as session:
+            assert command_service.get_command(session, cmd_id).status == "success"
     finally:
         engine.dispose()

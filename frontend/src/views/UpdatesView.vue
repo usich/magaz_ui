@@ -10,8 +10,9 @@ import RadioButton from 'primevue/radiobutton'
 import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
+import { ApiError } from '@/api/client'
 import { dispatchAction, type ActionOutcome } from '@/api/actions'
-import { jobsApi } from '@/api/endpoints'
+import { jobsApi, localBasesApi } from '@/api/endpoints'
 import type { JobItem, LocalBaseItem } from '@/api/types'
 import OperationPanel from '@/components/OperationPanel.vue'
 import StatusTile from '@/components/StatusTile.vue'
@@ -66,31 +67,38 @@ function toggleAll(): void {
 const mergeJobs = ref<JobItem[]>([])
 const updateJobs = ref<JobItem[]>([])
 const recentJobs = ref<JobItem[]>([])
-// Д-24: операции обновления локальных баз (run_update_db_local)
+// Д-24/Д-26: операции локальных баз по видам (обновление / слияние / проверка файлов)
 const localJobs = ref<JobItem[]>([])
+const localMergeJobs = ref<JobItem[]>([])
+const localCheckJobs = ref<JobItem[]>([])
 const jobsLoading = ref(false)
 
 async function loadJobs(): Promise<void> {
   jobsLoading.value = true
   try {
-    const [merge, update, recent, local] = await Promise.all([
+    const [merge, update, recent, local, localMerge, localCheck] = await Promise.all([
       jobsApi.list({ kind: 'run_merge', limit: 200 }),
       jobsApi.list({ kind: 'run_update_db', limit: 200 }),
       jobsApi.list({ kind: '', limit: 40 }),
       jobsApi.list({ kind: 'run_update_db_local', limit: 200 }),
+      jobsApi.list({ kind: 'run_merge_local', limit: 200 }),
+      jobsApi.list({ kind: 'check_files_local', limit: 200 }),
     ])
     mergeJobs.value = merge.items
     updateJobs.value = update.items
     recentJobs.value = recent.items
     localJobs.value = local.items
+    localMergeJobs.value = localMerge.items
+    localCheckJobs.value = localCheck.items
   } finally {
     jobsLoading.value = false
   }
 }
 
-// Д-24: диалог «Обновить базу» для локальной базы; Д-25: массовое обновление.
+// Д-24/Д-26: диалог операции локальной базы (merge/update), Д-25: массовое обновление.
 const updateBase = ref<LocalBaseItem | null>(null)
 const bulkBaseIds = ref<number[]>([])
+const localDialogMode = ref<'merge' | 'update'>('update')
 const localUpdateVisible = computed({
   get: () => updateBase.value !== null || bulkBaseIds.value.length > 0,
   set: (value: boolean) => {
@@ -102,6 +110,13 @@ const localUpdateVisible = computed({
 })
 function openLocalUpdate(base: LocalBaseItem): void {
   bulkBaseIds.value = []
+  localDialogMode.value = 'update'
+  updateBase.value = base
+  localUpdateVisible.value = true
+}
+function openLocalMerge(base: LocalBaseItem): void {
+  bulkBaseIds.value = []
+  localDialogMode.value = 'merge'
   updateBase.value = base
   localUpdateVisible.value = true
 }
@@ -109,7 +124,24 @@ function openLocalBulkUpdate(): void {
   if (!localSelected.value.length) return
   updateBase.value = null
   bulkBaseIds.value = [...localSelected.value]
+  localDialogMode.value = 'update'
   localUpdateVisible.value = true
+}
+async function runLocalCheck(base: LocalBaseItem): Promise<void> {
+  try {
+    const response = await localBasesApi.checkFiles(base.id, { file_name: 'update' })
+    toast.add({
+      severity: 'success',
+      summary: 'Проверка файлов поставлена в очередь',
+      detail: response.message,
+      life: 5000,
+    })
+    void loadJobs()
+  } catch (error) {
+    const message =
+      error instanceof ApiError ? error.message : 'Не удалось поставить проверку файлов'
+    toast.add({ severity: 'error', summary: 'Операция не выполнена', detail: message, life: 6000 })
+  }
 }
 function onLocalUpdateSubmitted(): void {
   void loadJobs()
@@ -536,8 +568,10 @@ onUnmounted(() => {
       </div>
       <p class="magaz-muted max-w-2xl text-sm">
         Базы 1С на этой машине. Группируются по полю «Группа»: одинаковое значение
-        (например «Бухгалтерия») собирает базы в одну секцию. Обновление — следующий этап
-        (выбор файла <span class="magaz-mono">.cf/.cfe</span> и та же цепочка команд в cmd).
+        (например «Бухгалтерия») собирает базы в одну секцию. Конвейер как у магазинов:
+        сначала «Проверить файлы» (файл <span class="magaz-mono">.cf/.cfe</span> в
+        <span class="magaz-mono">local_update_dir</span>), затем «Слияние…», затем
+        «Обновить базу».
       </p>
 
       <template v-if="localBases.groups.length">
@@ -560,6 +594,8 @@ onUnmounted(() => {
                 <th class="py-2 pr-3 font-medium">Пользователь 1С</th>
                 <th class="py-2 pr-3 font-medium">Путь к базе</th>
                 <th class="py-2 pr-3 font-medium">Расширение</th>
+                <th class="py-2 pr-3 font-medium">Проверка</th>
+                <th class="py-2 pr-3 font-medium">Слияние</th>
                 <th class="py-2 pr-3 font-medium">Обновление</th>
                 <th class="py-2 pr-3 text-right font-medium">Действия</th>
               </tr>
@@ -605,15 +641,40 @@ onUnmounted(() => {
                 </td>
                 <td class="py-2 pr-3 whitespace-nowrap">
                   <Tag
+                    :value="stageStatus(lastLocalFor(localCheckJobs, base.id)).label"
+                    :severity="stageStatus(lastLocalFor(localCheckJobs, base.id)).severity"
+                    :data-test="`lb-check-status-${base.id}`"
+                  />
+                </td>
+                <td class="py-2 pr-3 whitespace-nowrap">
+                  <Tag
+                    :value="stageStatus(lastLocalFor(localMergeJobs, base.id)).label"
+                    :severity="stageStatus(lastLocalFor(localMergeJobs, base.id)).severity"
+                    :data-test="`lb-merge-status-${base.id}`"
+                  />
+                </td>
+                <td class="py-2 pr-3 whitespace-nowrap">
+                  <Tag
                     :value="stageStatus(lastLocalFor(localJobs, base.id)).label"
                     :severity="stageStatus(lastLocalFor(localJobs, base.id)).severity"
                     :data-test="`lb-status-${base.id}`"
                   />
-                  <div v-if="lastLocalFor(localJobs, base.id)?.status === 'success'" class="magaz-muted text-xs">
-                    {{ lastOkAt(lastLocalFor(localJobs, base.id)) }}
-                  </div>
                 </td>
                 <td class="py-2 pr-3 text-right whitespace-nowrap">
+                  <Button
+                    label="Проверить файлы"
+                    size="small"
+                    text
+                    :data-test="`lb-check-${base.id}`"
+                    @click="runLocalCheck(base)"
+                  />
+                  <Button
+                    label="Слияние…"
+                    size="small"
+                    text
+                    :data-test="`lb-merge-${base.id}`"
+                    @click="openLocalMerge(base)"
+                  />
                   <Button
                     label="Обновить базу"
                     size="small"
@@ -688,6 +749,7 @@ onUnmounted(() => {
     v-model:visible="localUpdateVisible"
     :base="updateBase"
     :bulk-base-ids="bulkBaseIds"
+    :mode="localDialogMode"
     @submitted="onLocalUpdateSubmitted"
   />
 </template>
