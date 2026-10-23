@@ -165,3 +165,23 @@ def test_backup_status_counts_yesterday_store_as_ok(auth_client: TestClient, ses
     assert data["stores"]["ok"] == 1
     assert data["stores"]["checked"] == 1
 
+
+
+def test_next_auto_check_respects_end_hour(session: Session) -> None:
+    """Д-27: после `backup_end_hour` (15:00) автопроверка — завтра в 10:00."""
+    from datetime import datetime
+
+    from server.api.backups import _next_auto_check
+
+    # Окно [10, 15): сейчас 16:00 — следующий автоматический запуск завтра в 10:00.
+    now = datetime(2026, 10, 23, 16, 0, 0)
+    out = _next_auto_check(session, now=now)
+    assert out == "2026-10-24T10:00:00"
+
+    # Внутри окна: сейчас 12:30 — следующий запуск через интервал (60 с).
+    inside = _next_auto_check(session, now=datetime(2026, 10, 23, 12, 30, 0))
+    assert inside == "2026-10-23T12:31:00"
+
+    # До окна: сейчас 8:00 — следующий запуск сегодня в 10:00.
+    before = _next_auto_check(session, now=datetime(2026, 10, 23, 8, 0, 0))
+    assert before == "2026-10-23T10:00:00"

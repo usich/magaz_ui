@@ -111,7 +111,7 @@ class TestSettingsApi:
 
         assert response.status_code == 200
         by_key = {item["key"]: item for item in body}
-        assert len(by_key) == 20, "все ключи §4.9 присутствуют (включая добавки Д-7/Д-21/Д-24/Д-25)"
+        assert len(by_key) == 21, "все ключи §4.9 присутствуют (включая добавки Д-7/Д-21/Д-24/Д-25/Д-27)"
         assert by_key["health_interval_sec"]["value"] == "15"
         assert by_key["health_interval_sec"]["default"] == "15"
         assert by_key["health_interval_sec"]["is_default"] is True
@@ -119,6 +119,7 @@ class TestSettingsApi:
         assert by_key["default_file_name"]["value"] == "update"
         assert by_key["local_update_interval_sec"]["value"] == "5"  # Д-24
         assert by_key["local_update_concurrency"]["value"] == "5"  # Д-25
+        assert by_key["backup_end_hour"]["value"] == "15"  # Д-27
 
     def test_update_changes_value_and_writes_audit(
         self, auth_client: TestClient, admin, engine: Engine  # noqa: ANN001, ARG002
@@ -196,7 +197,7 @@ class TestSystemInfo:
         assert body["counts"]["stores_inactive"] == 0
         assert body["counts"]["admins_total"] == 1
         assert body["counts"]["jobs_active"] == 0, "Э4: плитка «Задач в работе»"
-        assert body["settings_keys"] == 20  # §4.9, включая Д-7/Д-21/Д-24/Д-25
+        assert body["settings_keys"] == 21  # §4.9, включая Д-7/Д-21/Д-24/Д-25/Д-27
 
 
 class TestSystemCountersForDisabledStores:

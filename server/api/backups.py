@@ -78,22 +78,29 @@ class BackupListItem(BaseModel):
 
 
 
-def _next_auto_check(session: Session) -> str | None:
+def _next_auto_check(session: Session, *, now: datetime | None = None) -> str | None:
     """Когда Backup Monitor снова сможет опросить автоматически (ISO, местное).
 
-    Учитывает час старта (`backup_start_hour`, по умолчанию 10:00): если сейчас
-    раньше — следующий запуск сегодня в этот час; иначе — следующий интервал
-    `backup_interval_sec`.
+    Учитывает окно запросов (Д-21/Д-27): `backup_start_hour` (по умолчанию 10:00)
+    и `backup_end_hour` (по умолчанию 15:00). Если сейчас раньше окна — следующий
+    запуск сегодня в `start_hour`; внутри окна — следующий интервал
+    `backup_interval_sec`; после `end_hour` — завтра в `start_hour`.
     """
     try:
         start_hour = settings_service.get_int(session, "backup_start_hour")
+        end_hour = settings_service.get_int(session, "backup_end_hour")
         interval_sec = settings_service.get_int(session, "backup_interval_sec")
     except ValueError:
         return None
 
-    now = datetime.now()
-    if now.hour < start_hour:
+    now = datetime.now() if now is None else now
+    hour = now.hour
+    if hour < start_hour:
         target = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    elif hour >= end_hour:
+        # Окно закрыто: следующий автоматический запуск — завтра в start_hour.
+        tomorrow = now + timedelta(days=1)
+        target = tomorrow.replace(hour=start_hour, minute=0, second=0, microsecond=0)
     else:
         target = now + timedelta(seconds=max(1, interval_sec))
     return target.isoformat(timespec="seconds")

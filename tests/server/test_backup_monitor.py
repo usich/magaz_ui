@@ -10,7 +10,7 @@ from datetime import date
 
 import pytest
 
-from server.core.backup_monitor import apply_statuses, should_check_now
+from server.core.backup_monitor import apply_statuses, in_backup_window, should_check_now
 from server.services import backup_service
 from server.services.backup_service import BackupCheckResult
 
@@ -126,3 +126,23 @@ def test_apply_statuses_skips_disabled(session, store) -> None:  # noqa: ANN001
     )
     assert checked == 0
     assert store.backup_status == ""
+
+
+
+def test_in_backup_window_inside() -> None:
+    """В окне 10:00–15:00 автоматическая проверка разрешена (Д-27)."""
+    assert in_backup_window(10, start=10, end=15) is True
+    assert in_backup_window(14, start=10, end=15) is True
+
+
+def test_in_backup_window_before_start() -> None:
+    """До 10:00 автоматическая проверка не делается."""
+    assert in_backup_window(9, start=10, end=15) is False
+    assert in_backup_window(0, start=10, end=15) is False
+
+
+def test_in_backup_window_at_and_after_end() -> None:
+    """С 15:00 и позже автоматическая проверка не делается (только вручную)."""
+    assert in_backup_window(15, start=10, end=15) is False
+    assert in_backup_window(16, start=10, end=15) is False
+    assert in_backup_window(23, start=10, end=15) is False

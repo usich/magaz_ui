@@ -35,11 +35,12 @@ from shared.timeutil import utcnow
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["BackupMonitor", "apply_statuses", "check_missing", "should_check_now"]
+__all__ = ["BackupMonitor", "apply_statuses", "check_missing", "in_backup_window", "should_check_now"]
 
-#: Ключи настроек Д-21
+#: Ключи настроек Д-21/Д-27
 INTERVAL_SETTING = "backup_interval_sec"
 START_HOUR_SETTING = "backup_start_hour"
+END_HOUR_SETTING = "backup_end_hour"
 MAX_TRIES_SETTING = "backup_max_tries"
 RETRY_INTERVAL_SETTING = "backup_retry_interval_sec"
 
@@ -77,6 +78,15 @@ def should_check_now(
             if delta.total_seconds() < retry_interval_sec:
                 return False, "too_soon"
     return True, ""
+
+def in_backup_window(hour: int, *, start: int, end: int) -> bool:
+    """Внутри ли окна автоматических запросов бэкапов (Д-27): `start <= hour < end`.
+
+    По умолчанию окно 10:00–15:00. Вне окна автоматически не опрашиваем —
+    остаётся только ручной запуск.
+    """
+    return start <= hour < end
+
 
 def _run_check(obj, *, secret_box: SecretBox) -> tuple[str, str | None]:
     """Проверить бэкап одного объекта (Store/LocalBase) через сервис Д-21.
@@ -260,11 +270,11 @@ class BackupMonitor:
         self.last_checked = checked
         return checked
 
-    async def check_missing_once(self) -> int:
-        """Ручная проверка (кнопка): опросить только не найденные бэкапы.
+    def _check_missing_sync(self) -> int:
+        """Синхронный обход (ручная проверка): опросить только не найденные бэкапы.
 
-        Не зависит от часа старта и интервала между попытками — это явное действие
-        администратора. Возвращает число опрошенных объектов.
+        Выполняется в потоке через `asyncio.to_thread`, чтобы SMB-опрос с
+        недоступными хостами не блокировал главный event loop (см. `_run_cycle`).
         """
         with self._db.session() as session:
             stores = list(session.scalars(select(Store)).all())
@@ -276,13 +286,25 @@ class BackupMonitor:
                 secret_box=self._secret_box,
             )
             session.commit()
+        return checked
+
+    async def check_missing_once(self) -> int:
+        """Ручная проверка (кнопка): опросить только не найденные бэкапы.
+
+        Не зависит от часа старта и интервала между попытками — это явное действие
+        администратора. Возвращает число опрошенных объектов.
+        """
+        checked = await asyncio.to_thread(self._check_missing_sync)
         self.last_checked = checked
         return checked
 
+    def _apply_statuses_sync(self, max_tries: int, retry: int) -> int:
+        """Синхронный автоматический обход всех включённых объектов.
 
-    async def _run_cycle(self) -> int:
-        max_tries = self._setting(MAX_TRIES_SETTING)
-        retry = self._setting(RETRY_INTERVAL_SETTING)
+        SMB-опрос (pysmb) синхронный и может ждать таймауты по недоступным
+        хостам по 10+ сек на магазин; выполняем в отдельном потоке, чтобы не
+        блокировать главный event loop uvicorn и админку.
+        """
         with self._db.session() as session:
             stores = list(session.scalars(select(Store)).all())
             bases = list(session.scalars(select(LocalBase)).all())
@@ -297,21 +319,37 @@ class BackupMonitor:
             session.commit()
         return checked
 
+    async def _run_cycle(self) -> int:
+        max_tries = self._setting(MAX_TRIES_SETTING)
+        retry = self._setting(RETRY_INTERVAL_SETTING)
+        return await asyncio.to_thread(self._apply_statuses_sync, max_tries, retry)
+
     @property
     def start_hour(self) -> int:
         """Час начала запросов (по умолчанию 10:00) — раньше автоматически не опрашиваем."""
         return max(0, min(23, self._setting(START_HOUR_SETTING)))
 
+    @property
+    def end_hour(self) -> int:
+        """Час окончания запросов (по умолчанию 15:00, Д-27) — после него автоматически не опрашиваем."""
+        return max(0, min(24, self._setting(END_HOUR_SETTING)))
+
     async def run(self) -> None:
         while not self._stop_event.is_set():
-            # Д-21: запросы бэкапов начинаются с 10:00 (backup_start_hour)
-            if datetime.now().hour >= self.start_hour:
+            # Д-21/Д-27: автоматические запросы — только в окне [start_hour, end_hour)
+            # (с 10:00 до 15:00); в остальное время — только ручной запуск.
+            hour = datetime.now().hour
+            if in_backup_window(hour, start=self.start_hour, end=self.end_hour):
                 try:
                     await self.poll_once()
                 except Exception:  # noqa: BLE001 - обход не падает от одной ошибки
                     logger.exception("Сбой цикла проверки бэкапов")
             else:
-                logger.debug("До часа начала бэкапов (%s:00) — обход пропущен", self.start_hour)
+                logger.debug(
+                    "Вне окна бэкапов (%s:00–%s:00) — автоматический обход пропущен",
+                    self.start_hour,
+                    self.end_hour,
+                )
             await self._sleep(self.interval_sec)
         logger.debug("Backup Monitor остановлен")
 
