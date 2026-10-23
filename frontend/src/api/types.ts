@@ -270,14 +270,18 @@ export interface LocalMergeResponse {
   job: LocalBaseRunUpdateJob
 }
 
-/** Тело `POST /admin/local-bases/bulk/update` (Д-25): пачка баз + файл и режим. */
+/** Тело `POST /admin/local-bases/bulk/update` (Д-25/Д-26): пачка баз + вид операции. */
 export interface LocalBulkUpdatePayload {
   /** id выбранных локальных баз. */
   local_base_ids: number[]
+  /** Вид операции (Д-26): `check_files_local` | `run_merge_local` | `run_update_db_local`. */
+  kind?: 'check_files_local' | 'run_merge_local' | 'run_update_db_local'
   file_name?: string
   is_fast_update?: boolean
+  full_merge?: boolean
   is_extension?: boolean | null
   extension_name?: string | null
+  settings_file_name?: string | null
 }
 
 /** Строка результата массового обновления по одной базе (Д-25). */

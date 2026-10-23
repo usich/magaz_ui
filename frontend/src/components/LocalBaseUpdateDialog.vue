@@ -95,13 +95,16 @@ async function run(): Promise<void> {
   }
   try {
     if (isBulk.value) {
+      const kind = isMerge.value ? 'run_merge_local' : 'run_update_db_local'
       const response = await localBasesApi.bulkUpdate({
         local_base_ids: props.bulkBaseIds,
+        kind,
+        ...(isMerge.value ? { full_merge: false } : {}),
         ...payload,
       })
       toast.add({
         severity: 'success',
-        summary: 'Обновление поставлено в очередь',
+        summary: isMerge.value ? 'Слияние поставлено в очередь' : 'Обновление поставлено в очередь',
         detail: response.message,
         life: 5000,
       })

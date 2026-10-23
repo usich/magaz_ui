@@ -208,6 +208,7 @@ python -m client.tray --ack <id>                             # «Ознаком�
 | `agent-config.json`: `base_1c_path = "C:/Program Files/1cv8"` (не `(x86)`) | `tests/server/test_store_api.py` |
 | Д-26 (backend): полный конвейер локальной базы — `check_files_local` (проверка файлов в `local_update_dir`), `run_merge_local` (`/MergeCfg`), R12 охватывает merge+update | `tests/server/test_local_updates_api.py` |
 | Д-26 (frontend): кнопки «Проверить файлы», «Слияние…», «Обновить базу» и статусы этапов | `frontend/tests/updates-view.spec.ts`, `frontend/tests/local-bases-view.spec.ts` |
+| Д-26 (массовые кнопки): общий полный цикл для отмеченных баз — bulk/update с `kind` (check/merge/update) | `tests/server/test_local_updates_api.py`, `frontend/tests/updates-view.spec.ts`, `frontend/tests/local-bases-view.spec.ts` |
 
 | Разметка уведомления: санитайз, метки `magaz-image:` без файла, лимиты картинок | `tests/shared/test_richtext.py`, `tests/server/test_notification_images.py`, `frontend/tests/notification-editor.spec.ts` |
 | Кэш картинок на кассе, справочник прочитанного, `delete_after_read` до кассы | `tests/client/test_agent_notifications.py` |

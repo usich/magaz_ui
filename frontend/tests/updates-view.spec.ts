@@ -428,4 +428,85 @@ describe('страница «Обновление 1С»', () => {
     })
     wrapper.unmount()
   })
+
+  it('вкладка «Локальные базы»: массовое «Проверить файлы» шлёт bulk/update с kind=check (Д-26)', async () => {
+    const bulkBodies: unknown[] = []
+    fetchMock.mockImplementation(
+      apiMock(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [makeLocalBase(), makeLocalBase({ id: 3, name: 'Торговля', database_name: 'trade', group: 'Продажи' })],
+        [],
+        [],
+        [],
+        undefined,
+        (body) => bulkBodies.push(body),
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('[data-test="lb-select-2"]').setValue(true)
+    await wrapper.find('[data-test="lb-select-3"]').setValue(true)
+    await flushPromises()
+
+    await wrapper.find('[data-test="updates-local-check-selected"]').trigger('click')
+    await flushPromises()
+
+    expect(bulkBodies).toHaveLength(1)
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      local_base_ids: [2, 3],
+      kind: 'check_files_local',
+      file_name: 'update',
+    })
+    wrapper.unmount()
+  })
+
+  it('вкладка «Локальные базы»: массовое «Слияние…» шлёт bulk/update с kind=run_merge_local (Д-26)', async () => {
+    const bulkBodies: unknown[] = []
+    fetchMock.mockImplementation(
+      apiMock(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [makeLocalBase(), makeLocalBase({ id: 3, name: 'Торговля', database_name: 'trade', group: 'Продажи' })],
+        [],
+        [],
+        [],
+        undefined,
+        (body) => bulkBodies.push(body),
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('[data-test="lb-select-2"]').setValue(true)
+    await wrapper.find('[data-test="lb-select-3"]').setValue(true)
+    await flushPromises()
+
+    await wrapper.find('[data-test="updates-local-merge-selected"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
+    await wrapper.find('[data-test="lbu-file"]').setValue('update')
+    await wrapper.find('[data-test="lbu-run"]').trigger('click')
+    await flushPromises()
+
+    expect(bulkBodies).toHaveLength(1)
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      local_base_ids: [2, 3],
+      kind: 'run_merge_local',
+      file_name: 'update',
+    })
+    wrapper.unmount()
+  })
 })

@@ -251,4 +251,32 @@ describe('страница «Локальные базы»', () => {
     expect(JSON.parse(String(mergeBodies[0]))).toMatchObject({ file_name: 'update' })
     wrapper.unmount()
   })
+
+  it('массовое «Проверить файлы» шлёт bulk/update с kind=check_files_local (Д-26)', async () => {
+    const bulkBodies: unknown[] = []
+    fetchMock.mockImplementation(
+      apiMock(
+        [makeBase(), makeBase({ id: 3, name: 'Торговля', database_name: 'trade', group: 'Продажи' })],
+        [],
+        (body) => bulkBodies.push(body),
+      ),
+    )
+
+    const wrapper = await mountView(fetchMock)
+
+    await wrapper.find('[data-test="lb-select-2"]').setValue(true)
+    await wrapper.find('[data-test="lb-select-3"]').setValue(true)
+    await flushPromises()
+
+    await wrapper.find('[data-test="lb-check-selected"]').trigger('click')
+    await flushPromises()
+
+    expect(bulkBodies).toHaveLength(1)
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      local_base_ids: [2, 3],
+      kind: 'check_files_local',
+      file_name: 'update',
+    })
+    wrapper.unmount()
+  })
 })

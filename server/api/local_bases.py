@@ -500,14 +500,67 @@ def run_update_local_base(
         ),
     )
 
+#: Виды задач, которые умеет ставить массовый `POST /local-bases/bulk/update` (Д-26)
+_BULK_LOCAL_KINDS: tuple[str, ...] = (
+    str(CommandKind.CHECK_FILES_LOCAL),
+    str(CommandKind.RUN_MERGE_LOCAL),
+    str(CommandKind.RUN_UPDATE_DB_LOCAL),
+)
+
+
+def _validate_bulk_kind(kind: str) -> str:
+    """Проверить и нормализовать `kind` массовой операции локальных баз (Д-26)."""
+    value = str(kind).strip()
+    if value not in _BULK_LOCAL_KINDS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Неизвестный вид операции: {value}",
+        )
+    return value
+
+
+def _build_bulk_params(kind: str, payload: LocalBulkUpdateRequest) -> dict[str, object]:
+    """Собрать параметры массовой операции по её виду (Д-26)."""
+    if kind == str(CommandKind.CHECK_FILES_LOCAL):
+        return {"file_name": payload.file_name}
+    if kind == str(CommandKind.RUN_MERGE_LOCAL):
+        params: dict[str, object] = {
+            "file_name": payload.file_name,
+            "full_merge": payload.full_merge,
+            "is_extension": payload.is_extension,
+        }
+        if payload.extension_name:
+            params["extension_name"] = payload.extension_name
+        if payload.settings_file_name:
+            params["settings_file_name"] = payload.settings_file_name
+        return params
+    return _build_local_update_params(
+        LocalUpdateRunRequest(
+            file_name=payload.file_name,
+            is_fast_update=payload.is_fast_update,
+            is_extension=payload.is_extension,
+            extension_name=payload.extension_name,
+        )
+    )
+
+
 class LocalBulkUpdateRequest(BaseModel):
-    """Тело `POST /local-bases/bulk/update`: список баз + файл и режим (Д-25)."""
+    """Тело `POST /local-bases/bulk/update`: список баз + вид операции и режим (Д-25/Д-26).
+
+    `kind` — какой локальный вид создавать: `check_files_local`, `run_merge_local`
+    или `run_update_db_local` (по умолчанию — обновление БД, обратная совместимость
+    с Д-25). Поля `is_fast_update`/`full_merge`/`settings_file_name` применимы только
+    к своему виду и игнорируются остальными.
+    """
 
     local_base_ids: list[int] = Field(default_factory=list)
+    kind: str = str(CommandKind.RUN_UPDATE_DB_LOCAL)
     file_name: str = "update"
     is_fast_update: bool = False
+    full_merge: bool = False
     is_extension: bool | None = None
     extension_name: str | None = None
+    settings_file_name: str | None = None
 
 
 @router.post(
@@ -535,6 +588,7 @@ def bulk_update_local_bases(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Не выбрано ни одной локальной базы",
         )
+    kind = _validate_bulk_kind(payload.kind)
 
     results: list[LocalBulkUpdateJobOut] = []
     with command_service.dispatch_guard():
@@ -550,29 +604,25 @@ def bulk_update_local_bases(
                     )
                 )
                 continue
-            busy = command_service.find_local_update_conflict(session, base_id)
-            if busy is not None:
-                results.append(
-                    LocalBulkUpdateJobOut(
-                        local_base_id=base_id,
-                        local_base_name=row.name,
-                        status="skipped",
-                        detail=f"уже обновляется (задача #{busy.id})",
+            # R12 «одна база — одно обновление» — только для видов, меняющих ИБ;
+            # проверка файлов в папке ИБ не трогает, поэтому не блокируется.
+            if kind in command_service.LOCAL_IB_KINDS:
+                busy = command_service.find_local_update_conflict(session, base_id)
+                if busy is not None:
+                    results.append(
+                        LocalBulkUpdateJobOut(
+                            local_base_id=base_id,
+                            local_base_name=row.name,
+                            status="skipped",
+                            detail=f"уже обновляется (задача #{busy.id})",
+                        )
                     )
-                )
-                continue
-            params = _build_local_update_params(
-                LocalUpdateRunRequest(
-                    file_name=payload.file_name,
-                    is_fast_update=payload.is_fast_update,
-                    is_extension=payload.is_extension,
-                    extension_name=payload.extension_name,
-                )
-            )
+                    continue
+            params = _build_bulk_params(kind, payload)
             job = command_service.create_local_command(
                 session,
                 local_base_id=base_id,
-                kind=CommandKind.RUN_UPDATE_DB_LOCAL,
+                kind=kind,
                 params=params,
                 created_by=admin.username,
             )

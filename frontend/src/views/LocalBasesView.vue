@@ -97,6 +97,34 @@ function openLocalBulkUpdate(): void {
   localDialogMode.value = 'update'
   localUpdateVisible.value = true
 }
+function openLocalBulkMerge(): void {
+  if (!localSelected.value.length) return
+  updateBase.value = null
+  bulkBaseIds.value = [...localSelected.value]
+  localDialogMode.value = 'merge'
+  localUpdateVisible.value = true
+}
+async function runLocalBulkCheck(): Promise<void> {
+  if (!localSelected.value.length) return
+  try {
+    const response = await localBasesApi.bulkUpdate({
+      local_base_ids: [...localSelected.value],
+      kind: 'check_files_local',
+      file_name: 'update',
+    })
+    toast.add({
+      severity: 'success',
+      summary: 'Проверка файлов поставлена в очередь',
+      detail: response.message,
+      life: 5000,
+    })
+    void loadJobs()
+  } catch (error) {
+    const message =
+      error instanceof ApiError ? error.message : 'Не удалось поставить проверку файлов'
+    toast.add({ severity: 'error', summary: 'Операция не выполнена', detail: message, life: 6000 })
+  }
+}
 async function runLocalCheck(base: LocalBaseItem): Promise<void> {
   try {
     const response = await localBasesApi.checkFiles(base.id, { file_name: 'update' })
@@ -208,7 +236,21 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
           @click="toggleLocalAll"
         />
         <Button
-          label="Обновить выбранные…"
+          label="Проверить файлы"
+          size="small"
+          :disabled="!localSelected.length"
+          data-test="lb-check-selected"
+          @click="runLocalBulkCheck"
+        />
+        <Button
+          label="Слияние…"
+          size="small"
+          :disabled="!localSelected.length"
+          data-test="lb-merge-selected"
+          @click="openLocalBulkMerge"
+        />
+        <Button
+          label="Обновить базу…"
           size="small"
           :disabled="!localSelected.length"
           data-test="lb-update-selected"

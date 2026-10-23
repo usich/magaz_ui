@@ -450,3 +450,39 @@ def test_monitor_poll_once_runs_merge_local(tmp_path, secret_box) -> None:
             assert command_service.get_command(session, cmd_id).status == "success"
     finally:
         engine.dispose()
+
+
+
+def test_bulk_update_kind_check_files(auth_client: TestClient) -> None:
+    """Bulk с `kind='check_files_local'` создаёт задачи проверки файлов (Д-26)."""
+    first = auth_client.post(BASE_URL, json=make_payload()).json()
+    response = auth_client.post(
+        f"{BASE_URL}/bulk/update",
+        json={"local_base_ids": [first["id"]], "kind": "check_files_local", "file_name": "update"},
+    )
+    assert response.status_code == 202, response.text
+    job = response.json()["jobs"][0]
+    assert job["status"] == "queued"
+    assert job["job_id"] is not None
+
+
+def test_bulk_update_kind_run_merge(auth_client: TestClient) -> None:
+    """Bulk с `kind='run_merge_local'` создаёт задачи слияния (Д-26)."""
+    first = auth_client.post(BASE_URL, json=make_payload()).json()
+    response = auth_client.post(
+        f"{BASE_URL}/bulk/update",
+        json={"local_base_ids": [first["id"]], "kind": "run_merge_local", "file_name": "update"},
+    )
+    assert response.status_code == 202, response.text
+    job = response.json()["jobs"][0]
+    assert job["job_id"] is not None
+
+
+def test_bulk_update_invalid_kind_is_422(auth_client: TestClient) -> None:
+    """Bulk с неизвестным `kind` — `422` (Д-26)."""
+    first = auth_client.post(BASE_URL, json=make_payload()).json()
+    response = auth_client.post(
+        f"{BASE_URL}/bulk/update",
+        json={"local_base_ids": [first["id"]], "kind": "hack_the_planet"},
+    )
+    assert response.status_code == 422
