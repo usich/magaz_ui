@@ -23,6 +23,7 @@ export const JOB_KIND_LABELS: Record<string, string> = {
   download_file: 'Скачивание файла',
   run_merge: 'Слияние конфигурации',
   run_update_db: 'Обновление БД',
+  run_update_db_local: 'Обновление локальной базы',
   send_message: 'Сообщение пользователям',
   notify: 'Уведомление',
   notify_cancel: 'Отзыв уведомления',

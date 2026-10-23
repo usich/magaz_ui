@@ -27,7 +27,8 @@ function makeStore(overrides: Record<string, unknown> = {}): Record<string, unkn
 
 function makeJob(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    id: 7, store_id: 1, store_name: 'Магазин №5', kind: 'run_merge', status: 'success',
+    id: 7, store_id: 1, store_name: 'Магазин №5', local_base_id: null, local_base_name: null,
+    kind: 'run_merge', status: 'success',
     params: {}, attempts: 0, last_error: null, log_files: [],
     created_by: 'admin', created_at: '2026-10-13T10:00:00Z',
     started_at: '2026-10-13T10:00:01Z', finished_at: '2026-10-13T10:00:10Z',
@@ -60,13 +61,26 @@ function apiMock(
   upd: unknown[],
   recent: unknown[],
   localBases: unknown[] = [],
+  localJobs: unknown[] = [],
+  onRunUpdate?: (body: unknown) => void,
 ) {
-  return async (url: string): Promise<Response> => {
+  return async (url: string, init: RequestInit = {}): Promise<Response> => {
+    if (init.method === 'POST' && url.includes('/run-update')) {
+      onRunUpdate?.(init.body)
+      return jsonResponse(
+        {
+          message: 'Обновление базы поставлено в очередь',
+          job: { id: 9, local_base_id: 2, local_base_name: 'Бухгалтерия', kind: 'run_update_db_local', status: 'queued', created_at: '2026-10-13T10:00:00Z' },
+        },
+        202,
+      )
+    }
     if (url.includes('/admin/stores')) return jsonResponse(stores)
     if (url.includes('/admin/local-bases')) return jsonResponse(localBases)
     if (url.includes('/admin/files/matrix')) return jsonResponse({ rows, total: rows.length, present: 1, missing: 0 })
     if (url.includes('/admin/jobs')) {
       if (url.includes('kind=run_merge')) return jsonResponse({ items: merge, counts: {}, total: 0, active: 0 })
+      if (url.includes('kind=run_update_db_local')) return jsonResponse({ items: localJobs, counts: {}, total: 0, active: 0 })
       if (url.includes('kind=run_update_db')) return jsonResponse({ items: upd, counts: {}, total: 0, active: 0 })
       return jsonResponse({ items: recent, counts: {}, total: 0, active: 0 })
     }
@@ -75,12 +89,24 @@ function apiMock(
 }
 
 const stubs = {
-  Button: { props: ['label'], template: '<button>{{ label }}</button>' },
+  Button: { props: ['label', 'disabled'], template: '<button :disabled="disabled">{{ label }}</button>' },
   Tag: { props: ['value'], template: '<span class="tag">{{ value }}</span>' },
-  Checkbox: { props: ['modelValue'], template: '<input type="checkbox" />' },
-  RadioButton: { template: '<span />' },
-  InputText: { props: ['modelValue'], template: '<input />' },
-  Dialog: { props: ['visible'], template: '<div v-if="visible"><slot /></div>' },
+  Checkbox: {
+    props: ['modelValue'],
+    emits: ['update:modelValue'],
+    template: '<input type="checkbox" :checked="modelValue" @change="$emit(\'update:modelValue\', $event.target.checked)" />',
+  },
+  RadioButton: {
+    props: ['modelValue', 'value'],
+    emits: ['update:modelValue'],
+    template: '<button @click="$emit(\'update:modelValue\', value)" />',
+  },
+  InputText: {
+    props: ['modelValue'],
+    emits: ['update:modelValue'],
+    template: '<input :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" />',
+  },
+  Dialog: { props: ['visible'], template: '<div v-if="visible"><slot /><slot name="footer" /></div>' },
   OperationPanel: { template: '<div data-test="operation-panel" />' },
 }
 
@@ -186,6 +212,86 @@ describe('страница «Обновление 1С»', () => {
     expect(wrapper.find('[data-test="local-base-dialog"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="lb-name"]').exists()).toBe(true)
     expect(wrapper.find('[data-test="lb-group"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('вкладка «Локальные базы»: статус обновления по базе из run_update_db_local (Д-24)', async () => {
+    fetchMock.mockImplementation(
+      apiMock(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [makeLocalBase()],
+        [
+          makeJob({
+            id: 9, store_id: null, store_name: null, local_base_id: 2, local_base_name: 'Бухгалтерия',
+            kind: 'run_update_db_local', status: 'success',
+            created_at: '2026-10-13T10:00:00Z', finished_at: '2026-10-13T10:05:00Z',
+          }),
+        ],
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    // Статус последнего обновления показывается в строке базы и в журнале
+    const status = wrapper.find('[data-test="lb-status-2"]')
+    expect(status.exists()).toBe(true)
+    expect(status.text()).toContain('успех')
+    expect(wrapper.text()).toContain('Журнал операций по локальным базам')
+    expect(wrapper.text()).toContain('Бухгалтерия')
+    wrapper.unmount()
+  })
+
+  it('вкладка «Локальные базы»: «Обновить базу» открывает диалог (Д-24)', async () => {
+    fetchMock.mockImplementation(apiMock([], [], [], [], [], [makeLocalBase()]))
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('[data-test="lb-update-2"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lbu-file"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lbu-cf"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lbu-cfe"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('вкладка «Локальные базы»: запуск шлёт POST .../run-update (Д-24)', async () => {
+    const runUpdateBody: unknown[] = []
+    fetchMock.mockImplementation(
+      apiMock([], [], [], [], [], [makeLocalBase()], [], (body) => runUpdateBody.push(body)),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('[data-test="lb-update-2"]').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('[data-test="lbu-file"]').setValue('update')
+    await wrapper.find('[data-test="lbu-cfe"]').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('[data-test="lbu-extension"]').setValue('БГ_Бухгалтерия')
+    await wrapper.find('[data-test="lbu-run"]').trigger('click')
+    await flushPromises()
+
+    expect(runUpdateBody).toHaveLength(1)
+    expect(JSON.parse(String(runUpdateBody[0]))).toMatchObject({
+      file_name: 'update',
+      is_extension: true,
+      extension_name: 'БГ_Бухгалтерия',
+      is_fast_update: false,
+    })
     wrapper.unmount()
   })
 })

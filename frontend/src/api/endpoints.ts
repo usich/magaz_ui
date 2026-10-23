@@ -29,6 +29,8 @@ import type {
   JobsPage,
   LocalBaseCreatePayload,
   LocalBaseItem,
+  LocalBaseRunUpdatePayload,
+  LocalBaseRunUpdateResponse,
   LocalBaseUpdatePayload,
   BackupStatus,
   BackupListItem,
@@ -186,6 +188,7 @@ export const jobsApi = {
   list: (filters: JobFilters = {}) => {
     const query = new URLSearchParams()
     if (filters.storeId) query.set('store_id', String(filters.storeId))
+    if (filters.localBaseId) query.set('local_base_id', String(filters.localBaseId))
     if (filters.kind) query.set('kind', filters.kind)
     if (filters.status) query.set('status', filters.status)
     if (filters.activeOnly) query.set('active_only', 'true')
@@ -411,6 +414,10 @@ export const localBasesApi = {
     id: number,
     payload: { user_name_1c?: string; password?: string; clear_password?: boolean },
   ) => api.put<LocalBaseItem>(`/admin/local-bases/${id}/credentials`, payload),
+
+  /** Обновить локальную базу 1С (Д-24): поставить задачу `run_update_db_local` в очередь. */
+  runUpdate: (id: number, payload: LocalBaseRunUpdatePayload) =>
+    api.post<LocalBaseRunUpdateResponse>(`/admin/local-bases/${id}/run-update`, payload),
 }
 
 /** Бэкапы 1С (`/admin/backup/*`, Д-21): сводка, раздельные списки, ручная проверка. */

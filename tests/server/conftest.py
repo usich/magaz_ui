@@ -57,6 +57,7 @@ def settings(tmp_path) -> Settings:  # noqa: ANN001 - pytest tmp_path
         health_monitor_enabled=False,
         dispatcher_enabled=False,
         backup_monitor_enabled=False,
+        local_updater_enabled=False,
         # Схему в тестах создаёт `Base.metadata.create_all` (фикстура `engine`),
         # а не Alembic — автоприменение миграций отключаем
         auto_migrate=False,

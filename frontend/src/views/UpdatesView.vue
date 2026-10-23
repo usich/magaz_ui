@@ -12,10 +12,11 @@ import { useToast } from 'primevue/usetoast'
 
 import { dispatchAction, type ActionOutcome } from '@/api/actions'
 import { jobsApi } from '@/api/endpoints'
-import type { JobItem } from '@/api/types'
+import type { JobItem, LocalBaseItem } from '@/api/types'
 import OperationPanel from '@/components/OperationPanel.vue'
 import StatusTile from '@/components/StatusTile.vue'
 import LocalBaseFormDialog from '@/components/LocalBaseFormDialog.vue'
+import LocalBaseUpdateDialog from '@/components/LocalBaseUpdateDialog.vue'
 import { useFilesStore } from '@/stores/files'
 import { useLocalBasesStore } from '@/stores/local_bases'
 import { JOB_KIND_LABELS, JOB_STATUS_LABELS, jobStatusSeverity } from '@/stores/jobs'
@@ -65,28 +66,58 @@ function toggleAll(): void {
 const mergeJobs = ref<JobItem[]>([])
 const updateJobs = ref<JobItem[]>([])
 const recentJobs = ref<JobItem[]>([])
+// Д-24: операции обновления локальных баз (run_update_db_local)
+const localJobs = ref<JobItem[]>([])
 const jobsLoading = ref(false)
 
 async function loadJobs(): Promise<void> {
   jobsLoading.value = true
   try {
-    const [merge, update, recent] = await Promise.all([
+    const [merge, update, recent, local] = await Promise.all([
       jobsApi.list({ kind: 'run_merge', limit: 200 }),
       jobsApi.list({ kind: 'run_update_db', limit: 200 }),
       jobsApi.list({ kind: '', limit: 40 }),
+      jobsApi.list({ kind: 'run_update_db_local', limit: 200 }),
     ])
     mergeJobs.value = merge.items
     updateJobs.value = update.items
     recentJobs.value = recent.items
+    localJobs.value = local.items
   } finally {
     jobsLoading.value = false
   }
+}
+
+// Д-24: диалог «Обновить базу» для локальной базы
+const updateBase = ref<LocalBaseItem | null>(null)
+const localUpdateVisible = computed({
+  get: () => updateBase.value !== null,
+  set: (value: boolean) => {
+    if (!value) updateBase.value = null
+  },
+})
+function openLocalUpdate(base: LocalBaseItem): void {
+  updateBase.value = base
+  localUpdateVisible.value = true
+}
+function onLocalUpdateSubmitted(): void {
+  void loadJobs()
 }
 
 function lastFor(jobs: JobItem[], storeId: number): JobItem | null {
   let best: JobItem | null = null
   for (const job of jobs) {
     if (job.store_id !== storeId) continue
+    if (best === null || (job.created_at ?? '') > (best.created_at ?? '')) best = job
+  }
+  return best
+}
+
+/** Последняя задача обновления по локальной базе (Д-24). */
+function lastLocalFor(jobs: JobItem[], localBaseId: number): JobItem | null {
+  let best: JobItem | null = null
+  for (const job of jobs) {
+    if (job.local_base_id !== localBaseId) continue
     if (best === null || (job.created_at ?? '') > (best.created_at ?? '')) best = job
   }
   return best
@@ -486,6 +517,7 @@ onUnmounted(() => {
                 <th class="py-2 pr-3 font-medium">Пользователь 1С</th>
                 <th class="py-2 pr-3 font-medium">Путь к базе</th>
                 <th class="py-2 pr-3 font-medium">Расширение</th>
+                <th class="py-2 pr-3 font-medium">Обновление</th>
                 <th class="py-2 pr-3 text-right font-medium">Действия</th>
               </tr>
             </thead>
@@ -520,7 +552,24 @@ onUnmounted(() => {
                   <span v-if="base.extension_name" class="magaz-mono text-xs">{{ base.extension_name }}</span>
                   <span v-else class="magaz-muted text-xs">—</span>
                 </td>
+                <td class="py-2 pr-3 whitespace-nowrap">
+                  <Tag
+                    :value="stageStatus(lastLocalFor(localJobs, base.id)).label"
+                    :severity="stageStatus(lastLocalFor(localJobs, base.id)).severity"
+                    :data-test="`lb-status-${base.id}`"
+                  />
+                  <div v-if="lastLocalFor(localJobs, base.id)?.status === 'success'" class="magaz-muted text-xs">
+                    {{ lastOkAt(lastLocalFor(localJobs, base.id)) }}
+                  </div>
+                </td>
                 <td class="py-2 pr-3 text-right whitespace-nowrap">
+                  <Button
+                    label="Обновить базу"
+                    size="small"
+                    text
+                    :data-test="`lb-update-${base.id}`"
+                    @click="openLocalUpdate(base)"
+                  />
                   <Button
                     label="Изменить"
                     size="small"
@@ -545,9 +594,45 @@ onUnmounted(() => {
       <div v-else class="magaz-muted rounded-xl border border-dashed border-slate-300 p-6 text-sm">
         Локальные базы ещё не добавлены — нажмите «Добавить базу».
       </div>
+
+      <section class="rounded-xl border border-slate-200 bg-white p-5">
+        <h2 class="mb-3 font-semibold">Журнал операций по локальным базам</h2>
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="magaz-muted border-b border-slate-200 text-left text-xs">
+                <th class="py-2 pr-3 font-medium">База</th>
+                <th class="py-2 pr-3 font-medium">Статус</th>
+                <th class="py-2 pr-3 font-medium">Начато</th>
+                <th class="py-2 pr-3 font-medium">Завершено</th>
+                <th class="py-2 pr-3 font-medium">Лог</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="job in localJobs" :key="job.id" class="border-b border-slate-100">
+                <td class="py-2 pr-3">{{ job.local_base_name }}</td>
+                <td class="py-2 pr-3">
+                  <Tag :value="JOB_STATUS_LABELS[job.status] ?? job.status" :severity="jobStatusSeverity(job.status)" />
+                </td>
+                <td class="py-2 pr-3 magaz-muted whitespace-nowrap">{{ formatTime(job.started_at) }}</td>
+                <td class="py-2 pr-3 magaz-muted whitespace-nowrap">{{ formatTime(job.finished_at) }}</td>
+                <td class="py-2 pr-3">
+                  <span v-if="job.log_files.length" class="magaz-mono text-xs">{{ job.log_files.join(', ') }}</span>
+                  <span v-else-if="job.last_error" class="text-rose-600 text-xs">{{ job.last_error }}</span>
+                  <span v-else class="magaz-muted text-xs">—</span>
+                </td>
+              </tr>
+              <tr v-if="!localJobs.length && !jobsLoading">
+                <td colspan="5" class="magaz-muted py-6 text-center">Обновлений локальных баз ещё не было.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
     </div>
   </div>
 
   <LocalBaseFormDialog v-model:visible="baseFormVisible" :base="editingBase" @saved="onBaseSaved" />
+  <LocalBaseUpdateDialog v-model:visible="localUpdateVisible" :base="updateBase" @submitted="onLocalUpdateSubmitted" />
 </template>
 

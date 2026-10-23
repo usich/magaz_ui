@@ -112,11 +112,17 @@ class BulkActionRequest(BaseModel):
 
 
 class JobOut(BaseModel):
-    """Задача в списке `/jobs` (§4.3). Секретов здесь нет по построению."""
+    """Задача в списке `/jobs` (§4.3). Секретов здесь нет по построению.
+
+    Д-24: локальная задача ссылается на `local_base_id`/`local_base_name`, а не
+    на магазин — `store_id` тогда `None`. Ровно одно из полей заполнено.
+    """
 
     id: int
-    store_id: int
+    store_id: int | None = None
     store_name: str | None = None
+    local_base_id: int | None = None
+    local_base_name: str | None = None
     kind: str
     status: str
     params: dict[str, Any] | None = None
@@ -137,6 +143,8 @@ class JobOut(BaseModel):
             id=command.id,
             store_id=command.store_id,
             store_name=getattr(command.store, "name", None),
+            local_base_id=command.local_base_id,
+            local_base_name=getattr(command.local_base, "name", None),
             kind=command.kind,
             status=command.status,
             params=command.params,
@@ -818,16 +826,18 @@ def bulk_action(  # noqa: PLR0913 - параметры HTTP-точки
 def list_jobs(  # noqa: PLR0913 - параметры HTTP-точки
     session: Annotated[Session, Depends(get_db)],
     store_id: Annotated[int | None, Query(ge=1)] = None,
+    local_base_id: Annotated[int | None, Query(ge=1)] = None,
     kind: Annotated[str | None, Query(max_length=32)] = None,
     job_status: Annotated[str | None, Query(alias="status", max_length=32)] = None,
     active_only: Annotated[bool, Query()] = False,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> JobsPageOut:
-    """Список задач с фильтрами: магазин, тип, статус, «только в работе» (§11.6)."""
+    """Список задач с фильтрами: магазин, локальная база, тип, статус, «только в работе» (§11.6)."""
     commands = command_service.list_commands(
         session,
         store_id=store_id,
+        local_base_id=local_base_id,
         kind=(kind or "").strip() or None,
         status=(job_status or "").strip() or None,
         active_only=active_only,
@@ -835,7 +845,7 @@ def list_jobs(  # noqa: PLR0913 - параметры HTTP-точки
         offset=offset,
     )
     messages = _last_messages(session, [command.id for command in commands])
-    counts = command_service.counts_by_status(session, store_id=store_id)
+    counts = command_service.counts_by_status(session, store_id=store_id, local_base_id=local_base_id)
     return JobsPageOut(
         items=[
             JobOut.from_model(command, last_message=messages.get(command.id))

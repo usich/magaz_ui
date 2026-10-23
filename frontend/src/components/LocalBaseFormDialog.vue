@@ -22,8 +22,10 @@ const props = withDefaults(
     visible: boolean
     /** `null` — создание, иначе — правка переданной базы */
     base?: LocalBaseItem | null
+    /** Источник для «Скопировать»: поля заполняются, но имя пустое и это создание */
+    copyFrom?: LocalBaseItem | null
   }>(),
-  { base: null },
+  { base: null, copyFrom: null },
 )
 
 const emit = defineEmits<{
@@ -100,24 +102,24 @@ const isFormValid = computed(
 )
 
 function reset(): void {
-  const base = props.base
+  const source = props.copyFrom ?? props.base
   Object.assign(form, emptyForm(), {
-    name: base?.name ?? '',
-    version_1c: base?.version_1c ?? '',
-    cluster_name: base?.cluster_name ?? '',
-    database_name: base?.database_name ?? '',
-    user_name_1c: base?.user_name_1c ?? 'Администратор',
-    base_path: base?.base_path ?? '',
-    extension_name: base?.extension_name ?? '',
-    group: base?.group ?? '',
-    comment: base?.comment ?? '',
-    is_active: base?.is_active ?? true,
-    backup_check_enabled: base?.backup_check_enabled ?? false,
-    backup_path: base?.backup_path ?? '',
-    backup_host: base?.backup_host ?? '',
-    backup_use_auth: base?.backup_use_auth ?? false,
-    backup_user: base?.backup_user ?? '',
-    backup_check_yesterday: base?.backup_check_yesterday ?? false,
+    name: props.copyFrom ? '' : (source?.name ?? ''),
+    version_1c: source?.version_1c ?? '',
+    cluster_name: source?.cluster_name ?? '',
+    database_name: source?.database_name ?? '',
+    user_name_1c: source?.user_name_1c ?? 'Администратор',
+    base_path: source?.base_path ?? '',
+    extension_name: source?.extension_name ?? '',
+    group: source?.group ?? '',
+    comment: source?.comment ?? '',
+    is_active: source?.is_active ?? true,
+    backup_check_enabled: source?.backup_check_enabled ?? false,
+    backup_path: source?.backup_path ?? '',
+    backup_host: source?.backup_host ?? '',
+    backup_use_auth: source?.backup_use_auth ?? false,
+    backup_user: source?.backup_user ?? '',
+    backup_check_yesterday: source?.backup_check_yesterday ?? false,
   })
   formError.value = ''
 }

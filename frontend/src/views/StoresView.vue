@@ -61,11 +61,21 @@ function notifySuccess(summary: string, detail: string): void {
 
 function openCreate(): void {
   formStore.value = null
+  copyFrom.value = null
   isFormOpen.value = true
 }
 
 function openEdit(store: StoreItem): void {
   formStore.value = store
+  copyFrom.value = null
+  isFormOpen.value = true
+}
+
+/** «Скопировать» (Д-23): создать магазин по образцу — все поля, кроме имени. */
+const copyFrom = ref<StoreItem | null>(null)
+function openCopy(store: StoreItem): void {
+  copyFrom.value = store
+  formStore.value = null
   isFormOpen.value = true
 }
 
@@ -245,6 +255,7 @@ function formatTime(value: string | null): string {
               <span v-if="store.agent_version" class="magaz-mono block text-xs">
                 агент {{ store.agent_version }}
               </span>
+                <Button label="Скопировать" size="small" text :data-test="`store-copy-${store.id}`" @click="openCopy(store)" />
             </td>
             <td>
               <div class="flex flex-wrap gap-1">
@@ -292,7 +303,7 @@ function formatTime(value: string | null): string {
     </p>
 
     <!-- Форма создания и правки: все реквизиты магазина (§11.2, Э8) -->
-    <StoreFormDialog v-model:visible="isFormOpen" :store="formStore" @saved="handleSaved" />
+    <StoreFormDialog v-model:visible="isFormOpen" :store="formStore" :copy-from="copyFrom" @saved="handleSaved" />
 
     <!-- Конфиг агента: тот же блок, что показывается сразу после создания -->
     <AgentConfigDialog

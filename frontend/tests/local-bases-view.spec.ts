@@ -27,12 +27,40 @@ function makeBase(overrides: Record<string, unknown> = {}): Record<string, unkno
   }
 }
 
+function makeJob(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 7, store_id: null, store_name: null, local_base_id: 2, local_base_name: 'Бухгалтерия',
+    kind: 'run_update_db_local', status: 'success', params: {}, attempts: 0, last_error: null,
+    log_files: [], created_by: 'admin', created_at: '2026-10-13T10:00:00Z',
+    started_at: '2026-10-13T10:00:01Z', finished_at: '2026-10-13T10:05:00Z',
+    last_message: null, excerpt_preview: null, ...overrides,
+  }
+}
+
+/** Маршрутизатор fetch: магазинные/локальные базы, журнал локальных обновлений. */
+function apiMock(localBases: unknown[], localJobs: unknown[] = []) {
+  return async (url: string): Promise<Response> => {
+    if (url.includes('/admin/local-bases')) return jsonResponse(localBases)
+    if (url.includes('/admin/jobs')) {
+      if (url.includes('kind=run_update_db_local'))
+        return jsonResponse({ items: localJobs, counts: {}, total: 0, active: 0 })
+      return jsonResponse({ items: [], counts: {}, total: 0, active: 0 })
+    }
+    return jsonResponse([])
+  }
+}
 const stubs = {
-  Button: { props: ['label'], template: '<button>{{ label }}</button>' },
+  Button: { props: ['label', 'disabled'], template: '<button :disabled="disabled">{{ label }}</button>' },
   Tag: { props: ['value'], template: '<span class="tag">{{ value }}</span>' },
   Message: { template: '<div class="stub-msg"><slot /></div>' },
-  InputText: { props: ['modelValue'], template: '<input />' },
-  Dialog: { props: ['visible'], template: '<div v-if="visible"><slot /></div>' },
+  InputText: {
+    props: ['modelValue'],
+    emits: ['update:modelValue'],
+    template: '<input :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" />',
+  },
+  Dialog: { props: ['visible'], template: '<div v-if="visible"><slot /><slot name="footer" /></div>' },
+  Checkbox: { props: ['modelValue'], template: '<input type="checkbox" />' },
+  RadioButton: { template: '<span />' },
 }
 
 async function mountView(fetchMock: ReturnType<typeof vi.fn>): Promise<VueWrapper> {
@@ -61,16 +89,13 @@ describe('страница «Локальные базы»', () => {
   })
 
   it('показывает группы и статус бэкапа (Д-20/Д-21)', async () => {
-    fetchMock.mockImplementation(async (url: string) => {
-      if (url.includes('/admin/local-bases')) {
-        return jsonResponse([
-          makeBase(),
-          makeBase({ id: 3, name: 'Зарплата', database_name: 'zp', group: 'Финансы', backup_status: 'missing' }),
-          makeBase({ id: 4, name: 'Торговля', database_name: 'trade', group: 'Продажи' }),
-        ])
-      }
-      return jsonResponse([])
-    })
+    fetchMock.mockImplementation(
+      apiMock([
+        makeBase(),
+        makeBase({ id: 3, name: 'Зарплата', database_name: 'zp', group: 'Финансы', backup_status: 'missing' }),
+        makeBase({ id: 4, name: 'Торговля', database_name: 'trade', group: 'Продажи' }),
+      ]),
+    )
 
     const wrapper = await mountView(fetchMock)
 
@@ -85,13 +110,37 @@ describe('страница «Локальные базы»', () => {
   })
 
   it('кнопка «Добавить базу» открывает форму', async () => {
-    fetchMock.mockImplementation(async () => jsonResponse([]))
+    fetchMock.mockImplementation(apiMock([]))
     const wrapper = await mountView(fetchMock)
 
     await wrapper.find('[data-test="lb-add"]').trigger('click')
     await flushPromises()
 
     expect(wrapper.find('[data-test="local-base-dialog"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('показывает статус последнего обновления базы из run_update_db_local (Д-24)', async () => {
+    fetchMock.mockImplementation(apiMock([makeBase()], [makeJob()]))
+
+    const wrapper = await mountView(fetchMock)
+
+    const status = wrapper.find('[data-test="lb-status-2"]')
+    expect(status.exists()).toBe(true)
+    expect(status.text()).toContain('успех')
+    wrapper.unmount()
+  })
+
+  it('кнопка «Обновить базу» открывает диалог обновления (Д-24)', async () => {
+    fetchMock.mockImplementation(apiMock([makeBase()]))
+
+    const wrapper = await mountView(fetchMock)
+
+    await wrapper.find('[data-test="lb-update-2"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lbu-file"]').exists()).toBe(true)
     wrapper.unmount()
   })
 })

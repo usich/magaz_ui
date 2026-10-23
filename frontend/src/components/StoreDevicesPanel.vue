@@ -69,11 +69,21 @@ watch(
 
 function openCreate(): void {
   editing.value = null
+  copyFrom.value = null
   isFormOpen.value = true
 }
 
 function openEdit(device: DeviceItem): void {
   editing.value = device
+  copyFrom.value = null
+  isFormOpen.value = true
+}
+
+/** «Скопировать» (Д-23): создать устройство по образцу — все поля, кроме имени. */
+const copyFrom = ref<DeviceItem | null>(null)
+function openCopy(device: DeviceItem): void {
+  copyFrom.value = device
+  editing.value = null
   isFormOpen.value = true
 }
 
@@ -264,6 +274,7 @@ function formatTime(value: string | null): string {
                   :disabled="!device.is_active"
                   @click="checkNow(device)"
                 />
+                <Button label="Скопировать" size="small" text :data-test="`equipment-copy-${device.id}`" @click="openCopy(device)" />
                 <Button label="Изменить" size="small" text @click="openEdit(device)" />
                 <Button
                   v-if="device.is_active"
@@ -299,6 +310,7 @@ function formatTime(value: string | null): string {
       v-model:visible="isFormOpen"
       :store-id="storeId"
       :device="editing"
+      :copy-from="copyFrom"
       @saved="onSaved"
     />
 

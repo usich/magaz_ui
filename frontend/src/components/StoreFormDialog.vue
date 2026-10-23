@@ -25,8 +25,10 @@ const props = withDefaults(
     visible: boolean
     /** `null` — создание магазина, иначе — правка переданного (§11.2) */
     store?: StoreItem | null
+    /** Источник для «Скопировать»: поля заполняются, но имя пустое и это создание */
+    copyFrom?: StoreItem | null
   }>(),
-  { store: null },
+  { store: null, copyFrom: null },
 )
 
 const emit = defineEmits<{
@@ -109,24 +111,24 @@ const isFormValid = computed(
 
 /** Заполнить форму значениями по умолчанию или реквизитами магазина (правка). */
 function reset(): void {
-  const store = props.store
+  const source = props.copyFrom ?? props.store
   Object.assign(form, emptyForm(), {
-    name: store?.name ?? '',
-    ip_address: store?.ip_address ?? '',
-    cluster_name: store?.cluster_name ?? '',
-    database_name: store?.database_name ?? '',
-    version_1c: store?.version_1c ?? '',
-    user_name_1c: store?.user_name_1c ?? 'Администратор',
-    agent_port: store?.agent_port ?? DEFAULT_AGENT_PORT,
-    comment: store?.comment ?? '',
-    extension_name: store?.extension_name ?? '',
-    is_active: store?.is_active ?? true,
-    backup_check_enabled: store?.backup_check_enabled ?? false,
-    backup_path: store?.backup_path ?? '',
-    backup_host: store?.backup_host ?? '',
-    backup_use_auth: store?.backup_use_auth ?? false,
-    backup_user: store?.backup_user ?? '',
-    backup_check_yesterday: store?.backup_check_yesterday ?? false,
+    name: props.copyFrom ? '' : (source?.name ?? ''),
+    ip_address: source?.ip_address ?? '',
+    cluster_name: source?.cluster_name ?? '',
+    database_name: source?.database_name ?? '',
+    version_1c: source?.version_1c ?? '',
+    user_name_1c: source?.user_name_1c ?? 'Администратор',
+    agent_port: source?.agent_port ?? DEFAULT_AGENT_PORT,
+    comment: source?.comment ?? '',
+    extension_name: source?.extension_name ?? '',
+    is_active: source?.is_active ?? true,
+    backup_check_enabled: source?.backup_check_enabled ?? false,
+    backup_path: source?.backup_path ?? '',
+    backup_host: source?.backup_host ?? '',
+    backup_use_auth: source?.backup_use_auth ?? false,
+    backup_user: source?.backup_user ?? '',
+    backup_check_yesterday: source?.backup_check_yesterday ?? false,
   })
   formError.value = ''
 }

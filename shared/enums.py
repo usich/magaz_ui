@@ -41,6 +41,9 @@ class CommandKind(StrEnum):
     NOTIFY_CANCEL = "notify_cancel"
     #: Э10: удаление файлов обновления в рабочей папке кассы
     DELETE_FILE = "delete_file"
+    #: Д-24: обновление **локальной** базы 1С напрямую на машине дашборда
+    #: (без агента) — выполняет LocalUpdateMonitor, а не диспетчер
+    RUN_UPDATE_DB_LOCAL = "run_update_db_local"
 
 
 class CommandStatus(StrEnum):

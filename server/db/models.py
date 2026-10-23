@@ -277,8 +277,14 @@ class Command(TimestampMixin, Base):
     __tablename__ = "commands"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    store_id: Mapped[int] = mapped_column(
-        ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True
+    # Д-24: `store_id` nullable — у локальной задачи (по базе на этой машине)
+    # магазина нет. `local_base_id` указывает на `local_bases`, и у задач магазина
+    # его нет. Ровно одно из полей заполнено.
+    store_id: Mapped[int | None] = mapped_column(
+        ForeignKey("stores.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    local_base_id: Mapped[int | None] = mapped_column(
+        ForeignKey("local_bases.id", ondelete="CASCADE"), nullable=True, index=True
     )
     kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -292,6 +298,7 @@ class Command(TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     store: Mapped["Store"] = relationship()
+    local_base: Mapped["LocalBase | None"] = relationship()
     logs: Mapped[list["JobLog"]] = relationship(
         back_populates="command",
         cascade="all, delete-orphan",

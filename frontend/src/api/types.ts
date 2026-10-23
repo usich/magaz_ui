@@ -216,6 +216,34 @@ export interface LocalBaseUpdatePayload {
   backup_check_yesterday?: boolean
 }
 
+/** Тело `POST /admin/local-bases/{id}/run-update` (Д-24): файл и режим. */
+export interface LocalBaseRunUpdatePayload {
+  /** Имя файла обновления: с расширением `.cf`/`.cfe` или без него. */
+  file_name?: string
+  /** Быстрое обновление без завершения сеансов. */
+  is_fast_update?: boolean
+  /** Явный тип: `true` — расширение (`.cfe`), `false` — основная конфигурация. */
+  is_extension?: boolean | null
+  /** Имя расширения, если обновляем его (иначе из карточки базы). */
+  extension_name?: string | null
+}
+
+/** Поставленная задача обновления локальной базы (Д-24). */
+export interface LocalBaseRunUpdateJob {
+  id: number
+  local_base_id: number
+  local_base_name: string | null
+  kind: string
+  status: string
+  created_at: string | null
+}
+
+/** Ответ `POST /admin/local-bases/{id}/run-update` (Д-24). */
+export interface LocalBaseRunUpdateResponse {
+  message: string
+  job: LocalBaseRunUpdateJob
+}
+
 /** Блок «что вписать в конфиг агента» (§11.2). */
 export interface AgentConfigBlock {
   store_id: number
@@ -297,8 +325,11 @@ export interface StoreListFilters {
 /** Задача в истории операций (§4.3, §11.6). Секретов здесь нет по построению. */
 export interface JobItem {
   id: number
-  store_id: number
+  // Д-24: локальная задача ссылается на базу, а не на магазин — `store_id` тогда `null`
+  store_id: number | null
   store_name: string | null
+  local_base_id: number | null
+  local_base_name: string | null
   kind: string
   status: string
   params: Record<string, unknown> | null
@@ -349,6 +380,7 @@ export interface JobsBulkDelete {
 
 export interface JobFilters {
   storeId?: number | null
+  localBaseId?: number | null
   kind?: string
   status?: string
   activeOnly?: boolean

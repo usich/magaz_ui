@@ -246,6 +246,48 @@ describe('страница «Магазины»', () => {
     wrapper.unmount()
   })
 
+  it('«Скопировать» открывает форму создания с полями магазина, кроме имени (Д-23)', async () => {
+    const calls: { method: string; body: unknown }[] = []
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit = {}) => {
+      calls.push({ method: init.method ?? 'GET', body: init.body })
+      if (init.method === 'POST') return jsonResponse(makeStore())
+      return jsonResponse([makeStore()])
+    })
+
+    const wrapper = await mountStores(fetchMock)
+    const copyButton = wrapper.find('[data-test="store-copy-1"]')
+    expect(copyButton.exists(), 'кнопка «Скопировать» есть в строке магазина').toBe(true)
+    await copyButton.trigger('click')
+
+    const nameInput = wrapper.find('[data-test="form-name"]') as unknown as { element: { value: string } }
+    expect(nameInput.element.value, 'имя при копировании пустое').toBe('')
+
+    // все остальные поля скопированы из исходного магазина
+    expect(
+      (wrapper.find('[data-test="form-ip"]') as unknown as { element: { value: string } }).element.value,
+    ).toBe('10.10.5.10')
+    expect(
+      (wrapper.find('[data-test="form-cluster"]') as unknown as { element: { value: string } }).element.value,
+    ).toBe('srv-1c')
+    expect(
+      (wrapper.find('[data-test="form-database"]') as unknown as { element: { value: string } }).element.value,
+    ).toBe('trade')
+
+    await wrapper.find('[data-test="form-name"]').setValue('Магазин-копия')
+    await wrapper.find('[data-test="save-store"]').trigger('click')
+    await flushPromises()
+
+    const created = calls.find((call) => call.method === 'POST')
+    expect(created, 'копия создаётся POST /stores').toBeTruthy()
+    expect(JSON.parse(String(created?.body))).toMatchObject({
+      name: 'Магазин-копия',
+      ip_address: '10.10.5.10',
+      cluster_name: 'srv-1c',
+    })
+    wrapper.unmount()
+  })
+
+
   it('кнопка «Конфиг» показывает agent-config.json магазина и скачивает файл (Э8)', async () => {
     const agentConfig = {
       store_id: 1,

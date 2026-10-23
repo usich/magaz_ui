@@ -120,6 +120,20 @@ class Settings(BaseSettings):
     #: HTTP-вызов (`/run-*`, `/check-*`) должен отвечать быстро (§5.1.1)
     agent_request_timeout_sec: float = 15.0
 
+    #: --- Обновление локальных баз 1С (Д-24) ---
+    #: Фоновая задача LocalUpdateMonitor: выполняет `1cv8.exe` напрямую на этой
+    #: машине для задач обновления локальных баз (`run_update_db_local`)
+    local_updater_enabled: bool = True
+    #: Пауза перед первым циклом LocalUpdateMonitor, с
+    local_updater_startup_delay_sec: float = 0.0
+    #: Интервал опроса очереди локальных задач, с
+    local_updater_interval_sec: int = 5
+    #: Корень установленных платформ 1С — `local_1c_path/<version_1c>/bin/1cv8.exe`
+    #: (аналог `base_1c_path` агента, I-14)
+    local_1c_path: str = ""
+    #: Рабочая папка локальных обновлений: сюда кладут `.cf/.cfe` и пишутся логи
+    local_update_dir: Path = DATA_DIR / "local-updates"
+
     #: Логи сервера
     log_level: str = "INFO"
     log_file: Path = LOG_DIR / "server.log"

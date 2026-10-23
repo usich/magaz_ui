@@ -28,6 +28,7 @@ from server.core.context import AppContext, build_app_context
 from server.core.dispatcher import CommandDispatcher
 from server.core.backup_monitor import BackupMonitor
 from server.core.health_monitor import HealthMonitor
+from server.core.local_updater import LocalUpdateMonitor
 from server.core.logging_setup import configure_logging
 from server.db.migrations import run_migrations
 from server.services import settings_service
@@ -69,6 +70,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     monitor: HealthMonitor | None = None
     dispatcher: CommandDispatcher | None = None
     backup_monitor: BackupMonitor | None = None
+    local_updater: LocalUpdateMonitor | None = None
     try:
         # Автоприменение миграций: идемпотентный `alembic upgrade head`. Защищает
         # от `no such column`, когда к рабочей БД ещё не подошла миграция, но
@@ -110,6 +112,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             backup_monitor.start()
         app.state.backup_monitor = backup_monitor
+
+        # Д-24: LocalUpdateMonitor — обновление локальных баз 1С напрямую
+        if settings.local_updater_enabled:
+            local_updater = LocalUpdateMonitor(
+                context.db,
+                settings,
+                secret_box=context.secret_box,
+            )
+            local_updater.start()
+        app.state.local_updater = local_updater
         yield
     except SQLAlchemyError:  # pragma: no cover - нужен реальный сбой БД
         logger.exception("Ошибка БД при старте сервера")
@@ -121,6 +133,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await monitor.stop()
         if backup_monitor is not None:
             await backup_monitor.stop()
+        if local_updater is not None:
+            await local_updater.stop()
         context.dispose()
         logger.info("Сервер остановлен")
 

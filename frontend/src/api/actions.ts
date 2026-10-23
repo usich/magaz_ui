@@ -62,19 +62,22 @@ export async function dispatchAction(
 
   if (isSingle(targets)) {
     const response = await actionsApi.run((targets.storeIds ?? [])[0], payload)
+    // Одиночная операция всегда магазинная — `store_id` у задачи гарантированно есть.
+    // Сужаем `number | null` до `number`: запасной вариант — id из `targets` (тот же магазин).
+    const storeId = response.job.store_id ?? (targets.storeIds ?? [])[0] ?? 0
     return {
       message: response.message,
       warning: response.warning,
       jobs: [
         {
-          store_id: response.job.store_id,
-          store_name: response.job.store_name ?? `#${response.job.store_id}`,
+          store_id: storeId,
+          store_name: response.job.store_name ?? `#${storeId}`,
           job_id: response.job.id,
           status: response.job.status,
         },
       ],
       skipped: 0,
-      storeIds: [response.job.store_id],
+      storeIds: [storeId],
     }
   }
 

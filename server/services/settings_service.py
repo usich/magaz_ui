@@ -48,6 +48,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "backup_start_hour": "10",
     "backup_max_tries": "5",
     "backup_retry_interval_sec": "600",
+    #: Д-24: интервал опроса очереди обновлений локальных баз
+    "local_update_interval_sec": "5",
 }
 
 #: Ключи, значение которых обязано быть неотрицательным целым

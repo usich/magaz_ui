@@ -20,7 +20,8 @@ from sqlalchemy.orm import Session
 from server.core.context import AppContext
 from server.core.dependencies import get_client_ip, get_context, get_db, require_active_admin
 from server.db.models import AdminUser, LocalBase
-from server.services import audit_service, backup_service, local_base_service
+from server.services import audit_service, backup_service, local_base_service, command_service
+from shared.enums import CommandKind
 from shared.timeutil import to_iso_z
 
 logger = logging.getLogger(__name__)
@@ -345,4 +346,129 @@ def set_credentials_endpoint(
         ip_address=get_client_ip(request),
     )
     return LocalBaseOut.from_model(row)
+
+
+
+# --- Обновление локальной базы (Д-24) ----------------------------------------
+
+
+class LocalUpdateRunRequest(BaseModel):
+    """Тело `POST /local-bases/{id}/run-update`: файл и режим операции.
+
+    `file_name` — имя файла обновления без расширения или с явным `.cf`/`.cfe`
+    (как у магазинов, Д-16); `is_fast_update` — быстрое обновление без завершения
+    сеансов; `is_extension` — явный тип (расширение/основная), если нужен.
+    """
+
+    file_name: str = "update"
+    is_fast_update: bool = False
+    is_extension: bool | None = None
+    extension_name: str | None = None
+
+
+class LocalUpdateJobOut(BaseModel):
+    """Поставленная задача обновления локальной базы (Д-24). Секретов нет."""
+
+    id: int
+    local_base_id: int
+    local_base_name: str | None = None
+    kind: str
+    status: str
+    created_at: str | None = None
+
+
+class LocalUpdateRunOut(BaseModel):
+    """Ответ `POST /local-bases/{id}/run-update`: задача в очереди (Д-24)."""
+
+    message: str
+    job: LocalUpdateJobOut
+
+
+@router.post(
+    "/{base_id}/run-update",
+    response_model=LocalUpdateRunOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Обновить локальную базу 1С (Д-24)",
+)
+def run_update_local_base(
+    base_id: int,
+    payload: LocalUpdateRunRequest,
+    request: Request,
+    admin: Annotated[AdminUser, Depends(require_active_admin)],
+    session: Annotated[Session, Depends(get_db)],
+) -> LocalUpdateRunOut:
+    """Поставить задачу обновления локальной базы в очередь (Д-24).
+
+    Задачу (`run_update_db_local`) выполнит LocalUpdateMonitor напрямую на этой
+    машине; ответ `202`, результат — в `/jobs` и журнале `/jobs/{id}`. Пароль 1С
+    в параметры не попадает (I-7): подключение берётся из карточки базы.
+    R12-запрет «одна локальная база — одно обновление» — под `dispatch_guard`.
+    """
+    from shared.paths import split_merge_file_name
+
+    row = _get_or_404(session, base_id)
+
+    params: dict[str, object] = {
+        "file_name": payload.file_name,
+        "is_fast_update": payload.is_fast_update,
+        "is_extension": payload.is_extension,
+    }
+    if payload.extension_name:
+        params["extension_name"] = payload.extension_name
+    else:
+        # Тип обновления по имени файла: `.cfe` → расширение, `.cf` → основная
+        _, suffix = split_merge_file_name(payload.file_name)
+        params["is_extension"] = bool(payload.is_extension) if payload.is_extension is not None else (suffix == ".cfe")
+
+    with command_service.dispatch_guard():
+        busy = command_service.find_local_update_conflict(session, row.id)
+        if busy is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"База «{row.name}» уже обновляется (задача #{busy.id}) — "
+                    "дождитесь завершения операции"
+                ),
+            )
+        job = command_service.create_local_command(
+            session,
+            local_base_id=row.id,
+            kind=CommandKind.RUN_UPDATE_DB_LOCAL,
+            params=params,
+            created_by=admin.username,
+        )
+        session.commit()
+
+    audit_service.record(
+        session,
+        action="local_base_run_update",
+        actor=admin.username,
+        entity="local_base",
+        entity_id=row.id,
+        details={
+            "file_name": payload.file_name,
+            "is_fast_update": payload.is_fast_update,
+            "is_extension": params["is_extension"],
+            "job_id": job.id,
+        },
+        ip_address=get_client_ip(request),
+    )
+    session.commit()
+    logger.info(
+        "Обновление локальной базы id=%s поставлено в очередь (задача #%s, %s)",
+        row.id,
+        job.id,
+        "быстрое" if payload.is_fast_update else "полное",
+    )
+    return LocalUpdateRunOut(
+        message=f"Обновление базы «{row.name}» поставлено в очередь",
+        job=LocalUpdateJobOut(
+            id=job.id,
+            local_base_id=row.id,
+            local_base_name=row.name,
+            kind=job.kind,
+            status=job.status,
+            created_at=to_iso_z(job.created_at),
+        ),
+    )
 

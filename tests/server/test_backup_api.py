@@ -148,3 +148,20 @@ def test_job_cancel_already_finished_conflict(auth_client: TestClient, session: 
     response = auth_client.post(f"/api/v1/admin/jobs/{command.id}/cancel")
     assert response.status_code == 409
 
+
+def test_backup_status_counts_yesterday_store_as_ok(auth_client: TestClient, session: Session) -> None:
+    """Д-21: магазин с проверкой «за вчера» и найденным бэкапом считается `ok` (не «0 из 1»)."""
+    import datetime
+
+    store = add_store(session, "Магазин №1", enabled=True, status="ok")
+    store.backup_check_yesterday = True
+    store.backup_checked_date = (
+        datetime.date.today() - datetime.timedelta(days=1)
+    ).isoformat()  # целевая дата (вчера) совпадает с проверенной
+    session.commit()
+
+    data = auth_client.get(STATUS_URL).json()
+    assert data["stores"]["total"] == 1
+    assert data["stores"]["ok"] == 1
+    assert data["stores"]["checked"] == 1
+

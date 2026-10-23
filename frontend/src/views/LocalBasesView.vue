@@ -14,9 +14,12 @@ import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
 import { ApiError } from '@/api/client'
-import type { LocalBaseItem } from '@/api/types'
+import { jobsApi } from '@/api/endpoints'
+import type { JobItem, LocalBaseItem } from '@/api/types'
 import LocalBaseFormDialog from '@/components/LocalBaseFormDialog.vue'
+import LocalBaseUpdateDialog from '@/components/LocalBaseUpdateDialog.vue'
 import { useLocalBasesStore } from '@/stores/local_bases'
+import { JOB_STATUS_LABELS, jobStatusSeverity } from '@/stores/jobs'
 
 const toast = useToast()
 const store = useLocalBasesStore()
@@ -36,14 +39,66 @@ const visibleItems = computed(() => {
   )
 })
 
-onMounted(() => void store.load())
+// Д-24: операции обновления локальных баз — статус по базе из run_update_db_local
+const localJobs = ref<JobItem[]>([])
+async function loadJobs(): Promise<void> {
+  const page = await jobsApi.list({ kind: 'run_update_db_local', limit: 200 })
+  localJobs.value = page.items
+}
+
+/** Последняя задача обновления по локальной базе (Д-24). */
+function lastLocalFor(jobs: JobItem[], localBaseId: number): JobItem | null {
+  let best: JobItem | null = null
+  for (const job of jobs) {
+    if (job.local_base_id !== localBaseId) continue
+    if (best === null || (job.created_at ?? '') > (best.created_at ?? '')) best = job
+  }
+  return best
+}
+
+// Диалог «Обновить базу» для локальной базы
+const updateBase = ref<LocalBaseItem | null>(null)
+const localUpdateVisible = computed({
+  get: () => updateBase.value !== null,
+  set: (value: boolean) => {
+    if (!value) updateBase.value = null
+  },
+})
+function openLocalUpdate(base: LocalBaseItem): void {
+  updateBase.value = base
+  localUpdateVisible.value = true
+}
+function onLocalUpdateSubmitted(): void {
+  void loadJobs()
+}
+
+function stageStatus(job: JobItem | null): { label: string; severity: string } {
+  if (!job) return { label: '—', severity: 'secondary' }
+  return { label: JOB_STATUS_LABELS[job.status] ?? job.status, severity: jobStatusSeverity(job.status) }
+}
+
+onMounted(() => {
+  void store.load()
+  void loadJobs()
+})
 
 function openCreate(): void {
   editingBase.value = null
+  copyFrom.value = null
   formVisible.value = true
 }
+
 function openEdit(base: LocalBaseItem): void {
   editingBase.value = base
+  copyFrom.value = null
+  formVisible.value = true
+}
+
+/** «Скопировать» (Д-23): создать базу по образцу — все поля, кроме имени. */
+const copyFrom = ref<LocalBaseItem | null>(null)
+function openCopy(base: LocalBaseItem): void {
+  copyFrom.value = base
+  editingBase.value = null
   formVisible.value = true
 }
 function onSaved(): void {
@@ -112,6 +167,7 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               <th class="py-2 pr-3 font-medium">Пользователь</th>
               <th class="py-2 pr-3 font-medium">Путь к базе</th>
               <th class="py-2 pr-3 font-medium">Бэкап</th>
+              <th class="py-2 pr-3 font-medium">Обновление</th>
               <th class="py-2 pr-3 text-right font-medium">Действия</th>
             </tr>
           </thead>
@@ -142,7 +198,22 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
                   :severity="base.backup_status === 'ok' ? 'success' : base.backup_status === 'missing' ? 'danger' : 'secondary'"
                 />
               </td>
+              <td class="py-2 pr-3 whitespace-nowrap">
+                <Tag
+                  :value="stageStatus(lastLocalFor(localJobs, base.id)).label"
+                  :severity="stageStatus(lastLocalFor(localJobs, base.id)).severity"
+                  :data-test="`lb-status-${base.id}`"
+                />
+              </td>
               <td class="py-2 pr-3 text-right whitespace-nowrap">
+                <Button
+                  label="Обновить базу"
+                  size="small"
+                  text
+                  :data-test="`lb-update-${base.id}`"
+                  @click="openLocalUpdate(base)"
+                />
+                <Button label="Скопировать" size="small" text :data-test="`lb-copy-${base.id}`" @click="openCopy(base)" />
                 <Button
                   label="Изменить"
                   size="small"
@@ -161,7 +232,7 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               </td>
             </tr>
             <tr v-if="!visibleItems.filter((item) => item.group === group).length">
-              <td colspan="7" class="magaz-muted py-4 text-center">Нет баз в этой группе</td>
+              <td colspan="8" class="magaz-muted py-4 text-center">Нет баз в этой группе</td>
             </tr>
           </tbody>
         </table>
@@ -172,7 +243,8 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
       Локальные базы ещё не добавлены — нажмите «Добавить базу».
     </div>
 
-    <LocalBaseFormDialog v-model:visible="formVisible" :base="editingBase" @saved="onSaved" />
+    <LocalBaseFormDialog v-model:visible="formVisible" :base="editingBase" :copy-from="copyFrom" @saved="onSaved" />
+    <LocalBaseUpdateDialog v-model:visible="localUpdateVisible" :base="updateBase" @submitted="onLocalUpdateSubmitted" />
   </div>
 </template>
 

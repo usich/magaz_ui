@@ -43,19 +43,24 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ACTIVE_STATUSES",
     "FINISHED_STATUSES",
+    "KIND_LABELS",
+    "LOCAL_UPDATE_KIND",
     "UPDATE_KINDS",
     "UpdateConflict",
     "add_log",
     "count_active",
     "counts_by_status",
     "create_command",
+    "create_local_command",
     "delete_command",
     "delete_commands",
     "dispatch_guard",
+    "find_local_update_conflict",
     "find_update_conflicts",
     "get_command",
     "list_commands",
     "list_pending",
+    "list_pending_local",
     "log_from_text",
     "register_attempt",
     "sanitize_params",
@@ -99,10 +104,15 @@ ERROR_MARKERS = ("Ошибка", "ошибка", "Error", "error", "FAILED")
 #: Виды задач, которые меняют серверную ИБ 1С: их параллельный запуск запрещён (R12)
 UPDATE_KINDS: tuple[str, ...] = (str(CommandKind.RUN_MERGE), str(CommandKind.RUN_UPDATE_DB))
 
+#: Вид задачи обновления **локальной** базы (Д-24): свой запрет R12, см.
+#: `find_local_update_conflict()` — одну локальную базу обновляет одна задача.
+LOCAL_UPDATE_KIND: str = str(CommandKind.RUN_UPDATE_DB_LOCAL)
+
 #: Человекочитаемые названия операций обновления — для текстов конфликтов R12
 KIND_LABELS: dict[str, str] = {
     str(CommandKind.RUN_MERGE): "слияние конфигурации",
     str(CommandKind.RUN_UPDATE_DB): "обновление конфигурации БД",
+    LOCAL_UPDATE_KIND: "обновление локальной базы",
 }
 
 #: Замок критического участка «проверка R12 → создание задач» (FR-28, §14.1)
@@ -233,12 +243,48 @@ def create_command(
     return command
 
 
+def create_local_command(
+    session: Session,
+    *,
+    local_base_id: int,
+    kind: str | CommandKind,
+    params: dict[str, Any] | None = None,
+    created_by: str | None = None,
+) -> Command:
+    """Создать задачу обновления **локальной** базы (Д-24) в статусе `queued`.
+
+    Локальную задачу подхватит `LocalUpdateMonitor`, а не диспетчер: она не
+    отправляется агенту, а выполняется `1cv8.exe` напрямую на этой машине.
+    Параметры проходят через `sanitize_params()` — пароль 1С не попадает в
+    `commands.params` (I-7); подключение берётся из карточки базы.
+    """
+    command = Command(
+        store_id=None,
+        local_base_id=local_base_id,
+        kind=str(kind),
+        params=sanitize_params(params),
+        status=CommandStatus.QUEUED,
+        attempts=0,
+        created_by=created_by,
+    )
+    session.add(command)
+    session.flush()
+    logger.info(
+        "Задача id=%s создана: локальная база %s, тип %s (автор %s)",
+        command.id,
+        local_base_id,
+        command.kind,
+        created_by or "—",
+    )
+    return command
+
+
 def get_command(session: Session, command_id: int) -> Command | None:
-    """Задача по id вместе с магазином и журналом (§11.6)."""
+    """Задача по id вместе с магазином/локальной базой и журналом (§11.6)."""
     stmt = (
         select(Command)
         .where(Command.id == command_id)
-        .options(selectinload(Command.store), selectinload(Command.logs))
+        .options(selectinload(Command.store), selectinload(Command.local_base), selectinload(Command.logs))
     )
     return session.scalars(stmt).one_or_none()
 
@@ -284,16 +330,27 @@ def list_commands(
     session: Session,
     *,
     store_id: int | None = None,
+    local_base_id: int | None = None,
     kind: str | None = None,
     status: str | None = None,
     active_only: bool = False,
     limit: int = 100,
     offset: int = 0,
 ) -> list[Command]:
-    """История задач для страницы `/jobs` (§11.6), новые — первыми."""
-    stmt = select(Command).options(selectinload(Command.store)).order_by(Command.id.desc())
+    """История задач для страницы `/jobs` (§11.6), новые — первыми.
+
+    `store_id` и `local_base_id` взаимоисключающие (Д-24): задача магазина
+    ссылается на магазин, локальная — на базу. Оба не заданы — все задачи.
+    """
+    stmt = (
+        select(Command)
+        .options(selectinload(Command.store), selectinload(Command.local_base))
+        .order_by(Command.id.desc())
+    )
     if store_id is not None:
         stmt = stmt.where(Command.store_id == store_id)
+    if local_base_id is not None:
+        stmt = stmt.where(Command.local_base_id == local_base_id)
     if kind:
         stmt = stmt.where(Command.kind == kind)
     if status:
@@ -304,16 +361,41 @@ def list_commands(
 
 
 def list_pending(session: Session) -> list[Command]:
-    """Незавершённые задачи всех магазинов — вход диспетчера (§3.3, FR-24).
+    """Незавершённые задачи магазинов — вход диспетчера (§3.3, FR-24).
 
     Дополнительно к «в работе» берём задачи в статусе `queued`: после
     перезапуска сервера очередь не теряется, а команды, не дошедшие до кассы,
-    отправляются снова.
+    отправляются снова. **Локальные** задачи (по базе на этой машине, Д-24)
+    отсюда исключены — их выполняет `LocalUpdateMonitor` (`list_pending_local`).
     """
     stmt = (
         select(Command)
-        .where(Command.status.in_(ACTIVE_STATUSES))
+        .where(
+            Command.status.in_(ACTIVE_STATUSES),
+            Command.store_id.is_not(None),
+            Command.local_base_id.is_(None),
+        )
         .options(selectinload(Command.store))
+        .order_by(Command.id)
+    )
+    return list(session.scalars(stmt).all())
+
+
+def list_pending_local(session: Session) -> list[Command]:
+    """Незавершённые задачи **локальных** баз — вход LocalUpdateMonitor (Д-24).
+
+    Это задачи с `local_base_id`, но без `store_id`: их не видит диспетчер
+    магазинов. `queued`/`running` — «в работе»; `running` встречается после
+    перезапуска сервера посреди операции — монитор продолжает выполнение.
+    """
+    stmt = (
+        select(Command)
+        .where(
+            Command.status.in_(ACTIVE_STATUSES),
+            Command.store_id.is_(None),
+            Command.local_base_id.is_not(None),
+        )
+        .options(selectinload(Command.local_base))
         .order_by(Command.id)
     )
     return list(session.scalars(stmt).all())
@@ -325,11 +407,15 @@ def count_active(session: Session) -> int:
     return int(session.scalar(stmt) or 0)
 
 
-def counts_by_status(session: Session, *, store_id: int | None = None) -> dict[str, int]:
+def counts_by_status(
+    session: Session, *, store_id: int | None = None, local_base_id: int | None = None
+) -> dict[str, int]:
     """Счётчики задач по статусам — фильтры страницы `/jobs` (§11.6)."""
     stmt = select(Command.status, func.count(Command.id)).group_by(Command.status)
     if store_id is not None:
         stmt = stmt.where(Command.store_id == store_id)
+    if local_base_id is not None:
+        stmt = stmt.where(Command.local_base_id == local_base_id)
     return {str(status): int(count) for status, count in session.execute(stmt).all()}
 
 
@@ -551,3 +637,25 @@ def dispatch_guard() -> Iterator[None]:
     """
     with _DISPATCH_LOCK:
         yield
+
+
+def find_local_update_conflict(session: Session, local_base_id: int) -> Command | None:
+    """Вернуть активную задачу обновления той же **локальной** базы, если есть (Д-24).
+
+    Аналог R12 для магазинов, но без «общей серверной ИБ»: локальная база — одна
+    на машину, поэтому достаточно запрета «одна база — одно обновление». Активной
+    считается задача `run_update_db_local` в статусе `queued`/`running`. Вызывается
+    под `dispatch_guard()`, чтобы два администратора не проскочили запрет.
+    """
+    stmt = (
+        select(Command)
+        .where(
+            Command.local_base_id == local_base_id,
+            Command.kind == LOCAL_UPDATE_KIND,
+            Command.status.in_(ACTIVE_STATUSES),
+        )
+        .order_by(Command.id)
+        .limit(1)
+    )
+    return session.scalar(stmt)
+

@@ -27,8 +27,10 @@ const props = withDefaults(
     storeId: number | null
     storeOptions?: { id: number; name: string }[]
     device?: DeviceItem | null
+    /** Источник для «Скопировать»: поля заполняются, но имя пустое и это создание */
+    copyFrom?: DeviceItem | null
   }>(),
-  { storeOptions: () => [], device: null },
+  { storeOptions: () => [], device: null, copyFrom: null },
 )
 
 const emit = defineEmits<{
@@ -54,14 +56,14 @@ const isPortNeeded = computed(() => form.check_type === 'tcp')
 
 /** Заполнить форму из устройства (правка) или значениями по умолчанию (добавление). */
 function reset(): void {
-  const device = props.device
+  const source = props.copyFrom ?? props.device
   form.storeId = props.storeId ?? props.storeOptions[0]?.id ?? null
-  form.name = device?.name ?? ''
-  form.ip_address = device?.ip_address ?? ''
-  form.device_type = device?.device_type ?? 'camera'
-  form.check_type = device?.check_type ?? 'icmp'
-  form.check_port = device?.check_port ? String(device.check_port) : ''
-  form.comment = device?.comment ?? ''
+  form.name = props.copyFrom ? '' : (source?.name ?? '')
+  form.ip_address = source?.ip_address ?? ''
+  form.device_type = source?.device_type ?? 'camera'
+  form.check_type = source?.check_type ?? 'icmp'
+  form.check_port = source?.check_port ? String(source.check_port) : ''
+  form.comment = source?.comment ?? ''
   formError.value = ''
 }
 

@@ -102,13 +102,19 @@ def _today_iso() -> str:
     return date.today().isoformat()
 
 
-def _category(items: list[tuple[str, str | None]], target: str) -> BackupCategory:
-    """Свернуть список `(status, checked_date)` в сводку по категории."""
+def _category(items: list[tuple[str, str | None, bool]]) -> BackupCategory:
+    """Свернуть список `(status, checked_date, yesterday)` в сводку по категории.
+
+    Целевая дата каждого объекта — сегодня или вчера (`backup_check_yesterday`),
+    поэтому `ok`/`missing` считаются по совпадению с его целевой датой, а не только
+    с сегодняшней (иначе у магазинов с проверкой «за вчера» «0 из 1» при наличном
+    бэкапе).
+    """
     cat = BackupCategory()
-    for status, checked_date in items:
+    for status, checked_date, yesterday in items:
         cat.total += 1
-        current = checked_date == target
-        if not current:
+        target = parse_target_date(yesterday, reference=date.today())
+        if checked_date != target:
             continue
         cat.checked += 1
         if status == "ok":
@@ -139,26 +145,24 @@ def backup_status_endpoint(
     session: Annotated[Session, Depends(get_db)],
 ) -> BackupStatusOut:
     """Сколько бэкапов есть/нет — для блока «Бэкапы» на главной (Д-21)."""
-    today = _today_iso()
-
     store_rows = list(session.scalars(select(Store).where(Store.is_active.is_(True))))
     base_rows = list(session.scalars(select(LocalBase).where(LocalBase.is_active.is_(True))))
 
     store_items = [
-        (s.backup_status or "", s.backup_checked_date)
+        (s.backup_status or "", s.backup_checked_date, bool(s.backup_check_yesterday))
         for s in store_rows
         if s.backup_check_enabled
     ]
     base_items = [
-        (b.backup_status or "", b.backup_checked_date)
+        (b.backup_status or "", b.backup_checked_date, bool(b.backup_check_yesterday))
         for b in base_rows
         if b.backup_check_enabled
     ]
 
     next_check_iso = _next_auto_check(session)
     return BackupStatusOut(
-        stores=_category(store_items, today),
-        local_bases=_category(base_items, today),
+        stores=_category(store_items),
+        local_bases=_category(base_items),
         next_check_iso=next_check_iso,
     )
 
