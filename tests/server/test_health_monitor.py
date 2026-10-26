@@ -25,6 +25,7 @@ from tests.server.agent_mock import (
     ok_transport,
     status_transport,
     timeout_transport,
+    transport_from_handler,
 )
 
 WINDOW_SEC = 45
@@ -100,6 +101,31 @@ class TestSingleCycle:
         refreshed = read_store(engine, store.id)
         assert refreshed.last_seen_at is None, "неудачный опрос не двигает last_seen_at"
         assert refreshed.is_online(window_sec=WINDOW_SEC) is False
+
+    async def test_shared_client_sends_agent_token_header(
+        self,
+        settings: Settings,
+        db_manager: DatabaseManager,
+        store,  # noqa: ANN001
+    ) -> None:
+        """При переиспользовании общего клиента уходит `X-Agent-Token`.
+
+        Health Monitor в бою опрашивает всех одним `httpx.AsyncClient` (без
+        headers), а токен должен добавляться на каждый запрос явно — иначе агент
+        отвечал бы `401` на автоматический опрос (регресс переиспользования).
+        """
+        seen_tokens: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_tokens.append(request.headers.get("x-agent-token", ""))
+            if request.headers.get("x-agent-token", "") != store.agent_token:
+                return httpx.Response(401, json={"detail": "Неверный токен"})
+            return httpx.Response(200, json=health_body(store_id=store.id))
+
+        report = await run_cycle(db_manager, settings, transport=transport_from_handler(handler))
+
+        assert report.ok_count == 1, "боевой путь с общим клиентом должен пройти авторизацию"
+        assert seen_tokens and seen_tokens[0] == store.agent_token
 
     async def test_agent_rejecting_token_is_reported_as_auth_error(
         self, settings: Settings, db_manager: DatabaseManager, store  # noqa: ANN001

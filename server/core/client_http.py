@@ -210,8 +210,13 @@ class AgentClient:
         try:
             # URL собирается из target.base_url, а не из base_url клиента, чтобы
             # один общий httpx-клиент (без base_url) мог ходить к разным агентам.
+            # Заголовки (X-Agent-Token магазина) передаются на каждый запрос явно:
+            # общий клиент в Health Monitor создаётся БЕЗ headers, поэтому иначе
+            # токен не уходил бы и агент отвечал 401 Unauthorized.
             url = f"{self.target.base_url}{path}"
-            return await self.client.request(method, url, json=json_body, params=query)
+            return await self.client.request(
+                method, url, json=json_body, params=query, headers=self.target.headers
+            )
         except httpx.HTTPError as exc:
             logger.debug(
                 "Агент магазина id=%s недоступен (%s %s): %s",
