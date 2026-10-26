@@ -184,7 +184,10 @@ def _cmd_run(args: argparse.Namespace, config: AgentConfig, config_path: str | N
 
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI (без аргументов — `run` в терминале, как `--console`)."""
-    args = _build_parser().parse_args(argv)
+    # `parse_known_args`, а не `parse_args`: скрипты установки передают службе
+    # `install --startup auto` (§14.2), и эти аргументы должен разобрать
+    # `win32serviceutil`, а не argparse CLI (иначе «unrecognized arguments»).
+    args, _extra = _build_parser().parse_known_args(argv)
     command = args.command or "run"
 
     if command in SERVICE_COMMANDS:

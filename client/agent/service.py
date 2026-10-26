@@ -149,9 +149,11 @@ def run_service_command(command: str, argv: list[str] | None = None) -> int:
     import win32serviceutil
 
     arguments = list(argv or sys.argv)
-    # `HandleCommandLine` ждёт argv вида [`<exe>`, `<команда>`] — остальное он
-    # разберёт сам (`--startup auto` и прочее добавят скрипты установки)
-    handle_argv = [arguments[0], command]
+    # `HandleCommandLine` понимает `[<exe>, <команда>, ...]`, а `--startup auto`
+    # (и прочие опции win32serviceutil) он разбирает сам — поэтому передаём их,
+    # а не отбрасываем (иначе `install --startup auto` поставил бы службу без
+    # автозапуска, а argparse CLI на них падал бы «unrecognized arguments»).
+    handle_argv = [arguments[0], command, *arguments[1:]]
     win32serviceutil.HandleCommandLine(build_service_class(), argv=handle_argv)
     logger.info("Команда службы %s выполнена: %s", SERVICE_NAME, command)
     return 0
