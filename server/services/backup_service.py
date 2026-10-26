@@ -16,12 +16,17 @@
 from __future__ import annotations
 
 import logging
+import socket
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from smb.SMBConnection import SMBConnection
 
 logger = logging.getLogger(__name__)
+
+#: Сколько ждать TCP-connect к SMB-порту хоста. Недоступный хост не должен
+#: задерживать обход: короткий таймаут → мгновенный статус «недоступен».
+SMB_CONNECT_TIMEOUT_SEC = 2.0
 
 __all__ = [
     "BackupCheckError",
@@ -88,6 +93,23 @@ def _filename_has_date(filename: str, target_iso: str) -> bool:
     return compact in name
 
 
+def _host_reachable(host: str, *, timeout: float = SMB_CONNECT_TIMEOUT_SEC) -> bool:
+    """Открыт ли на хосте SMB-порт (445, затем 139) — быстрый TCP-connect.
+
+    Не даёт гарантии доступа к конкретной шаре, но отсеивает **недоступные**
+    хосты без долгих таймаутов `os.listdir`/pysmb (которые могут висеть по
+    10+ сек на хост и тормозить обход бэкапов). Проверка всегда продолжается
+    для доступных хостов.
+    """
+    for port in (445, 139):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _check_local(path: str, target_iso: str) -> BackupCheckResult:
     """Локальный путь: список файлов через файловую систему Windows."""
     import os
@@ -129,7 +151,7 @@ def _check_smb(
             use_ntlm_v2=True,
         )
         try:
-            conn.connect(host, port, timeout=10)
+            conn.connect(host, port, timeout=4)
         except Exception as exc:  # noqa: BLE001 - pysmb бросает разные типы
             errors.append(f"порт {port}: {type(exc).__name__} ({exc})")
             continue
@@ -178,6 +200,16 @@ def check_backup(
 
     unc = resolve_unc_path(path)
     if unc is not None:
+        # Быстрый TCP-probe SMB-порта: недоступный хост отсекаем сразу, без
+        # долгих таймаутов `os.listdir`/pysmb (иначе каждый недоступный хост
+        # висел бы по 10+ сек и тормозил обход). Проверка для доступных хостов
+        # продолжается обычным путём.
+        if not _host_reachable(unc[0]):
+            return BackupCheckResult(
+                found=False,
+                error=f"Хост {unc[0]} недоступен (SMB-порт 445/139 не отвечает за "
+                f"{SMB_CONNECT_TIMEOUT_SEC:.0f} с)",
+            )
         # Основной способ для сетевого пути — файловая система Windows по UNC
         # (`os.listdir`), как ходит проводник: Windows сама аутентифицируется
         # текущей сессией/сохранёнными учётными. pysmb на многих современных

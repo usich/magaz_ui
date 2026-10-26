@@ -65,3 +65,28 @@ def test_check_local_missing_dir_reports_error(tmp_path) -> None:  # noqa: ANN00
     # Недоступная папка → BackupCheckError (монитор трактует как «бэкапа нет»)
     with pytest.raises(BackupCheckError):
         _check_local(str(tmp_path / "нет-такой-папки"), "2026-10-22")
+
+
+def test_check_backup_unreachable_smb_host_is_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Недоступный SMB-хост не должен висеть на os.listdir/pysmb.
+
+    TCP-probe (`_host_reachable`) отсекает хост сразу: `check_backup` возвращает
+    `found=False` с ошибкой «недоступен», не трогая локальную ФС по UNC и pysmb.
+    """
+    import server.services.backup_service as bs
+
+    calls: list[str] = []
+    monkeypatch.setattr(bs, "_host_reachable", lambda *a, **k: False)
+    monkeypatch.setattr(bs, "_check_local", lambda *a, **k: calls.append("_check_local"))
+    monkeypatch.setattr(bs, "_check_smb", lambda *a, **k: calls.append("_check_smb"))
+
+    result = check_backup(
+        "\\\\недоступный-хост\\backup\\buh", yesterday=False, reference=date(2026, 10, 22)
+    )
+
+    assert result.found is False
+    assert "недоступен" in (result.error or "")
+    # Ни os.listdir по UNC, ни pysmb не вызывались — проверка мгновенная
+    assert calls == []
