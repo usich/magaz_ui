@@ -22,16 +22,42 @@ if /i "%~2"=="--no-tray" set "NO_TRAY=1"
 
 if not exist "%TARGET%" mkdir "%TARGET%"
 
-echo [1/4] Проверка файлов в "%TARGET%" ...
+rem Скрипт самодостаточен: недостающие файлы берутся из каталога, где лежит
+rem этот bat (то есть из дистрибутива), и копируются в %TARGET%. Так дистрибутив
+rem можно распаковать в любую папку и запустить install_agent.bat без ручного
+rem копирования exe в целевой каталог.
+set "SCRIPT_DIR=%~dp0"
+
+echo [1/4] Развёртывание файлов в "%TARGET%" ...
 if not exist "%TARGET%\magaz-agent.exe" (
-  echo      ОШИБКА: не найден "%TARGET%\magaz-agent.exe".
-  echo      Скопируйте magaz-agent.exe, MagazTrayAgent.exe и agent-config.json
-  echo      из дистрибутива в "%TARGET%" и запустите скрипт снова.
-  exit /b 1
+  if exist "%SCRIPT_DIR%magaz-agent.exe" (
+    copy /y "%SCRIPT_DIR%magaz-agent.exe" "%TARGET%\" >nul
+    echo      Скопирован magaz-agent.exe из дистрибутива.
+  ) else (
+    echo      ОШИБКА: magaz-agent.exe нет ни в "%TARGET%", ни рядом со скриптом.
+    echo      Каталог скрипта: %SCRIPT_DIR%
+    echo      Положите magaz-agent.exe рядом со скриптом или в "%TARGET%" и запустите снова.
+    exit /b 1
+  )
+)
+if not exist "%TARGET%\MagazTrayAgent.exe" (
+  if exist "%SCRIPT_DIR%MagazTrayAgent.exe" (
+    copy /y "%SCRIPT_DIR%MagazTrayAgent.exe" "%TARGET%\" >nul
+    echo      Скопирован MagazTrayAgent.exe из дистрибутива.
+  ) else (
+    echo      ПРЕДУПРЕЖДЕНИЕ: MagazTrayAgent.exe не найден ни в "%TARGET%", ни рядом
+    echo      со скриптом. TrayAgent не будет зарегистрирован, эквивалентно --no-tray.
+  )
 )
 if not exist "%TARGET%\agent-config.json" (
-  echo      ПРЕДУПРЕЖДЕНИЕ: нет agent-config.json — возьмите его в карточке
-  echo      магазина: store_id, server_url, agent_token, base_1c_path.
+  if exist "%SCRIPT_DIR%agent-config.json" (
+    copy /y "%SCRIPT_DIR%agent-config.json" "%TARGET%\" >nul
+    echo      Скопирован agent-config.json из дистрибутива.
+  ) else (
+    echo      ПРЕДУПРЕЖДЕНИЕ: нет agent-config.json.
+    echo      Возьмите его в карточке магазина: store_id, server_url, agent_token, base_1c_path.
+    echo      Положите рядом со скриптом или в "%TARGET%", затем перезапустите скрипт.
+  )
 )
 
 echo [2/4] Установка службы MagazAgent ...
