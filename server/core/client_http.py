@@ -148,17 +148,23 @@ class AgentClient:
         *,
         timeout: float = 5.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         self.target = target
         self.timeout = float(timeout)
         self._transport = transport
-        self._client: httpx.AsyncClient | None = None
+        # Общий httpx-клиент, переданный снаружи (Health Monitor переиспользует
+        # одно соединение на весь цикл опроса — на Windows это резко снижает
+        # число исходящих сбоев, из-за которых Proactor «застревал» на accept).
+        # Если клиент передан, мы не владеем им и не закрываем его.
+        self._client = client
+        self._owns_client = client is None
 
     # --- Жизненный цикл -----------------------------------------------------
 
     @property
     def client(self) -> httpx.AsyncClient:
-        """Лениво созданный httpx-клиент (I-10: ничего на импорте)."""
+        """httpx-клиент: общий (извне) или лениво созданный свой (I-10)."""
         if self._client is None:
             self._client = httpx.AsyncClient(
                 base_url=self.target.base_url,
@@ -171,6 +177,7 @@ class AgentClient:
                 # (см. регресс-тест `TestProxyIsIgnored`)
                 trust_env=False,
             )
+            self._owns_client = True
         return self._client
 
     async def __aenter__(self) -> "AgentClient":
@@ -180,8 +187,8 @@ class AgentClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Закрыть соединения (идемпотентно)."""
-        if self._client is not None:
+        """Закрыть соединения (идемпотентно); общий клиент не трогаем."""
+        if self._client is not None and self._owns_client:
             await self._client.aclose()
             self._client = None
 
@@ -201,7 +208,10 @@ class AgentClient:
         (Э4 использует статус `/check-*` как результат операции).
         """
         try:
-            return await self.client.request(method, path, json=json_body, params=query)
+            # URL собирается из target.base_url, а не из base_url клиента, чтобы
+            # один общий httpx-клиент (без base_url) мог ходить к разным агентам.
+            url = f"{self.target.base_url}{path}"
+            return await self.client.request(method, url, json=json_body, params=query)
         except httpx.HTTPError as exc:
             logger.debug(
                 "Агент магазина id=%s недоступен (%s %s): %s",

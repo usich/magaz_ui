@@ -135,11 +135,14 @@ async def poll_store(
     timeout: float,
     transport: httpx.AsyncBaseTransport | None = None,
     client_factory: ClientFactory | None = None,
+    shared_client: httpx.AsyncClient | None = None,
 ) -> StoreHealthResult:
     """Опросить один магазин: `GET /health` с таймаутом.
 
     Любая ошибка обращения к агенту — это результат проверки («офлайн»), а не
     исключение наружу: мониторинг обязан переживать недоступные кассы.
+    `shared_client` — общий httpx-клиент на весь цикл опроса (переиспользование
+    соединений; см. `poll_targets`).
     """
     started = time.perf_counter()
 
@@ -150,6 +153,11 @@ async def poll_store(
         if client_factory is not None:
             client = client_factory(target, timeout, transport)
             async with client:
+                health = await client.get_health()
+        elif shared_client is not None:
+            async with AgentClient(
+                target, timeout=timeout, transport=transport, client=shared_client
+            ) as client:
                 health = await client.get_health()
         else:
             async with AgentClient(target, timeout=timeout, transport=transport) as client:
@@ -194,7 +202,14 @@ async def poll_targets(
     transport: httpx.AsyncBaseTransport | None = None,
     client_factory: ClientFactory | None = None,
 ) -> list[StoreHealthResult]:
-    """Опросить список магазинов параллельно, не превышая `concurrency`."""
+    """Опросить список магазинов параллельно, не превышая `concurrency`.
+
+    В бою (без `client_factory`) используется **один** общий `httpx.AsyncClient`
+    на весь цикл: соединения переиспользуются, а не открываются заново на каждый
+    магазин. На Windows это резко снижает число исходящих сбоев к недоступным
+    хостам, из-за которых asyncio Proactor «застревал» на приёме входящих
+    соединений и админка «провисала».
+    """
     if not targets:
         return []
 
@@ -203,10 +218,23 @@ async def poll_targets(
     async def guarded(target: AgentTarget) -> StoreHealthResult:
         async with semaphore:
             return await poll_store(
-                target, timeout=timeout, transport=transport, client_factory=client_factory
+                target,
+                timeout=timeout,
+                transport=transport,
+                client_factory=client_factory,
+                shared_client=shared_client,
             )
 
-    return list(await asyncio.gather(*(guarded(target) for target in targets)))
+    if client_factory is not None:
+        # Тесты: каждый запрос через свою фабрику (подменённый транспорт).
+        shared_client = None
+        return list(await asyncio.gather(*(guarded(target) for target in targets)))
+
+    # Боевой путь: один общий клиент на весь цикл опроса.
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout), trust_env=False, transport=transport
+    ) as shared_client:
+        return list(await asyncio.gather(*(guarded(target) for target in targets)))
 
 
 async def run_cycle(
