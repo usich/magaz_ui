@@ -112,6 +112,8 @@ def build_service_class():  # noqa: ANN201 - класс создаётся ди�
             Логи пишутся в `C:\\ProgramData\\MagazAgent\\logs\\agent.log`
             (`configure_logging`), а не в консоль: у службы консоли нет.
             """
+            import threading
+
             import uvicorn
 
             config = load_config()
@@ -131,7 +133,12 @@ def build_service_class():  # noqa: ANN201 - класс создаётся ди�
                 config.store_id,
                 config.port,
             )
-            self.server.run()
+            self.ReportServiceStatus(win32service.SERVICE_START_PENDING)
+            thread = threading.Thread(target=self.server.run, daemon=True)
+            thread.start()
+            self.ReportServiceStatus(win32service.SERVICE_RUNNING)
+            # Держим службу запущенной до сигнала остановки (`SvcStop`).
+            win32event.WaitForSingleObject(self.stop_event, win32event.INFINITE)
 
     return MagazAgentService
 
