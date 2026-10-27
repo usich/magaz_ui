@@ -48,12 +48,15 @@ RUNTIME_BINARIES = _pyside6_runtime_binaries()
 
 #: `Qt6Core.dll` импортирует `icuuc.dll` (и `icuin.dll`) — PySide6 их не
 #: поставляет, а полагается на системную ICU Windows. На «чистой» кассе её
-#: может не быть (или версия не та) → «DLL load failed while importing QtCore».
-#: Поэтому включаем ICU из System32 сборочной машины в exe.
+#: нет → «DLL load failed while importing QtCore».
+#: Включаем ICU из System32 в exe, но кладём её в ту же подпапку `PySide6\`,
+#: где лежит Qt6Core.dll: Windows при загрузке DLL ищет зависимости СНАЧАЛА
+#: в каталоге самой DLL, и если положить icuuc в корень архива, на кассе без
+#: системной ICU она не найдётся.
 def _system_icu_binaries() -> list[tuple[str, str]]:
     system32 = Path("C:/Windows/System32")
     names = ("icuuc.dll", "icuin.dll")
-    return [(str(system32 / name), ".") for name in names]
+    return [(str(system32 / name), "PySide6") for name in names]
 
 
 RUNTIME_BINARIES = _pyside6_runtime_binaries() + _system_icu_binaries()
