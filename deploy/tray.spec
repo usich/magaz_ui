@@ -53,10 +53,49 @@ RUNTIME_BINARIES = _pyside6_runtime_binaries()
 #: где лежит Qt6Core.dll: Windows при загрузке DLL ищет зависимости СНАЧАЛА
 #: в каталоге самой DLL, и если положить icuuc в корень архива, на кассе без
 #: системной ICU она не найдётся.
+def _pe_machine(path: Path) -> int | None:
+    """Читает поле Machine из PE-заголовка: 0x8664=AMD64, 0xAA64=ARM64."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    pe = data.find(b"PE\x00\x00")
+    if pe < 0 or pe + 6 > len(data):
+        return None
+    return data[pe + 4] | (data[pe + 5] << 8)
+
+
 def _system_icu_binaries() -> list[tuple[str, str]]:
+    """Системную ICU кладём в exe, только если она той же разрядности, что PySide6.
+
+    Ошибка «%1 не является приложением Win32» (WinError 193): на сборочной
+    машине под Windows on ARM `C:\\Windows\\System32\\icuuc.dll` имеет разрядность
+    ARM64, а PySide6/Qt6Core — AMD64. Если такую ICU включить в exe, Qt6Core
+    (AMD64) найдёт её в `_MEIxxx\\PySide6\\` и упадёт с WinError 193 на x64-кассах.
+    Поэтому берём ICU из System32 только при совпадении разрядности с Qt;
+    иначе Qt6Core подтянет совместимую `icuuc.dll` из System32 целевой кассы."""
+    fn = "_system_icu_binaries"
+    try:
+        import PySide6
+    except Exception:
+        # спека не под сборку GUI (маловероятно) — не мешаем PyInstaller-хукам
+        return []
+    pyside_dir = Path(PySide6.__file__).resolve().parent
+    qt_core = pyside_dir / "Qt6Core.dll"
+    qt_machine = _pe_machine(qt_core)
+    if qt_machine is None:
+        return []
     system32 = Path("C:/Windows/System32")
-    names = ("icuuc.dll", "icuin.dll")
-    return [(str(system32 / name), "PySide6") for name in names]
+    out: list[tuple[str, str]] = []
+    for name in ("icuuc.dll", "icuin.dll"):
+        src = system32 / name
+        if _pe_machine(src) != qt_machine:
+            print(f"[{fn}] {name} bitness "
+                  f"({_pe_machine(src)}) != Qt6Core ({qt_machine}); skip, "
+                  "use system ICU on target")
+            continue
+        out.append((str(src), "PySide6"))
+    return out
 
 
 RUNTIME_BINARIES = _pyside6_runtime_binaries() + _system_icu_binaries()
