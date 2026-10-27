@@ -26,10 +26,31 @@ QT_HIDDEN_IMPORTS = [
     "PySide6.QtWidgets",
 ]
 
+#: VC++ runtime DLL, без которых `Qt6Core.dll` не загружается на чистой кассе
+#: («DLL load failed while importing QtCore»). PyInstaller не всегда включает их
+#: сам, поэтому форсируем из каталога PySide6. Путь PySide6 ищем из окружения
+#: сборочной машины, где ставится requirements-build.txt.
+def _pyside6_runtime_binaries() -> list[tuple[str, str]]:
+    import PySide6
+
+    pyside_dir = Path(PySide6.__file__).resolve().parent
+    names = (
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "msvcp140_2.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+    )
+    return [(str(pyside_dir / name), ".") for name in names]
+
+
+RUNTIME_BINARIES = _pyside6_runtime_binaries()
+
 a = Analysis(  # noqa: F821 - задаёт PyInstaller
     [str(REPO_ROOT / "client" / "tray" / "__main__.py")],
     pathex=[str(REPO_ROOT)],
-    binaries=[],
+    # VC++ runtime для Qt6Core.dll (иначе «DLL load failed while importing QtCore»)
+    binaries=RUNTIME_BINARIES,
     datas=[],
     # Интерфейс и значок — Qt; часть подмодулей подгружается по именам, поэтому
     # перечисляем их явно (см. QT_HIDDEN_IMPORTS)
