@@ -196,7 +196,10 @@ def _run_as_service() -> int:
     from client.agent.service import build_service_class
 
     servicemanager.Initialize()
-    servicemanager.PrepareServiceHosting(build_service_class())
+    # В pywin32 метод называется `PrepareToHostSingle` (PrepareServiceHosting
+    # не существует) — регистрируем класс службы, после чего диспетчер служб
+    # вызывает SvcDoRun и шлёт SCM статусы.
+    servicemanager.PrepareToHostSingle(build_service_class())
     servicemanager.StartServiceCtrlDispatcher()
     return 0
 
