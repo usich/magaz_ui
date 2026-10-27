@@ -1,29 +1,35 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller-спек TrayAgent: `MagazTrayAgent.exe`.
+"""PyInstaller-спек TrayAgent (§12 Э6, §7.4): `MagazTrayAgent.exe`.
 
 Показывает уведомления в сессии пользователя: служба живёт в Session 0 и окон
-не показывает. Exe собирается без консоли: он запускается Планировщиком при
-входе, и чёрное окно на экране кассира недопустимо. Поэтому логи трея идут в
-файл C:\ProgramData\MagazAgent\logs\tray.log.
+не показывает (R3). Exe собирается **без консоли**: он запускается Планировщиком
+при входе, и чёрное окно на экране кассира недопустимо. Поэтому логи трея идут в
+файл `C:\\ProgramData\\MagazAgent\\logs\\tray.log` (`configure_tray_logging`,
+параметр `interval` в bat-скрипте).
 
 Сборка (со сборочной машины):
 
-    pyinstaller --clean --noconfirm deploy\tray.spec
+    pyinstaller --clean --noconfirm deploy\\tray.spec
 """
 
 from pathlib import Path
 
+#: Корень репозитория: `SPECPATH` — каталог спеки (`deploy\`), поэтому на уровень выше
+#: (та же находка Э7, что и в `agent.spec`: `parents[1]` уходил выше репозитория).
 REPO_ROOT = Path(SPECPATH).resolve().parent  # noqa: F821 - задаёт PyInstaller
 
+#: Модули Qt, которые подгружаются по именам: PyInstaller не видит их статически.
+#: Интерфейс трея — PySide6 (спека 1.22): окна, значок `QSystemTrayIcon`, графика.
 QT_HIDDEN_IMPORTS = [
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
 ]
 
-
-#: VC++ runtime DLL, без которых Qt6Core.dll не загружается на чистой кассе.
-#: PyInstaller не всегда включает их сам, поэтому форсируем из каталога PySide6.
+#: VC++ runtime DLL, без которых `Qt6Core.dll` не загружается на чистой кассе
+#: («DLL load failed while importing QtCore»). PyInstaller не всегда включает их
+#: сам, поэтому форсируем из каталога PySide6. Путь PySide6 ищем из окружения
+#: сборочной машины, где ставится requirements-build.txt.
 def _pyside6_runtime_binaries() -> list[tuple[str, str]]:
     import PySide6
 
@@ -38,8 +44,17 @@ def _pyside6_runtime_binaries() -> list[tuple[str, str]]:
     return [(str(pyside_dir / name), ".") for name in names]
 
 
+RUNTIME_BINARIES = _pyside6_runtime_binaries()
+
+#: `Qt6Core.dll` импортирует `icuuc.dll` (и `icuin.dll`) — PySide6 их не
+#: поставляет, а полагается на системную ICU Windows. На «чистой» кассе её
+#: нет → «DLL load failed while importing QtCore».
+#: Включаем ICU из System32 в exe, но кладём её в ту же подпапку `PySide6\`,
+#: где лежит Qt6Core.dll: Windows при загрузке DLL ищет зависимости СНАЧАЛА
+#: в каталоге самой DLL, и если положить icuuc в корень архива, на кассе без
+#: системной ICU она не найдётся.
 def _pe_machine(path: Path) -> int | None:
-    """Читает поле Machine из PE-заголовка: 0x8664=AMD64, 0xAA64=ARM64, 0x14c=x86."""
+    """Читает поле Machine из PE-заголовка: 0x8664=AMD64, 0xAA64=ARM64."""
     try:
         data = path.read_bytes()
     except OSError:
@@ -50,59 +65,53 @@ def _pe_machine(path: Path) -> int | None:
     return data[pe + 4] | (data[pe + 5] << 8)
 
 
-#: Qt6Core.dll жёстко импортирует icuuc.dll. PySide6 её не поставляет и полагается
-#: на системную ICU Windows. Без неё на кассе падает
-#: «DLL load failed while importing QtCore: Не найден указанный модуль» (WinErr 126).
-#: Кладём ICU в подпапку PySide6\: Windows ищет зависимости DLL сначала в каталоге
-#: самой DLL, и Qt6Core найдёт icuuc рядом с собой (_MEIxxx\PySide6\).
-#:
-#: Что берём:
-#:   * если системная System32 ICU той же разрядности, что Qt (обычная x64-сборка),
-#:     берём её (icuuc.dll + icuin.dll);
-#:   * если System32 ICU несовместима (сборочная машина под Windows on ARM даёт
-#:     ARM64) — включаем автономную AMD64 ICU 74 из deploy/vendor_icu/.
-#:
-#: ICU кладём в `datas`, а не `binaries`: PyInstaller отбрасывает из `binaries`
-#: системные DLL (icuuc.dll есть в System32), а `datas` копирует как есть и в
-#: onefile попадают в _MEI.
-def _icu_entries() -> list[tuple[str, str]]:
+def _system_icu_binaries() -> list[tuple[str, str]]:
+    """Системную ICU кладём в exe, только если она той же разрядности, что PySide6.
+
+    Ошибка «%1 не является приложением Win32» (WinError 193): на сборочной
+    машине под Windows on ARM `C:\\Windows\\System32\\icuuc.dll` имеет разрядность
+    ARM64, а PySide6/Qt6Core — AMD64. Если такую ICU включить в exe, Qt6Core
+    (AMD64) найдёт её в `_MEIxxx\\PySide6\\` и упадёт с WinError 193 на x64-кассах.
+    Поэтому берём ICU из System32 только при совпадении разрядности с Qt;
+    иначе Qt6Core подтянет совместимую `icuuc.dll` из System32 целевой кассы."""
+    fn = "_system_icu_binaries"
     try:
         import PySide6
     except Exception:
+        # спека не под сборку GUI (маловероятно) — не мешаем PyInstaller-хукам
         return []
     pyside_dir = Path(PySide6.__file__).resolve().parent
-    qt_machine = _pe_machine(pyside_dir / "Qt6Core.dll")
+    qt_core = pyside_dir / "Qt6Core.dll"
+    qt_machine = _pe_machine(qt_core)
     if qt_machine is None:
         return []
     system32 = Path("C:/Windows/System32")
-    if any(_pe_machine(system32 / n) == qt_machine
-           for n in ("icuuc.dll", "icuin.dll")):
-        print("[_icu_entries] system ICU matches Qt bitness; bundling")
-        out = [(str(system32 / n), "PySide6")
-               for n in ("icuuc.dll", "icuin.dll")
-               if (system32 / n).exists()]
-        if out:
-            return out
-    vendor = Path(SPECPATH).joinpath("vendor_icu")  # noqa: F821
-    if vendor.joinpath("icuuc.dll").exists():
-        print(f"[_icu_entries] system ICU incompatible; bundling vendor ICU "
-              f"from {vendor}")
-        out = [(str(vendor / "icuuc.dll"), "PySide6")]
-        if (vendor / "icudt74.dll").exists():
-            out.append((str(vendor / "icudt74.dll"), "PySide6"))
-        return out
-    return []
+    out: list[tuple[str, str]] = []
+    for name in ("icuuc.dll", "icuin.dll"):
+        src = system32 / name
+        if _pe_machine(src) != qt_machine:
+            print(f"[{fn}] {name} bitness "
+                  f"({_pe_machine(src)}) != Qt6Core ({qt_machine}); skip, "
+                  "use system ICU on target")
+            continue
+        out.append((str(src), "PySide6"))
+    return out
 
 
-RUNTIME_BINARIES = _pyside6_runtime_binaries()
-ICU_DATAS = _icu_entries()
+RUNTIME_BINARIES = _pyside6_runtime_binaries() + _system_icu_binaries()
+
 a = Analysis(  # noqa: F821 - задаёт PyInstaller
     [str(REPO_ROOT / "client" / "tray" / "__main__.py")],
     pathex=[str(REPO_ROOT)],
     # VC++ runtime для Qt6Core.dll (иначе «DLL load failed while importing QtCore»)
     binaries=RUNTIME_BINARIES,
-    datas=ICU_DATAS,
+    datas=[],
+    # Интерфейс и значок — Qt; часть подмодулей подгружается по именам, поэтому
+    # перечисляем их явно (см. QT_HIDDEN_IMPORTS)
     hiddenimports=QT_HIDDEN_IMPORTS,
+    # Трею не нужны серверные и служебные зависимости: он ходит только на 127.0.0.1.
+    # Qt-модули, которых у трея нет (WebEngine, QML, 3D), исключаем: иначе exe
+    # вырастает на сотни мегабайт, а кассе нужен только виджетный стек (§7.4)
     excludes=[
         "uvicorn",
         "fastapi",
@@ -157,7 +166,7 @@ exe = EXE(  # noqa: F821 - задаёт PyInstaller
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=False,  # окно трея: консоль не нужна (см. докстроку)
+    console=False,  # окно трея: консоли быть не должно (см. докстроку)
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
