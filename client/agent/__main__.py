@@ -182,6 +182,25 @@ def _cmd_run(args: argparse.Namespace, config: AgentConfig, config_path: str | N
     return 0
 
 
+def _run_as_service() -> int:
+    """Запустить процесс как службу Windows (вызывается из `main` при `-service`).
+
+    Служба запускает `magaz-agent.exe -service` (см. `_exe_args_` в `service.py`):
+    в этом режиме exe не запускает uvicorn как консольное приложение, а передаёт
+    управление диспетчеру служб, который вызывает `SvcDoRun` и отправляет SCM
+    статусы (иначе SCM ждал бы `SERVICE_RUNNING` и падал с ошибкой 1053, хотя
+    uvicorn уже отвечал на 8383).
+    """
+    import servicemanager
+
+    from client.agent.service import build_service_class
+
+    servicemanager.Initialize()
+    servicemanager.PrepareServiceHosting(build_service_class())
+    servicemanager.StartServiceCtrlDispatcher()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI (без аргументов — `run` в терминале, как `--console`)."""
     # `parse_known_args`, а не `parse_args`: скрипты установки передают службе
@@ -189,6 +208,11 @@ def main(argv: list[str] | None = None) -> int:
     # `win32serviceutil`, а не argparse CLI (иначе «unrecognized arguments»).
     args, _extra = _build_parser().parse_known_args(argv)
     command = args.command or "run"
+
+    # Служба Windows запускает exe с `-service`/`--service`: это НЕ подкоманда
+    # CLI, а признак «стать процессом службы» (см. `_run_as_service`).
+    if "-service" in _extra or "--service" in _extra:
+        return _run_as_service()
 
     if command in SERVICE_COMMANDS:
         return _cmd_service(command, [sys.argv[0], *sys.argv[2:]])

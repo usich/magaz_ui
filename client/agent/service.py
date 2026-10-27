@@ -82,6 +82,11 @@ def build_service_class():  # noqa: ANN201 - класс создаётся ди�
         _svc_name_ = SERVICE_NAME
         _svc_display_name_ = SERVICE_DISPLAY_NAME
         _svc_description_ = SERVICE_DESCRIPTION
+        # Служба (frozen exe) запускает сам `magaz-agent.exe`, а не pythonservice.exe.
+        # `_exe_args_` добавляет `-service`, по которому CLI понимает «стать службой»
+        # и вызывает `servicemanager` (иначе CLI шёл бы в `run`, SCM не получал бы
+        # SERVICE_RUNNING и падал с ошибкой 1053 при живом uvicorn-процессе).
+        _exe_args_ = " -service"
 
         def __init__(self, args) -> None:  # noqa: ANN001 - аргументы SCM
             win32serviceutil.ServiceFramework.__init__(self, args)
