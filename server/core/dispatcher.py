@@ -600,28 +600,29 @@ class CommandDispatcher:
 
         Пароль 1С не едет в теле команды (П-1, I-7): его сервер доставляет
         отдельно push-ом `POST /credentials`, а агент подставляет из своего
-        зашифрованного профиля. Если касса ещё не получила текущую версию
-        пароля (версии в `/health` расходятся), запуск `/run-merge`/`/run-update-db`
-        уйдёт **без** `/P` — 1С откроет диалог аутентификации и конфигуратор
-        зависнет, а лог успеха не запишется. Поэтому перед постановкой 1С-операции
-        убеждаемся, что пароль на кассе актуален, и при расхождении досылаем его
-        push-ом — только затем запускаем операцию.
+        зашифрованного профиля. Совпадение версий `credentials_version` в
+        `/health` **не гарантирует**, что пароль на кассе реально расшифруется:
+        `password_enc` может быть пустым или зашифрованным старым ключом профиля
+        (в логе агента — «Пароль 1С из профиля не расшифрован: ключ профиля не
+        подходит»). Поэтому перед каждой 1С-операцией сервер **всегда** досылает
+        `/credentials`: `apply_push` перешифрует пароль текущим ключом кассы, и
+        операция гарантированно получит `/P`. Иначе команда уйдёт без `/P`, 1С
+        откроет диалог аутентификации и конфигуратор зависнет, а лог успеха не
+        запишется.
         """
-        health = await client.get_health()
-        if health.credentials_version != store.credentials_version:
-            await client.push_credentials(
-                CredentialsPush(
-                    user_name=store.user_name_1c,
-                    password=self._decrypt_password(store),
-                    credentials_version=store.credentials_version,
-                )
+        await client.push_credentials(
+            CredentialsPush(
+                user_name=store.user_name_1c,
+                password=self._decrypt_password(store),
+                credentials_version=store.credentials_version,
             )
-            report.credentials_pushed += 1
-            logger.info(
-                "Магазин id=%s: пароль 1С дослан перед 1С-операцией (версия %s)",
-                store.id,
-                store.credentials_version,
-            )
+        )
+        report.credentials_pushed += 1
+        logger.info(
+            "Магазин id=%s: пароль 1С дослан перед 1С-операцией (версия %s)",
+            store.id,
+            store.credentials_version,
+        )
 
         payload = build_1c_payload(store, command)
         if str(command.kind) == str(CommandKind.RUN_MERGE):

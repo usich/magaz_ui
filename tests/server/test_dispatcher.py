@@ -334,7 +334,15 @@ class TestReferenceScenario:
 
         state = fresh(session, command.id)
         assert "password" not in (state.params or {})
-        assert STORE_PASSWORD not in json.dumps(agent.json_bodies(), ensure_ascii=False)
+        # I-7: пароль не уходит в команду 1С и не лежит в истории задачи. Он может
+        # быть только в теле push-а `POST /credentials` (санкционированный канал П-1).
+        merge_bodies = [
+            item["json"]
+            for item in agent.requests
+            if item["path"] in ("/run-merge", "/run-update-db")
+        ]
+        assert all("password" not in (b or {}) for b in merge_bodies)
+        assert STORE_PASSWORD not in json.dumps(merge_bodies, ensure_ascii=False)
         assert (
             STORE_PASSWORD
             not in json.dumps(
@@ -342,6 +350,10 @@ class TestReferenceScenario:
                 ensure_ascii=False,
             )
         ), "в истории задач пароля нет (§4.3)"
+        # Пароль доставлен кассе push-ом — это и есть единственный его путь (П-1)
+        assert any(
+            item["path"] == "/credentials" for item in agent.requests
+        ), "сервер дослал пароль push-ом перед операцией"
 
     async def test_merge_failure_sets_failed_with_log(
         self, manager: DatabaseManager, settings: Settings, session: Session
@@ -495,9 +507,17 @@ class TestReferenceScenario:
         assert "Обновление конфигурации успешно завершено" in (update_state.log_excerpt or "")
         assert update_state.log_files == ["log-update-db.txt"]
 
-        # I-7: пароль не встречается ни в одном теле запроса к кассе
-        assert STORE_PASSWORD not in json.dumps(agent.json_bodies(), ensure_ascii=False)
-        assert "/credentials" not in agent.paths(), "версии совпали — push не нужен"
+        # I-7: пароль не уходит в команды 1С — только в push `POST /credentials` (П-1)
+        merge_bodies = [
+            item["json"]
+            for item in agent.requests
+            if item["path"] in ("/run-merge", "/run-update-db")
+        ]
+        assert all("password" not in (b or {}) for b in merge_bodies)
+        assert STORE_PASSWORD not in json.dumps(merge_bodies, ensure_ascii=False)
+        assert any(
+            item["path"] == "/credentials" for item in agent.requests
+        ), "пароль дослан push-ом перед 1С-операцией (П-1)"
         # Д-18: после полного обновления создаётся notify-задача «Можно входить»
         # — она в очереди, а не завершена в этом же цикле.
         statuses = {
@@ -617,6 +637,10 @@ class TestNoDuplicateOnBrokenChannel:
             requests.append({"method": request.method, "path": path})
             if path == "/health":
                 return httpx.Response(200, json=health_body(busy=busy))
+            if path == "/credentials":
+                # П-1: сервер всегда досылает пароль перед 1С-операцией — агент
+                # отвечает 200; рвётся именно `/run-merge` (проверяем разрыв на отправке)
+                return httpx.Response(200, json={"stored": True, "credentials_version": 1})
             if path == "/run-merge":
                 raise httpx.ConnectError(
                     "соединение разорвано: удалённый хост не ответил", request=request
@@ -818,18 +842,21 @@ class TestCredentialsPush:
         assert report.credentials_pushed == 0
         assert agent.credentials_pushes == []
 
-    async def test_password_is_resent_before_merge_when_versions_differ(
+    async def test_password_is_always_resent_before_merge(
         self,
         manager: DatabaseManager,
         settings: Settings,
         session: Session,
         secret_box: SecretBox,
     ) -> None:
-        """П-1: перед `/run-merge` сервер досылает пароль, если версии расходятся.
+        """П-1: перед `/run-merge` сервер всегда досылает пароль push-ом.
 
-        Если касса ещё не получила текущую версию пароля (например, была офлайн
-        и push не дошёл), запуск слияния ушёл бы без `/P` — 1С открыла бы диалог
-        аутентификации и конфигуратор завис. Гарантия: push до постановки операции.
+        Совпадение версий `credentials_version` не гарантирует, что пароль на кассе
+        расшифровывается (`password_enc` может быть пуст или зашифрован старым
+        ключом — в логе агента «ключ профиля не подходит»). Поэтому перед каждой
+        1С-операцией сервер безусловно шлёт `/credentials`: `apply_push` перешифрует
+        пароль текущим ключом кассы, и команда не уйдёт без `/P` (иначе 1С открыла бы
+        диалог аутентификации и конфигуратор завис).
         """
         seed_settings(session)
         store = make_store(
@@ -842,7 +869,8 @@ class TestCredentialsPush:
         command = add_command(
             session, store, CommandKind.RUN_MERGE, {"file_name": "update"}
         )
-        agent = ScriptedAgent(credentials_version=1)
+        # Версии совпадают (4=4) — но пароль всё равно досылается перед операцией
+        agent = ScriptedAgent(credentials_version=4)
         dispatcher = build_dispatcher(
             manager, settings, transport=agent.transport, secret_box=secret_box
         )
@@ -854,6 +882,7 @@ class TestCredentialsPush:
         assert "/credentials" in paths[:merge_at], (
             "пароль досылается до запуска слияния, а не после него"
         )
+        assert agent.credentials_pushes, "push `/credentials` выполнен перед операцией"
         assert agent.credentials_version == 4, "касса приняла актуальную версию пароля"
         assert fresh(session, command.id).status == CommandStatus.SENT
         assert report.credentials_pushed >= 1
