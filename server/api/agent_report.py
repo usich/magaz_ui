@@ -24,6 +24,7 @@ from server.config import API_PREFIX
 from server.core.context import AppContext
 from server.core.dependencies import get_admin_store, get_context, get_db
 from server.db.models import Command, Store
+from server.db.session import flush_with_retry
 from server.services import command_service, device_service, notification_service
 from shared.enums import CommandStatus
 from shared.schemas import (
@@ -255,7 +256,10 @@ def agent_receipts(
         )
 
     summary = notification_service.apply_receipts(session, store, payload)
-    session.flush()
+    # Приём квитанций идёт из потока uvicorn параллельно с фоновыми циклами
+    # (Health Monitor, диспетчер): при «database is locked» повторяем пачку,
+    # а не отдаём кассе 500 — иначе квитанция потеряется до следующей досылки.
+    flush_with_retry(session)
     return ReceiptAck(
         store_id=store.id,
         created=summary["created"],

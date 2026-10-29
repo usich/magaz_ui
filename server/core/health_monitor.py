@@ -30,6 +30,7 @@ from typing import Any, Callable
 
 import httpx
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from server.config import Settings
 from server.core.client_http import (
@@ -41,7 +42,7 @@ from server.core.client_http import (
     build_agent_target,
 )
 from server.db.models import Store
-from server.db.session import DatabaseManager
+from server.db.session import DatabaseManager, commit_with_retry
 from server.services import settings_service
 from shared.schemas import HealthResponse
 from shared.timeutil import utcnow
@@ -270,17 +271,24 @@ async def run_cycle(
     )
 
     with db.session() as session:
-        for result in results:
-            health = result.health
-            if health is None:
-                continue
-            store = session.get(Store, result.store_id)
-            if store is None:  # pragma: no cover - магазин удалён во время цикла
-                continue
-            store.last_seen_at = result.checked_at
-            store.agent_version = health.agent_version
-            store.os_info = health.os
-        session.commit()
+        try:
+            for result in results:
+                health = result.health
+                if health is None:
+                    continue
+                store = session.get(Store, result.store_id)
+                if store is None:  # pragma: no cover - магазин удалён во время цикла
+                    continue
+                store.last_seen_at = result.checked_at
+                store.agent_version = health.agent_version
+                store.os_info = health.os
+            commit_with_retry(session)
+        except OperationalError:
+            # Блокировка файла БД (параллельно пишут диспетчер/API): откатываем,
+            # чтобы сессия не осталась в PendingRollbackError, и пропускаем
+            # запись самодокладов — следующий цикл всё повторит.
+            session.rollback()
+            logger.warning("Запись самодокладов пропущена: БД заблокирована")
 
     report = MonitorCycleReport(started_at=started_at, finished_at=utcnow(), results=results)
     logger.debug("Цикл мониторинга: %s", report.as_dict())

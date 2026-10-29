@@ -54,7 +54,7 @@ from server.core.client_http import (
 )
 from server.core.security import SecretBox
 from server.db.models import Command, FileCheck, Store
-from server.db.session import DatabaseManager
+from server.db.session import DatabaseManager, commit_with_retry, flush_with_retry
 from server.services import (
     command_service,
     device_service,
@@ -194,7 +194,9 @@ def apply_file_check(
         checked_at=checked_at or utcnow(),
     )
     session.add(snapshot)
-    session.flush()
+    # Снимок пишется из фонового цикла параллельно с Health Monitor и API:
+    # при блокировке файла БД повторяем запись, а не роняем задачу.
+    flush_with_retry(session)
     return snapshot
 
 
@@ -361,6 +363,7 @@ class CommandDispatcher:
                         report=report,
                     )
                     continue
+                command_id = command.id
                 try:
                     if str(command.status) == str(CommandStatus.QUEUED):
                         await self._send(session, store, command, report)
@@ -369,11 +372,15 @@ class CommandDispatcher:
                 except AgentError as exc:
                     self._handle_error(session, store, command, exc, report)
                 except Exception:  # noqa: BLE001 - одна задача не роняет цикл
-                    logger.exception("Неожиданный сбой обработки задачи id=%s", command.id)
-                    report.errors.append(f"Задача {command.id}: внутренняя ошибка")
+                    # Ошибка БД (например, «database is locked») оставляет сессию
+                    # в PendingRollbackError: без rollback любое обращение к её
+                    # объектам (и финальный commit) падало вторично.
+                    session.rollback()
+                    logger.exception("Неожиданный сбой обработки задачи id=%s", command_id)
+                    report.errors.append(f"Задача {command_id}: внутренняя ошибка")
             self._prune(seen)
             await self._sync_pushes(session, report)
-            session.commit()
+            commit_with_retry(session)
         finally:
             session.close()
 

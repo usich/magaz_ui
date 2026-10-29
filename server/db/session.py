@@ -9,15 +9,24 @@ SQLite требует двух вещей, без которых поведен�
 from __future__ import annotations
 
 from functools import lru_cache
+from time import sleep
 from typing import Any
 
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from server.config import get_settings
 
 #: Сколько секунд SQLite ждёт освобождения блокировки файла БД (фоновые задачи + API)
-SQLITE_BUSY_TIMEOUT_SEC = 30
+SQLITE_BUSY_TIMEOUT_SEC = 60
+
+#: Сколько попыток записи с rollback делаем при «database is locked». WAL снимает
+#: конфликты читатель/писатель, но фоновый цикл диспетчера держит write-транзакцию
+#: во время HTTP-опросов, поэтому короткие коммиты API всё равно могут упереться
+#: в блокировку. Пара попыток с паузой дешевле потерянной квитанции/задачи.
+_SQLITE_LOCKED_RETRIES = 3
+_SQLITE_LOCKED_BACKOFF_SEC = 0.4
 
 
 def _enable_sqlite_foreign_keys(dbapi_connection: Any, _record: Any) -> None:  # noqa: ANN401
@@ -63,6 +72,47 @@ def create_db_engine(url: str, *, echo: bool = False) -> Engine:
     if url.startswith("sqlite"):
         event.listen(engine, "connect", _enable_sqlite_foreign_keys)
     return engine
+
+
+def commit_with_retry(session: Session) -> None:
+    """Коммит сессии SQLite с повторными попытками при «database is locked».
+
+    WAL снимает конфликт читатель/писатель, но фоновый цикл диспетчера держит
+    write-транзакцию во время HTTP-опросов, поэтому короткий коммит API может
+    упереться в блокировку и после busy_timeout. Вместо 500-ошибки пробуем ещё
+    пару раз: после rollback прежние изменения сессии отбрасываются, поэтому
+    вызывающий должен повторно собрать только финальный *лёгкий* коммит
+    (flush уже выполнен в hot-точках; для тяжёлой работы флаш разбит на шаги).
+    """
+    _retry_locked(session, session.commit)  # type: ignore[arg-type]
+
+
+def flush_with_retry(session: Session) -> None:
+    """Flush сессии SQLite с повторными попытками при «database is locked».
+
+    Применяется к коротким пачкам изменений (приём квитанций, снапшот файла),
+    которые в один ход отправляются в БД: повторить их дешевле, чем отдать
+    500-ошибку кассе или потерять задачу.
+    """
+    _retry_locked(session, session.flush)  # type: ignore[arg-type]
+
+
+def _retry_locked(session: Session, operation: Any) -> None:  # noqa: ANN401
+    last: OperationalError | None = None
+    for attempt in range(_SQLITE_LOCKED_RETRIES):
+        try:
+            operation()
+            return
+        except OperationalError as exc:  # noqa: PERF203 - мало итераций
+            message = str(exc.orig)
+            if "locked" not in message.lower():
+                raise
+            last = exc
+            session.rollback()
+            if attempt + 1 < _SQLITE_LOCKED_RETRIES:
+                sleep(_SQLITE_LOCKED_BACKOFF_SEC * (attempt + 1))
+    # noqa: B904 - повторно поднимаем исходную SQLite-ошибку
+    raise last  # type: ignore[misc]
 
 
 class DatabaseManager:
