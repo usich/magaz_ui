@@ -818,6 +818,46 @@ class TestCredentialsPush:
         assert report.credentials_pushed == 0
         assert agent.credentials_pushes == []
 
+    async def test_password_is_resent_before_merge_when_versions_differ(
+        self,
+        manager: DatabaseManager,
+        settings: Settings,
+        session: Session,
+        secret_box: SecretBox,
+    ) -> None:
+        """П-1: перед `/run-merge` сервер досылает пароль, если версии расходятся.
+
+        Если касса ещё не получила текущую версию пароля (например, была офлайн
+        и push не дошёл), запуск слияния ушёл бы без `/P` — 1С открыла бы диалог
+        аутентификации и конфигуратор завис. Гарантия: push до постановки операции.
+        """
+        seed_settings(session)
+        store = make_store(
+            session,
+            online=True,
+            password=STORE_PASSWORD,
+            credentials_version=4,
+            secret_box=secret_box,
+        )
+        command = add_command(
+            session, store, CommandKind.RUN_MERGE, {"file_name": "update"}
+        )
+        agent = ScriptedAgent(credentials_version=1)
+        dispatcher = build_dispatcher(
+            manager, settings, transport=agent.transport, secret_box=secret_box
+        )
+
+        report = await dispatcher.process_once()
+
+        paths = agent.paths()
+        merge_at = paths.index("/run-merge")
+        assert "/credentials" in paths[:merge_at], (
+            "пароль досылается до запуска слияния, а не после него"
+        )
+        assert agent.credentials_version == 4, "касса приняла актуальную версию пароля"
+        assert fresh(session, command.id).status == CommandStatus.SENT
+        assert report.credentials_pushed >= 1
+
 
 class TestDevicesPush:
     """Д-1/§7.6: сервер сам досылает список оборудования по расхождению версий."""
