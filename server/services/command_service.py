@@ -183,8 +183,14 @@ def add_log(
     message: str | None,
     *,
     level: str | JobLogLevel = JobLogLevel.INFO,
+    flush: bool = True,
 ) -> JobLog | None:
-    """Добавить строку журнала задачи (§4.4). Пустые строки не пишем."""
+    """Добавить строку журнала задачи (§4.4). Пустые строки не пишем.
+
+    `flush=False` — для массовых операций: там десятки строк на одну
+    транзакцию, и flush на каждую превращался в ожидание блокировки БД
+    (bulk-постановка задач «подвешивала» API). Вызывающий делает один flush.
+    """
     if message is None:
         return None
     text = str(message).strip()
@@ -195,7 +201,8 @@ def add_log(
 
     entry = JobLog(command_id=command.id, level=str(level), message=text)
     session.add(entry)
-    session.flush()
+    if flush:
+        session.flush()
     return entry
 
 
@@ -227,11 +234,16 @@ def create_command(
     kind: str | CommandKind,
     params: dict[str, Any] | None = None,
     created_by: str | None = None,
+    flush: bool = True,
 ) -> Command:
     """Создать задачу в статусе `queued` (§4.3): её подхватит диспетчер.
 
     Параметры проходят через `sanitize_params()` — пароль 1С в `commands.params`
     не попадает никогда (I-7).
+
+    `flush=False` используют массовые операции: они ставят десятки задач в одну
+    транзакцию и делают единственный flush в конце. Промежуточный flush на
+    каждую задачу упирался в блокировку БД и «подвешивал» запуск из UI.
     """
     command = Command(
         store_id=store_id,
@@ -242,14 +254,15 @@ def create_command(
         created_by=created_by,
     )
     session.add(command)
-    session.flush()
-    logger.info(
-        "Задача id=%s создана: магазин %s, тип %s (автор %s)",
-        command.id,
-        store_id,
-        command.kind,
-        created_by or "—",
-    )
+    if flush:
+        session.flush()
+        logger.info(
+            "Задача id=%s создана: магазин %s, тип %s (автор %s)",
+            command.id,
+            store_id,
+            command.kind,
+            created_by or "—",
+        )
     return command
 
 
@@ -260,6 +273,7 @@ def create_local_command(
     kind: str | CommandKind,
     params: dict[str, Any] | None = None,
     created_by: str | None = None,
+    flush: bool = True,
 ) -> Command:
     """Создать задачу обновления **локальной** базы (Д-24) в статусе `queued`.
 
@@ -267,6 +281,8 @@ def create_local_command(
     отправляется агенту, а выполняется `1cv8.exe` напрямую на этой машине.
     Параметры проходят через `sanitize_params()` — пароль 1С не попадает в
     `commands.params` (I-7); подключение берётся из карточки базы.
+
+    `flush=False` — для массовой постановки (аналог `create_command`).
     """
     command = Command(
         store_id=None,
@@ -278,14 +294,15 @@ def create_local_command(
         created_by=created_by,
     )
     session.add(command)
-    session.flush()
-    logger.info(
-        "Задача id=%s создана: локальная база %s, тип %s (автор %s)",
-        command.id,
-        local_base_id,
-        command.kind,
-        created_by or "—",
-    )
+    if flush:
+        session.flush()
+        logger.info(
+            "Задача id=%s создана: локальная база %s, тип %s (автор %s)",
+            command.id,
+            local_base_id,
+            command.kind,
+            created_by or "—",
+        )
     return command
 
 

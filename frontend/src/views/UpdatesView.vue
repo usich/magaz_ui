@@ -66,6 +66,7 @@ function toggleAll(): void {
 // Задачи этапов
 const mergeJobs = ref<JobItem[]>([])
 const updateJobs = ref<JobItem[]>([])
+const checkJobs = ref<JobItem[]>([])
 const recentJobs = ref<JobItem[]>([])
 // Д-24/Д-26: операции локальных баз по видам (обновление / слияние / проверка файлов)
 const localJobs = ref<JobItem[]>([])
@@ -76,9 +77,10 @@ const jobsLoading = ref(false)
 async function loadJobs(): Promise<void> {
   jobsLoading.value = true
   try {
-    const [merge, update, recent, local, localMerge, localCheck] = await Promise.all([
+    const [merge, update, checkFiles, recent, local, localMerge, localCheck] = await Promise.all([
       jobsApi.list({ kind: 'run_merge', limit: 200 }),
       jobsApi.list({ kind: 'run_update_db', limit: 200 }),
+      jobsApi.list({ kind: 'check_files', limit: 200 }),
       jobsApi.list({ kind: '', limit: 40 }),
       jobsApi.list({ kind: 'run_update_db_local', limit: 200 }),
       jobsApi.list({ kind: 'run_merge_local', limit: 200 }),
@@ -86,6 +88,7 @@ async function loadJobs(): Promise<void> {
     ])
     mergeJobs.value = merge.items
     updateJobs.value = update.items
+    checkJobs.value = checkFiles.items
     recentJobs.value = recent.items
     localJobs.value = local.items
     localMergeJobs.value = localMerge.items
@@ -202,7 +205,7 @@ const counts = computed(() => {
   const active = stores.items.filter((item) => item.is_active)
   const online = active.filter((item) => item.is_online)
   const ready = files.rows.filter((row) => row.cf_exists || row.cfe_exists).length
-  const activeJobs = [...mergeJobs.value, ...updateJobs.value].filter((job) =>
+  const activeJobs = [...mergeJobs.value, ...updateJobs.value, ...checkJobs.value].filter((job) =>
     ['queued', 'sent', 'running'].includes(job.status),
   )
   return { active: active.length, online: online.length, offline: active.length - online.length, ready, activeJobs: activeJobs.length }
@@ -210,6 +213,10 @@ const counts = computed(() => {
 
 // Компактные операции по выбору
 const opDialog = ref<null | 'merge' | 'update'>(null)
+//: Имя файла для «Проверить файлы»: проверять всегда `update` бессмысленно —
+//: у кассы файл называется по дате (`БГ_Торговоя-mag-29102026`), и проверка
+//: «update» честно отвечала «нет файла», из-за чего статусы не менялись.
+const checkFilename = ref('update')
 const mergeForm = reactive({ file_name: 'update', is_extension: false, extension_name: '' })
 const updateForm = reactive({ is_fast_update: false, is_extension: false, extension_name: '' })
 function openDialog(kind: 'merge' | 'update'): void {
@@ -254,7 +261,11 @@ function runSelectedOp(kind: 'merge' | 'update'): void {
 
 async function runSelectedCheck(): Promise<void> {
   if (!selected.value.length) return
-  const outcome = await dispatchAction({ storeIds: [...selected.value] }, 'check_files', { filename: 'update' })
+  const outcome = await dispatchAction(
+    { storeIds: [...selected.value] },
+    'check_files',
+    { filename: checkFilename.value.trim() || 'update' },
+  )
   notify(outcome, 'Проверка файлов поставлена в очередь')
 }
 
@@ -289,8 +300,11 @@ function storeActivity(storeId: number): string {
   const parts: string[] = []
   const merge = lastFor(mergeJobs.value, storeId)
   const update = lastFor(updateJobs.value, storeId)
+  const check = lastFor(checkJobs.value, storeId)
   if (merge && merge.status === 'running') parts.push('merge выполняется')
   if (update && update.status === 'running') parts.push('update выполняется')
+  const checkActive = check && ['queued', 'sent', 'running'].includes(check.status)
+  if (checkActive) parts.push('проверка файлов выполняется')
   return parts.join(' · ') || '—'
 }
 
@@ -347,7 +361,13 @@ onUnmounted(() => {
       <section class="rounded-xl border border-slate-200 bg-white p-5">
         <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
           <h2 class="font-semibold">Магазины и статусы обновления</h2>
-          <div class="flex flex-wrap gap-2">
+          <div class="flex flex-wrap items-center gap-2">
+            <InputText
+              v-model="checkFilename"
+              placeholder="файл для проверки"
+              class="w-56"
+              data-test="updates-check-filename"
+            />
             <Button
               label="Выбрать все"
               severity="secondary"

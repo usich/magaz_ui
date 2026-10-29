@@ -536,17 +536,32 @@ def _create_job(
     params: dict[str, Any],
     author: str,
     action_name: str,
+    defer_log: bool = False,
 ) -> Command:
-    """Поставить задачу в очередь и объяснить это в её журнале (§4.3, §11.6)."""
+    """Поставить задачу в очередь и объяснить это в её журнале (§4.3, §11.6).
+
+    `defer_log=True` — для массовых операций: там задача ещё без id (flush
+    отложен), а `job_logs.command_id` — NOT NULL. Пачка ставит все задачи,
+    делает один flush (id появляются) и затем пишет журналы — иначе каждый
+    INSERT ждал блокировки БД и запуск из UI «подвешивался».
+    """
     command = command_service.create_command(
-        session, store_id=store.id, kind=kind, params=params, created_by=author
+        session, store_id=store.id, kind=kind, params=params, created_by=author, flush=False
     )
     command.store = store
-    command_service.add_log(
-        session,
-        command,
-        f"Задача создана ({action_name}) администратором {author}; отправку выполнит диспетчер",
-    )
+    if defer_log:
+        command._pending_log_message = (  # type: ignore[attr-defined]
+            f"Задача создана ({action_name}) администратором {author}; отправку выполнит диспетчер"
+        )
+    else:
+        # Одиночная задача: flush сразу, чтобы появился id (нужен журналу),
+        # затем пишем строку журнала «Задача создана».
+        session.flush()
+        command_service.add_log(
+            session,
+            command,
+            f"Задача создана ({action_name}) администратором {author}; отправку выполнит диспетчер",
+        )
     return command
 
 
@@ -598,6 +613,7 @@ def _dispatch_bulk(
     """
     results: list[BulkActionJobOut] = []
     warning: str | None = None
+    created: list[tuple[Store, Command]] = []
 
     for store in stores:
         if not store.is_active:
@@ -617,7 +633,22 @@ def _dispatch_bulk(
             params=params,
             author=author,
             action_name=action_name,
+            defer_log=True,
         )
+        created.append((store, command))
+
+    # Один flush на всю пачку: задачи уже в сессии, id появляются здесь.
+    # Раунд-трип на каждую задачу упирался в блокировку БД, пока
+    # диспетчер/Health Monitor держат write-транзакцию, — запуск «подвешивался».
+    if created:
+        session.flush()
+        for _, command in created:
+            message = getattr(command, "_pending_log_message", None)
+            if message:
+                command_service.add_log(session, command, message, flush=False)
+        logger.info("Массовая операция: поставлено задач %s", len(created))
+
+    for store, command in created:
         results.append(
             BulkActionJobOut(
                 store_id=store.id,
