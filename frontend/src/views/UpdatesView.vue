@@ -1,16 +1,12 @@
 <script setup lang="ts">
 /** Обновлятор (§Д-19): пульт обновления 1С — статусы магазинов, массовые операции, журнал. */
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import Button from 'primevue/button'
 import Checkbox from 'primevue/checkbox'
-import Dialog from 'primevue/dialog'
-import InputText from 'primevue/inputtext'
-import RadioButton from 'primevue/radiobutton'
 import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
-import { dispatchAction, type ActionOutcome } from '@/api/actions'
 import { jobsApi } from '@/api/endpoints'
 import type { JobItem, LocalBaseItem } from '@/api/types'
 import StoreOperationStrip from '@/components/StoreOperationStrip.vue'
@@ -211,74 +207,6 @@ const counts = computed(() => {
   return { active: active.length, online: online.length, offline: active.length - online.length, ready, activeJobs: activeJobs.length }
 })
 
-// Компактные операции по выбору
-const opDialog = ref<null | 'merge' | 'update'>(null)
-//: Имя файла для «Проверить файлы»: проверять всегда `update` бессмысленно —
-//: у кассы файл называется по дате (`БГ_Торговоя-mag-29102026`), и проверка
-//: «update» честно отвечала «нет файла», из-за чего статусы не менялись.
-const checkFilename = ref('update')
-const mergeForm = reactive({ file_name: 'update', is_extension: false, extension_name: '' })
-const updateForm = reactive({ is_fast_update: false, is_extension: false, extension_name: '' })
-function openDialog(kind: 'merge' | 'update'): void {
-  opDialog.value = kind
-}
-const mergeDialogVisible = computed({
-  get: () => opDialog.value === 'merge',
-  set: (value: boolean) => {
-    if (!value) opDialog.value = null
-  },
-})
-const updateDialogVisible = computed({
-  get: () => opDialog.value === 'update',
-  set: (value: boolean) => {
-    if (!value) opDialog.value = null
-  },
-})
-function runSelectedOp(kind: 'merge' | 'update'): void {
-  if (!selected.value.length) return
-  void (async () => {
-    const targets = { storeIds: [...selected.value] }
-    const outcome =
-      kind === 'merge'
-        ? await dispatchAction(targets, 'run_merge', {
-            file_name: mergeForm.file_name.trim(),
-            is_extension: mergeForm.is_extension,
-            ...(mergeForm.is_extension && mergeForm.extension_name.trim()
-              ? { extension_name: mergeForm.extension_name.trim() }
-              : {}),
-          })
-        : await dispatchAction(targets, 'run_update_db', {
-            is_fast_update: updateForm.is_fast_update,
-            is_extension: updateForm.is_extension,
-            ...(updateForm.is_extension && updateForm.extension_name.trim()
-              ? { extension_name: updateForm.extension_name.trim() }
-              : {}),
-          })
-    opDialog.value = null
-    notify(outcome, kind === 'merge' ? 'Слияние поставлено в очередь' : 'Обновление БД поставлено в очередь')
-  })()
-}
-
-async function runSelectedCheck(): Promise<void> {
-  if (!selected.value.length) return
-  const outcome = await dispatchAction(
-    { storeIds: [...selected.value] },
-    'check_files',
-    { filename: checkFilename.value.trim() || 'update' },
-  )
-  notify(outcome, 'Проверка файлов поставлена в очередь')
-}
-
-function notify(outcome: ActionOutcome | null, summary: string): void {
-  toast.add({
-    severity: outcome?.warning ? 'warn' : 'success',
-    summary,
-    detail: outcome?.warning ?? outcome?.message ?? 'Задачи поставлены в очередь',
-    life: 6000,
-  })
-  void loadJobs()
-}
-
 function formatTime(value: string | null): string {
   if (!value) return '—'
   const date = new Date(value)
@@ -361,43 +289,14 @@ onUnmounted(() => {
       <section class="rounded-xl border border-slate-200 bg-white p-5">
         <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
           <h2 class="font-semibold">Магазины и статусы обновления</h2>
-          <div class="flex flex-wrap items-center gap-2">
-            <InputText
-              v-model="checkFilename"
-              placeholder="файл для проверки"
-              class="w-56"
-              data-test="updates-check-filename"
-            />
-            <Button
-              label="Выбрать все"
-              severity="secondary"
-              size="small"
-              outlined
-              :data-test="`updates-select-all-${allSelected ? 'on' : 'off'}`"
-              @click="toggleAll"
-            />
-            <Button
-              label="Проверить файлы"
-              size="small"
-              :disabled="!selected.length"
-              data-test="updates-check-selected"
-              @click="runSelectedCheck"
-            />
-            <Button
-              label="Слияние…"
-              size="small"
-              :disabled="!selected.length"
-              data-test="updates-merge-selected"
-              @click="openDialog('merge')"
-            />
-            <Button
-              label="Обновить базу…"
-              size="small"
-              :disabled="!selected.length"
-              data-test="updates-update-selected"
-              @click="openDialog('update')"
-            />
-          </div>
+          <Button
+            label="Выбрать все"
+            severity="secondary"
+            size="small"
+            outlined
+            :data-test="`updates-select-all-${allSelected ? 'on' : 'off'}`"
+            @click="toggleAll"
+          />
         </div>
 
         <div class="overflow-x-auto">
@@ -408,6 +307,7 @@ onUnmounted(() => {
                 <th class="py-2 pr-3 font-medium">Магазин</th>
                 <th class="py-2 pr-3 font-medium">Онлайн</th>
                 <th class="py-2 pr-3 font-medium">Файлы</th>
+                <th class="py-2 pr-3 font-medium">Проверка</th>
                 <th class="py-2 pr-3 font-medium">Merge</th>
                 <th class="py-2 pr-3 font-medium">Update</th>
                 <th class="py-2 pr-3 font-medium">Последнее обновление</th>
@@ -459,6 +359,13 @@ onUnmounted(() => {
                 </td>
                 <td class="py-2 pr-3 whitespace-nowrap">
                   <Tag
+                    :value="stageStatus(lastFor(checkJobs, store.id)).label"
+                    :severity="stageStatus(lastFor(checkJobs, store.id)).severity"
+                    :data-test="`updates-check-${store.id}`"
+                  />
+                </td>
+                <td class="py-2 pr-3 whitespace-nowrap">
+                  <Tag
                     :value="stageStatus(lastFor(mergeJobs, store.id)).label"
                     :severity="stageStatus(lastFor(mergeJobs, store.id)).severity"
                   />
@@ -478,7 +385,7 @@ onUnmounted(() => {
                 </td>
               </tr>
               <tr v-if="!stores.items.length && !stores.isLoading">
-                <td colspan="8" class="magaz-muted py-6 text-center">Магазинов нет.</td>
+                <td colspan="9" class="magaz-muted py-6 text-center">Магазинов нет.</td>
               </tr>
             </tbody>
           </table>
@@ -521,50 +428,6 @@ onUnmounted(() => {
           </table>
         </div>
       </section>
-
-      <Dialog v-model:visible="mergeDialogVisible" header="Слияние конфигурации" modal :style="{ width: '480px' }">
-        <div class="space-y-3">
-          <label class="block space-y-1">
-            <span class="magaz-muted text-xs">Имя файла (без расширения)</span>
-            <InputText v-model="mergeForm.file_name" class="w-full" data-test="updates-merge-file" />
-          </label>
-          <div class="flex items-center gap-4 text-sm">
-            <span class="magaz-muted text-xs">Сливаем:</span>
-            <label class="flex items-center gap-1"><RadioButton v-model="mergeForm.is_extension" :value="false" data-test="updates-merge-cf" /><span>Основная (.cf)</span></label>
-            <label class="flex items-center gap-1"><RadioButton v-model="mergeForm.is_extension" :value="true" data-test="updates-merge-cfe" /><span>Расширение (.cfe)</span></label>
-          </div>
-          <label v-if="mergeForm.is_extension" class="block space-y-1">
-            <span class="magaz-muted text-xs">Имя расширения</span>
-            <InputText v-model="mergeForm.extension_name" class="w-full" placeholder="имя расширения" />
-          </label>
-        </div>
-        <template #footer>
-          <Button label="Отмена" text size="small" @click="opDialog = null" />
-          <Button label="Запустить" size="small" :disabled="!mergeForm.file_name.trim()" data-test="updates-merge-run" @click="runSelectedOp('merge')" />
-        </template>
-      </Dialog>
-
-      <Dialog v-model:visible="updateDialogVisible" header="Обновление конфигурации БД" modal :style="{ width: '480px' }">
-        <div class="space-y-3">
-          <div class="flex items-center gap-4 text-sm">
-            <span class="magaz-muted text-xs">Обновляем:</span>
-            <label class="flex items-center gap-1"><RadioButton v-model="updateForm.is_extension" :value="false" data-test="updates-update-cf" /><span>Основная</span></label>
-            <label class="flex items-center gap-1"><RadioButton v-model="updateForm.is_extension" :value="true" data-test="updates-update-cfe" /><span>Расширение (.cfe)</span></label>
-          </div>
-          <label v-if="updateForm.is_extension" class="block space-y-1">
-            <span class="magaz-muted text-xs">Имя расширения</span>
-            <InputText v-model="updateForm.extension_name" class="w-full" placeholder="имя расширения" />
-          </label>
-          <label class="flex items-center gap-2 text-sm">
-            <Checkbox v-model="updateForm.is_fast_update" binary />
-            <span>Быстрое обновление (без завершения сеансов)</span>
-          </label>
-        </div>
-        <template #footer>
-          <Button label="Отмена" text size="small" @click="opDialog = null" />
-          <Button label="Запустить" size="small" data-test="updates-update-run" @click="runSelectedOp('update')" />
-        </template>
-      </Dialog>
     </div>
 
     <div v-else class="space-y-6">
