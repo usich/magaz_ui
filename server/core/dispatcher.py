@@ -350,7 +350,7 @@ class CommandDispatcher:
                     )
                     command_service.set_status(session, command, CommandStatus.CANCELED)
                     report.failed += 1
-                    commit_with_retry(session)
+                    await asyncio.to_thread(commit_with_retry, session)
                     continue
                 if self._in_backoff(command.id):
                     report.waiting += 1
@@ -363,7 +363,7 @@ class CommandDispatcher:
                         message=f"Истёк предел ожидания операции ({command.kind})",
                         report=report,
                     )
-                    commit_with_retry(session)
+                    await asyncio.to_thread(commit_with_retry, session)
                     continue
                 command_id = command.id
                 try:
@@ -385,11 +385,12 @@ class CommandDispatcher:
                 # SQLite залочена и любой API-запрос (логин/аудит, stores, jobs,
                 # health) ждёт до busy_timeout — «админка виснет», а магазины
                 # «мигают офлайн», потому что Health Monitor не успевает записать
-                # last_seen_at в окне online_window_sec.
-                commit_with_retry(session)
+                # last_seen_at в окне online_window_sec. Сам commit — в отдельном
+                # потоке, чтобы блокирующее ожидание не замораживало event loop.
+                await asyncio.to_thread(commit_with_retry, session)
             self._prune(seen)
             await self._sync_pushes(session, report)
-            commit_with_retry(session)
+            await asyncio.to_thread(commit_with_retry, session)
         finally:
             session.close()
 

@@ -238,20 +238,15 @@ async def poll_targets(
         return list(await asyncio.gather(*(guarded(target) for target in targets)))
 
 
-async def run_cycle(
+def _load_targets(
     db: DatabaseManager,
     settings: Settings,
-    *,
-    transport: httpx.AsyncBaseTransport | None = None,
-    client_factory: ClientFactory | None = None,
-) -> MonitorCycleReport:
-    """Один цикл мониторинга: опрос + запись самодокладов в `stores`.
+) -> tuple[list[AgentTarget], float, int]:
+    """Прочитать настройки мониторинга и активные магазины из БД (синхронно, в потоке).
 
-    Настройки (таймаут, параллелизм) читаются из БД на каждом цикле — изменение
-    в UI применяется без перезапуска сервера (§4.9).
+    Вынесено из event loop: открытие сессии и чтение не должны блокировать uvicorn,
+    когда БД залочена пишущим циклом (health/диспетчер).
     """
-    started_at = utcnow()
-
     with db.session() as session:
         timeout = float(settings_service.get_int(session, TIMEOUT_SETTING))
         concurrency = settings_service.get_int(session, CONCURRENCY_SETTING)
@@ -261,15 +256,16 @@ async def run_cycle(
             ).all()
         )
         targets = [build_agent_target(store, settings) for store in stores]
+    return targets, timeout, concurrency
 
-    results = await poll_targets(
-        targets,
-        timeout=timeout,
-        concurrency=concurrency,
-        transport=transport,
-        client_factory=client_factory,
-    )
 
+def _write_self_reports(db: DatabaseManager, results: list[StoreHealthResult]) -> None:
+    """Записать самодоклады (last_seen_at, версии) и закоммитить — в потоке.
+
+    `commit_with_retry` при «database is locked» ждёт busy_timeout и спал с
+    `time.sleep` — синхронно. В event loop это блокировало бы весь uvicorn
+    («админка виснет», включая `/health`), поэтому выполняем в отдельном потоке.
+    """
     with db.session() as session:
         try:
             for result in results:
@@ -289,6 +285,35 @@ async def run_cycle(
             # запись самодокладов — следующий цикл всё повторит.
             session.rollback()
             logger.warning("Запись самодокладов пропущена: БД заблокирована")
+
+
+async def run_cycle(
+    db: DatabaseManager,
+    settings: Settings,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    client_factory: ClientFactory | None = None,
+) -> MonitorCycleReport:
+    """Один цикл мониторинга: опрос + запись самодокладов в `stores`.
+
+    Настройки (таймаут, параллелизм) читаются из БД на каждом цикле — изменение
+    в UI применяется без перезапуска сервера (§4.9). Чтение и запись БД вынесены
+    в потоки (`asyncio.to_thread`): блокирующий синхронный commit не должен
+    замораживать event loop uvicorn, иначе админка и `/health` виснут.
+    """
+    started_at = utcnow()
+
+    targets, timeout, concurrency = await asyncio.to_thread(_load_targets, db, settings)
+
+    results = await poll_targets(
+        targets,
+        timeout=timeout,
+        concurrency=concurrency,
+        transport=transport,
+        client_factory=client_factory,
+    )
+
+    await asyncio.to_thread(_write_self_reports, db, results)
 
     report = MonitorCycleReport(started_at=started_at, finished_at=utcnow(), results=results)
     logger.debug("Цикл мониторинга: %s", report.as_dict())
