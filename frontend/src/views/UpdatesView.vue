@@ -69,6 +69,8 @@ const localJobs = ref<JobItem[]>([])
 const localMergeJobs = ref<JobItem[]>([])
 const localCheckJobs = ref<JobItem[]>([])
 const jobsLoading = ref(false)
+// Журнал операций по магазинам: по умолчанию свернут, разворачивается кнопкой.
+const logExpanded = ref(false)
 
 async function loadJobs(): Promise<void> {
   jobsLoading.value = true
@@ -193,10 +195,6 @@ function lastOkAt(job: JobItem | null): string {
   return formatTime(job.finished_at)
 }
 
-function fileRows(storeId: number) {
-  return files.rows.filter((row) => row.store_id === storeId)
-}
-
 const counts = computed(() => {
   const active = stores.items.filter((item) => item.is_active)
   const online = active.filter((item) => item.is_online)
@@ -211,12 +209,6 @@ function formatTime(value: string | null): string {
   if (!value) return '—'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('ru-RU')
-}
-function fileMark(exists: boolean): string {
-  return exists ? '✓' : '✗'
-}
-function fileCell(exists: boolean): string {
-  return exists ? 'text-emerald-600' : 'text-rose-600'
 }
 function storeError(storeId: number): string {
   const failed = [...mergeJobs.value, ...updateJobs.value].find(
@@ -306,7 +298,6 @@ onUnmounted(() => {
                 <th class="py-2 pr-3 font-medium"><span class="sr-only">выбор</span></th>
                 <th class="py-2 pr-3 font-medium">Магазин</th>
                 <th class="py-2 pr-3 font-medium">Онлайн</th>
-                <th class="py-2 pr-3 font-medium">Файлы</th>
                 <th class="py-2 pr-3 font-medium">Проверка</th>
                 <th class="py-2 pr-3 font-medium">Merge</th>
                 <th class="py-2 pr-3 font-medium">Update</th>
@@ -350,14 +341,6 @@ onUnmounted(() => {
                   </div>
                 </td>
                 <td class="py-2 pr-3 whitespace-nowrap">
-                  <template v-for="(row, i) in fileRows(store.id)" :key="i">
-                    <span :class="fileCell(row.cf_exists)" class="magaz-mono mr-2">{{ fileMark(row.cf_exists) }}</span>
-                    <span :class="fileCell(row.cfe_exists)" class="magaz-mono mr-2">{{ fileMark(row.cfe_exists) }}</span>
-                    <span :class="fileCell(row.xml_exists)" class="magaz-mono">{{ fileMark(row.xml_exists) }}</span>
-                  </template>
-                  <div v-if="!fileRows(store.id).length" class="magaz-muted text-xs">нет снимка</div>
-                </td>
-                <td class="py-2 pr-3 whitespace-nowrap">
                   <Tag
                     :value="stageStatus(lastFor(checkJobs, store.id)).label"
                     :severity="stageStatus(lastFor(checkJobs, store.id)).severity"
@@ -385,7 +368,7 @@ onUnmounted(() => {
                 </td>
               </tr>
               <tr v-if="!stores.items.length && !stores.isLoading">
-                <td colspan="9" class="magaz-muted py-6 text-center">Магазинов нет.</td>
+                <td colspan="8" class="magaz-muted py-6 text-center">Магазинов нет.</td>
               </tr>
             </tbody>
           </table>
@@ -393,8 +376,17 @@ onUnmounted(() => {
       </section>
 
       <section class="rounded-xl border border-slate-200 bg-white p-5">
-        <h2 class="mb-3 font-semibold">Журнал операций</h2>
-        <div class="overflow-x-auto">
+        <button
+          class="flex w-full items-center justify-between gap-2 text-left"
+          data-test="updates-log-toggle"
+          @click="logExpanded = !logExpanded"
+        >
+          <h2 class="font-semibold">Журнал операций</h2>
+          <span class="magaz-muted text-sm">
+            <i class="pi" :class="logExpanded ? 'pi-chevron-up' : 'pi-chevron-down'"></i>
+          </span>
+        </button>
+        <div v-if="logExpanded" class="overflow-x-auto">
           <table class="w-full text-sm">
             <thead>
               <tr class="magaz-muted border-b border-slate-200 text-left text-xs">

@@ -202,7 +202,6 @@ describe('страница «Обновление 1С»', () => {
     const row = wrapper.find('[data-test="updates-store-1"]')
     expect(row.exists()).toBe(true)
     expect(row.text()).toContain('Магазин №5')
-    expect(row.text()).toContain('✓') // файл из матрицы
     expect(row.text()).toContain('успех') // merge
     expect(row.text()).toContain('выполняется') // update
     expect(wrapper.text()).toContain('Журнал операций')
