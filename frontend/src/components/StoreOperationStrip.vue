@@ -33,13 +33,53 @@ const emit = defineEmits<{ submitted: [] }>()
 
 const toast = useToast()
 
-const check = reactive({ filename: 'update' })
-const merge = reactive({ file_name: 'update', is_extension: false, extension_name: '' })
-const update = reactive({ is_extension: false, extension_name: '', is_fast_update: false })
 const message = reactive({ text_message: '' })
 const link = reactive({ url: '' })
 
 const busy = ref<null | ActionName>(null)
+
+/**
+ * Единый блок «Файл обновления»: одно имя файла и один переключатель `.cf/.cfe`
+ * на всю форму, чтобы не задавать их отдельно для проверки и для слияния.
+ * Для `.cfe` используется `extension_name` (например `БГ_Торговоя`), для `.cf`
+ * — `filename` (например `update`). Проверка файлов сканирует все типы по стему,
+ * поэтому достаточно указать имя один раз.
+ */
+const fileForm = reactive({
+  filename: 'update',
+  is_extension: false,
+  extension_name: '',
+  is_fast_update: false,
+})
+
+/** Единое имя файла (стем) с учётом выбранного типа: `.cf` → `filename`, `.cfe` → `extension_name`. */
+const effectiveFileName = computed(() => {
+  const stem = fileForm.is_extension
+    ? fileForm.extension_name.trim() || fileForm.filename.trim()
+    : fileForm.filename.trim()
+  return stem || 'update'
+})
+
+function mergeParams(): Record<string, unknown> {
+  const file_name = effectiveFileName.value
+  return {
+    file_name,
+    is_extension: fileForm.is_extension,
+    ...(fileForm.is_extension && fileForm.extension_name.trim()
+      ? { extension_name: fileForm.extension_name.trim() }
+      : {}),
+  }
+}
+
+function updateParams(): Record<string, unknown> {
+  return {
+    is_fast_update: fileForm.is_fast_update,
+    is_extension: fileForm.is_extension,
+    ...(fileForm.is_extension && fileForm.extension_name.trim()
+      ? { extension_name: fileForm.extension_name.trim() }
+      : {}),
+  }
+}
 
 /** Получатели операции: выбранные магазины, либо все активные. */
 const targets = computed(() => {
@@ -87,70 +127,54 @@ async function run(action: ActionName, params: Record<string, unknown>, summary:
     </div>
 
     <div class="grid gap-4 md:grid-cols-3">
+      <!-- Единый блок: файл обновления (имя + тип) -->
+      <div class="rounded-lg border border-slate-200 p-4" data-test="store-file-form">
+        <h4 class="text-sm font-semibold">Файл обновления</h4>
+        <label class="mt-2 block space-y-1">
+          <span class="magaz-muted text-xs">Имя файла (без расширения)</span>
+          <InputText v-model="fileForm.filename" class="w-full" placeholder="update" data-test="store-file-name" />
+        </label>
+        <div class="mt-2 flex items-center gap-4 text-sm">
+          <span class="magaz-muted text-xs">Тип файла:</span>
+          <label class="flex items-center gap-1">
+            <RadioButton v-model="fileForm.is_extension" :value="false" />
+            <span>Основная (.cf)</span>
+          </label>
+          <label class="flex items-center gap-1">
+            <RadioButton v-model="fileForm.is_extension" :value="true" />
+            <span>Расширение (.cfe)</span>
+          </label>
+        </div>
+        <label v-if="fileForm.is_extension" class="mt-2 block space-y-1">
+          <span class="magaz-muted text-xs">Имя расширения</span>
+          <InputText v-model="fileForm.extension_name" class="w-full" placeholder="БГ_Торговоя" data-test="store-file-extension" />
+        </label>
+        <label class="mt-2 flex items-center gap-2 text-sm">
+          <Checkbox v-model="fileForm.is_fast_update" binary />
+          <span>Быстрое обновление (без завершения сеансов)</span>
+        </label>
+        <Button label="Обновить базу" size="small" class="mt-3" :loading="busy === 'run_update_db'"
+          :disabled="busy !== null" data-test="store-run-update"
+          @click="run('run_update_db', updateParams(), 'Обновление БД поставлено в очередь')" />
+      </div>
+
       <!-- Проверить файлы -->
       <div class="rounded-lg border border-slate-200 p-4" data-test="store-check-form">
         <h4 class="text-sm font-semibold">Проверить файлы</h4>
-        <label class="mt-2 block space-y-1">
-          <span class="magaz-muted text-xs">Имя файла (без расширения)</span>
-          <InputText v-model="check.filename" class="w-full" placeholder="update" data-test="store-check-filename" />
-        </label>
+        <p class="mt-2 text-xs magaz-muted">Проверка файла «{{ effectiveFileName }}» (.cf/.cfe/.xml) на кассах.</p>
         <Button label="Проверить" icon="pi pi-search" size="small" severity="secondary" class="mt-3"
-          :loading="busy === 'check_files'" :disabled="busy !== null || !check.filename.trim()"
+          :loading="busy === 'check_files'" :disabled="busy !== null"
           data-test="store-run-check"
-          @click="run('check_files', { filename: check.filename.trim() }, 'Проверка файлов поставлена в очередь')" />
+          @click="run('check_files', { filename: effectiveFileName }, 'Проверка файлов поставлена в очередь')" />
       </div>
 
       <!-- Слияние -->
       <div class="rounded-lg border border-slate-200 p-4" data-test="store-merge-form">
         <h4 class="text-sm font-semibold">Слияние</h4>
-        <label class="mt-2 block space-y-1">
-          <span class="magaz-muted text-xs">Имя файла (без расширения)</span>
-          <InputText v-model="merge.file_name" class="w-full" placeholder="update" data-test="store-merge-file" />
-        </label>
-        <div class="mt-2 flex items-center gap-4 text-sm">
-          <label class="flex items-center gap-1">
-            <RadioButton v-model="merge.is_extension" :value="false" />
-            <span>Основная (.cf)</span>
-          </label>
-          <label class="flex items-center gap-1">
-            <RadioButton v-model="merge.is_extension" :value="true" />
-            <span>Расширение (.cfe)</span>
-          </label>
-        </div>
-        <label v-if="merge.is_extension" class="mt-2 block space-y-1">
-          <span class="magaz-muted text-xs">Имя расширения</span>
-          <InputText v-model="merge.extension_name" class="w-full" placeholder="БГ_Торговоя" data-test="store-merge-extension" />
-        </label>
+        <p class="mt-2 text-xs magaz-muted">Слияние файла «{{ effectiveFileName }}» ({{ fileForm.is_extension ? 'расширение .cfe' : 'основная .cf' }}) в базу.</p>
         <Button label="Запустить слияние" size="small" class="mt-3" :loading="busy === 'run_merge'"
-          :disabled="busy !== null || !merge.file_name.trim()" data-test="store-run-merge"
-          @click="run('run_merge', { file_name: merge.file_name.trim(), is_extension: merge.is_extension, ...(merge.is_extension && merge.extension_name.trim() ? { extension_name: merge.extension_name.trim() } : {}) }, 'Слияние поставлено в очередь')" />
-      </div>
-
-      <!-- Обновить базу -->
-      <div class="rounded-lg border border-slate-200 p-4" data-test="store-update-form">
-        <h4 class="text-sm font-semibold">Обновить базу</h4>
-        <div class="mt-2 flex items-center gap-4 text-sm">
-          <span class="magaz-muted text-xs">Обновляем:</span>
-          <label class="flex items-center gap-1">
-            <RadioButton v-model="update.is_extension" :value="false" />
-            <span>Основная (.cf)</span>
-          </label>
-          <label class="flex items-center gap-1">
-            <RadioButton v-model="update.is_extension" :value="true" />
-            <span>Расширение (.cfe)</span>
-          </label>
-        </div>
-        <label v-if="update.is_extension" class="mt-2 block space-y-1">
-          <span class="magaz-muted text-xs">Имя расширения</span>
-          <InputText v-model="update.extension_name" class="w-full" placeholder="БГ_Торговоя" data-test="store-update-extension" />
-        </label>
-        <label class="mt-2 flex items-center gap-2 text-sm">
-          <Checkbox v-model="update.is_fast_update" binary />
-          <span>Быстрое обновление (без завершения сеансов)</span>
-        </label>
-        <Button label="Обновить" size="small" class="mt-3" :loading="busy === 'run_update_db'"
-          :disabled="busy !== null" data-test="store-run-update"
-          @click="run('run_update_db', { is_fast_update: update.is_fast_update, is_extension: update.is_extension, ...(update.is_extension && update.extension_name.trim() ? { extension_name: update.extension_name.trim() } : {}) }, 'Обновление БД поставлено в очередь')" />
+          :disabled="busy !== null" data-test="store-run-merge"
+          @click="run('run_merge', mergeParams(), 'Слияние поставлено в очередь')" />
       </div>
     </div>
 

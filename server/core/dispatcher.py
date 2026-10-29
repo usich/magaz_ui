@@ -350,6 +350,7 @@ class CommandDispatcher:
                     )
                     command_service.set_status(session, command, CommandStatus.CANCELED)
                     report.failed += 1
+                    commit_with_retry(session)
                     continue
                 if self._in_backoff(command.id):
                     report.waiting += 1
@@ -362,6 +363,7 @@ class CommandDispatcher:
                         message=f"Истёк предел ожидания операции ({command.kind})",
                         report=report,
                     )
+                    commit_with_retry(session)
                     continue
                 command_id = command.id
                 try:
@@ -378,6 +380,13 @@ class CommandDispatcher:
                     session.rollback()
                     logger.exception("Неожиданный сбой обработки задачи id=%s", command_id)
                     report.errors.append(f"Задача {command_id}: внутренняя ошибка")
+                # Освобождаем write-блокировку после каждой задачи: если держать
+                # транзакцию на весь цикл, пока диспетчер опрашивает кассы (HTTP),
+                # SQLite залочена и любой API-запрос (логин/аудит, stores, jobs,
+                # health) ждёт до busy_timeout — «админка виснет», а магазины
+                # «мигают офлайн», потому что Health Monitor не успевает записать
+                # last_seen_at в окне online_window_sec.
+                commit_with_retry(session)
             self._prune(seen)
             await self._sync_pushes(session, report)
             commit_with_retry(session)
