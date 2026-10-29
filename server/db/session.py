@@ -21,10 +21,24 @@ SQLITE_BUSY_TIMEOUT_SEC = 30
 
 
 def _enable_sqlite_foreign_keys(dbapi_connection: Any, _record: Any) -> None:  # noqa: ANN401
-    """Включить контроль внешних ключей для каждого соединения SQLite."""
+    """Настроить каждое соединение SQLite для конкурентной записи.
+
+    SQLite по умолчанию блокирует весь файл на время записи и падает
+    «database is locked», когда фоновые задачи (Health Monitor, диспетчер)
+    и API пишут одновременно. WAL-режим снимает блокировку читателей и
+    сокращает окно эксклюзивной записи, а явный busy_timeout заставляет
+    ждать освобождения вместо немедленного отказа.
+    """
     cursor = dbapi_connection.cursor()
     try:
         cursor.execute("PRAGMA foreign_keys=ON")
+        # WAL: конкурентные читатели не блокируются писателем.
+        cursor.execute("PRAGMA journal_mode=WAL")
+        # В WAL достаточно synchronous=NORMAL — меньше удержание блокировки.
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        # Гарантированное ожидание освобождения блокировки (не полагаемся
+        # только на `timeout` из connect_args).
+        cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_SEC * 1000}")
     finally:
         cursor.close()
 
