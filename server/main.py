@@ -31,6 +31,7 @@ from server.core.health_monitor import HealthMonitor
 from server.core.local_updater import LocalUpdateMonitor
 from server.core.logging_setup import configure_logging
 from server.db.migrations import run_migrations
+from server.db.session import ensure_sqlite_wal
 from server.services import settings_service
 from shared.version import APP_NAME, APP_VERSION
 
@@ -66,6 +67,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.ctx = context
     app.state.settings = settings
     logger.info("%s v%s запускается; БД: %s", APP_NAME, settings.app_version, settings.database_url)
+
+    # Один раз перевести БД в WAL на старте. В CONNECT-хуке это делать нельзя:
+    # `PRAGMA journal_mode=WAL` требует блокировки и ждал её до busy_timeout на
+    # каждом новом соединении пула, «подвешивая» API, пока фоновые циклы держат
+    # write-транзакции.
+    ensure_sqlite_wal(context.db.engine)
 
     monitor: HealthMonitor | None = None
     dispatcher: CommandDispatcher | None = None

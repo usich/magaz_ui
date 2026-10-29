@@ -32,17 +32,15 @@ _SQLITE_LOCKED_BACKOFF_SEC = 0.4
 def _enable_sqlite_foreign_keys(dbapi_connection: Any, _record: Any) -> None:  # noqa: ANN401
     """Настроить каждое соединение SQLite для конкурентной записи.
 
-    SQLite по умолчанию блокирует весь файл на время записи и падает
-    «database is locked», когда фоновые задачи (Health Monitor, диспетчер)
-    и API пишут одновременно. WAL-режим снимает блокировку читателей и
-    сокращает окно эксклюзивной записи, а явный busy_timeout заставляет
-    ждать освобождения вместо немедленного отказа.
+    Важно: `PRAGMA journal_mode=WAL` здесь **намеренно не выполняется** —
+    смена режима журнала требует блокировки БД и ждёт её до busy_timeout.
+    На новом соединении из пула это превращалось в секундные паузы API
+    («админка виснет»), потому что фоновые циклы держат write-транзакции.
+    WAL выставляется один раз при старте (`ensure_sqlite_wal`).
     """
     cursor = dbapi_connection.cursor()
     try:
         cursor.execute("PRAGMA foreign_keys=ON")
-        # WAL: конкурентные читатели не блокируются писателем.
-        cursor.execute("PRAGMA journal_mode=WAL")
         # В WAL достаточно synchronous=NORMAL — меньше удержание блокировки.
         cursor.execute("PRAGMA synchronous=NORMAL")
         # Гарантированное ожидание освобождения блокировки (не полагаемся
@@ -50,6 +48,19 @@ def _enable_sqlite_foreign_keys(dbapi_connection: Any, _record: Any) -> None:  #
         cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_SEC * 1000}")
     finally:
         cursor.close()
+
+
+def ensure_sqlite_wal(engine: Engine) -> None:
+    """Один раз перевести файл БД в WAL — на старте, а не на каждом соединении.
+
+    `PRAGMA journal_mode=WAL` — операция, требующая кратковременной блокировки;
+    повторять её в CONNECT-хуке дорого. Режим журнала — свойство файла БД, так
+    что достаточно выставить его один раз при подъёме сервера.
+    """
+    if not str(engine.url).startswith("sqlite"):
+        return
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA journal_mode=WAL")
 
 
 def create_db_engine(url: str, *, echo: bool = False) -> Engine:
