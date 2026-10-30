@@ -546,4 +546,48 @@ describe('страница «Обновление 1С»', () => {
     })
     wrapper.unmount()
   })
+
+  it('вкладка «Локальные базы»: выбор группы выбирает все её базы (дерево)', async () => {
+    const bulkBodies: unknown[] = []
+    fetchMock.mockImplementation(
+      apiMock(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [
+          makeLocalBase(),
+          makeLocalBase({ id: 3, name: 'Зарплата', database_name: 'zp', group: 'Финансы' }),
+          makeLocalBase({ id: 4, name: 'Торговля', database_name: 'trade', group: 'Продажи' }),
+        ],
+        [],
+        [],
+        [],
+        undefined,
+        (body) => bulkBodies.push(body),
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+    await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
+    await flushPromises()
+
+    // Выбрать группу «Финансы» — в неё входят базы id=2 и id=3
+    await wrapper.find('[data-test="lb-group-select-Финансы"]').setValue(true)
+    await flushPromises()
+
+    // Массовое обновление по выбранным — ушло по базам всей группы
+    await wrapper.find('[data-test="updates-local-update-selected"]').trigger('click')
+    await flushPromises()
+    await wrapper.find('[data-test="lbu-run"]').trigger('click')
+    await flushPromises()
+
+    expect(bulkBodies).toHaveLength(1)
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      local_base_ids: [2, 3],
+      kind: 'run_update_db_local',
+    })
+    wrapper.unmount()
+  })
 })

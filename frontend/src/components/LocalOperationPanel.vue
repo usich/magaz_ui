@@ -126,44 +126,34 @@ async function run(
       <span class="magaz-muted text-sm">{{ targetLabel }}</span>
     </div>
 
-    <div class="grid gap-4 md:grid-cols-3">
-      <!-- Единый блок: файл обновления (имя + тип) -->
-      <div class="rounded-lg border border-slate-200 p-4" data-test="local-file-form">
-        <h4 class="text-sm font-semibold">Файл обновления</h4>
-        <label class="mt-2 block space-y-1">
-          <span class="magaz-muted text-xs">Имя файла (без расширения)</span>
-          <InputText v-model="fileForm.file_name" class="w-full" placeholder="update" data-test="local-file-name" />
+    <!-- Единый блок: файл обновления (имя + тип) — общий для всех действий -->
+    <div class="mb-4 flex flex-wrap items-end gap-4 rounded-lg border border-slate-200 p-4" data-test="local-file-form">
+      <label class="block space-y-1">
+        <span class="magaz-muted text-xs">Имя файла (без расширения)</span>
+        <InputText v-model="fileForm.file_name" class="w-48" placeholder="update" data-test="local-file-name" />
+      </label>
+      <div class="flex items-center gap-4 text-sm pb-1">
+        <span class="magaz-muted text-xs">Тип файла:</span>
+        <label class="flex items-center gap-1">
+          <RadioButton v-model="fileForm.is_extension" :value="false" />
+          <span>Основная (.cf)</span>
         </label>
-        <div class="mt-2 flex items-center gap-4 text-sm">
-          <span class="magaz-muted text-xs">Тип файла:</span>
-          <label class="flex items-center gap-1">
-            <RadioButton v-model="fileForm.is_extension" :value="false" />
-            <span>Основная (.cf)</span>
-          </label>
-          <label class="flex items-center gap-1">
-            <RadioButton v-model="fileForm.is_extension" :value="true" />
-            <span>Расширение (.cfe)</span>
-          </label>
-        </div>
-        <label v-if="fileForm.is_extension" class="mt-2 block space-y-1">
-          <span class="magaz-muted text-xs">Имя расширения</span>
-          <InputText v-model="fileForm.extension_name" class="w-full" placeholder="БГ_Бухгалтерия" data-test="local-file-extension" />
+        <label class="flex items-center gap-1">
+          <RadioButton v-model="fileForm.is_extension" :value="true" />
+          <span>Расширение (.cfe)</span>
         </label>
-        <label class="mt-2 flex items-center gap-2 text-sm">
-          <Checkbox v-model="fileForm.is_fast_update" binary />
-          <span>Быстрое обновление (без завершения сеансов)</span>
-        </label>
-        <Button
-          label="Обновить"
-          size="small"
-          class="mt-3"
-          :loading="busy === 'update'"
-          :disabled="busy !== null"
-          data-test="local-run-update"
-          @click="run('run_update_db_local', updateParams(), 'Обновление поставлено в очередь')"
-        />
       </div>
+      <label v-if="fileForm.is_extension" class="block space-y-1">
+        <span class="magaz-muted text-xs">Имя расширения</span>
+        <InputText v-model="fileForm.extension_name" class="w-48" placeholder="БГ_Бухгалтерия" data-test="local-file-extension" />
+      </label>
+      <label class="flex items-center gap-2 text-sm pb-1">
+        <Checkbox v-model="fileForm.is_fast_update" binary />
+        <span>Быстрое обновление (без завершения сеансов)</span>
+      </label>
+    </div>
 
+    <div class="grid gap-4 md:grid-cols-3">
       <!-- Проверить файлы -->
       <div class="rounded-lg border border-slate-200 p-4" data-test="local-check-form">
         <h4 class="text-sm font-semibold">Проверить файлы</h4>
@@ -193,6 +183,21 @@ async function run(
           :disabled="busy !== null"
           data-test="local-run-merge"
           @click="run('run_merge_local', mergeParams(), 'Слияние поставлено в очередь')"
+        />
+      </div>
+
+      <!-- Обновить базу -->
+      <div class="rounded-lg border border-slate-200 p-4" data-test="local-update-form">
+        <h4 class="text-sm font-semibold">Обновить базу</h4>
+        <p class="mt-2 text-xs magaz-muted">Обновление БД файлом «{{ effectiveFileName }}» ({{ fileForm.is_extension ? 'расширение .cfe' : 'основная .cf' }}){{ fileForm.is_fast_update ? ', быстрое' : '' }}.</p>
+        <Button
+          label="Обновить базу"
+          size="small"
+          class="mt-3"
+          :loading="busy === 'update'"
+          :disabled="busy !== null"
+          data-test="local-run-update"
+          @click="run('run_update_db_local', updateParams(), 'Обновление поставлено в очередь')"
         />
       </div>
     </div>

@@ -166,6 +166,24 @@ function toggleLocalAll(): void {
   localSelected.value = localAllSelected.value ? [] : localBases.items.map((item) => item.id)
 }
 
+// Д-группы: выбор базы/группы. Чекбокс группы выбирает/снимает все базы этой группы.
+function localBasesOfGroup(group: string): LocalBaseItem[] {
+  return localBases.items.filter((item) => item.group === group)
+}
+function localGroupAllSelected(group: string): boolean {
+  const ids = localBasesOfGroup(group).map((item) => item.id)
+  return ids.length > 0 && ids.every((id) => localSelected.value.includes(id))
+}
+function toggleLocalGroup(group: string): void {
+  const ids = localBasesOfGroup(group).map((item) => item.id)
+  if (localGroupAllSelected(group)) {
+    localSelected.value = localSelected.value.filter((id) => !ids.includes(id))
+  } else {
+    localSelected.value = Array.from(new Set([...localSelected.value, ...ids]))
+  }
+}
+
+
 function lastFor(jobs: JobItem[], storeId: number): JobItem | null {
   let best: JobItem | null = null
   for (const job of jobs) {
@@ -469,92 +487,112 @@ onUnmounted(() => {
         </div>
 
 
-        <div class="overflow-x-auto">
-          <table class="w-full text-sm">
-            <thead>
-              <tr class="magaz-muted border-b border-slate-200 text-left text-xs">
-                <th class="py-2 pr-3 font-medium"><span class="sr-only">выбор</span></th>
-                <th class="py-2 pr-3 font-medium">База</th>
-                <th class="py-2 pr-3 font-medium">Версия 1С</th>
-                <th class="py-2 pr-3 font-medium">Кластер / БД</th>
-                <th class="py-2 pr-3 font-medium">Путь к базе</th>
-                <th class="py-2 pr-3 font-medium">Расширение</th>
-                <th class="py-2 pr-3 font-medium">Проверка</th>
-                <th class="py-2 pr-3 font-medium">Слияние</th>
-                <th class="py-2 pr-3 font-medium">Обновление</th>
-                <th class="py-2 pr-3 font-medium">Последнее обновление</th>
-                <th class="py-2 pr-3 text-right font-medium">Действия</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="base in localBases.items"
-                :key="base.id"
-                class="border-b border-slate-100"
-                :data-test="`lb-row-${base.id}`"
-              >
-                <td class="py-2 pr-3">
-                  <Checkbox
-                    :model-value="localSelected.includes(base.id)"
-                    binary
-                    :data-test="`lb-select-${base.id}`"
-                    @update:model-value="toggleLocalSelect(base.id)"
-                  />
-                </td>
-                <td class="py-2 pr-3 font-medium">
-                  {{ base.name }}
-                  <div v-if="base.comment" class="magaz-muted text-xs">{{ base.comment }}</div>
-                </td>
-                <td class="py-2 pr-3 whitespace-nowrap">{{ base.version_1c }}</td>
-                <td class="py-2 pr-3">
-                  <div>{{ base.cluster_name }}</div>
-                  <div class="magaz-muted text-xs">{{ base.database_name }}</div>
-                </td>
-                <td class="py-2 pr-3">
-                  <span v-if="base.base_path" class="magaz-mono text-xs">{{ base.base_path }}</span>
-                  <span v-else class="magaz-muted text-xs">—</span>
-                </td>
-                <td class="py-2 pr-3">
-                  <span v-if="base.extension_name" class="magaz-mono text-xs">{{ base.extension_name }}</span>
-                  <span v-else class="magaz-muted text-xs">—</span>
-                </td>
-                <td class="py-2 pr-3 whitespace-nowrap">
-                  <Tag
-                    :value="stageStatus(lastLocalFor(localCheckJobs, base.id)).label"
-                    :severity="stageStatus(lastLocalFor(localCheckJobs, base.id)).severity"
-                    :data-test="`lb-check-status-${base.id}`"
-                  />
-                </td>
-                <td class="py-2 pr-3 whitespace-nowrap">
-                  <Tag
-                    :value="stageStatus(lastLocalFor(localMergeJobs, base.id)).label"
-                    :severity="stageStatus(lastLocalFor(localMergeJobs, base.id)).severity"
-                    :data-test="`lb-merge-status-${base.id}`"
-                  />
-                </td>
-                <td class="py-2 pr-3 whitespace-nowrap">
-                  <Tag
-                    :value="stageStatus(lastLocalFor(localJobs, base.id)).label"
-                    :severity="stageStatus(lastLocalFor(localJobs, base.id)).severity"
-                    :data-test="`lb-status-${base.id}`"
-                  />
-                </td>
-                <td class="py-2 pr-3 whitespace-nowrap magaz-muted">
-                  {{ lastOkAt(lastLocalFor(localJobs, base.id)) }}
-                </td>
-                <td class="py-2 pr-3 text-right whitespace-nowrap">
-                  <Button label="Проверить файлы" size="small" text :data-test="`lb-check-${base.id}`" @click="openLocalCheck(base)" />
-                  <Button label="Слияние…" size="small" text :data-test="`lb-merge-${base.id}`" @click="openLocalMerge(base)" />
-                  <Button label="Обновить базу" size="small" text :data-test="`lb-update-${base.id}`" @click="openLocalUpdate(base)" />
-                  <Button label="Изменить" size="small" text :data-test="`lb-edit-${base.id}`" @click="openBaseEdit(base)" />
-                  <Button label="Отключить" size="small" severity="danger" text :data-test="`lb-remove-${base.id}`" @click="removeLocalBase(base.id)" />
-                </td>
-              </tr>
-              <tr v-if="!localBases.items.length && !localBases.isLoading">
-                <td colspan="11" class="magaz-muted py-6 text-center">Локальные базы ещё не добавлены — нажмите «Добавить базу».</td>
-              </tr>
-            </tbody>
-          </table>
+        <div v-if="!localBases.items.length && !localBases.isLoading" class="magaz-muted py-6 text-center">
+          Локальные базы ещё не добавлены — нажмите «Добавить базу».
+        </div>
+
+        <div v-else class="space-y-4">
+          <section
+            v-for="group in localBases.groups"
+            :key="group"
+            class="rounded-xl border border-slate-200 bg-white"
+            :data-test="`lb-group-${group || 'без-группы'}`"
+          >
+            <header class="flex items-center gap-3 border-b border-slate-200 px-4 py-2">
+              <Checkbox
+                :model-value="localGroupAllSelected(group)"
+                binary
+                :data-test="`lb-group-select-${group || 'без-группы'}`"
+                @update:model-value="toggleLocalGroup(group)"
+              />
+              <h3 class="font-semibold text-blue-700">{{ group || 'Без группы' }}</h3>
+              <span class="magaz-muted text-xs">баз: {{ localBasesOfGroup(group).length }}</span>
+            </header>
+            <div class="overflow-x-auto">
+              <table class="w-full text-sm">
+                <thead>
+                  <tr class="magaz-muted border-b border-slate-100 text-left text-xs">
+                    <th class="px-4 py-2 font-medium"><span class="sr-only">выбор</span></th>
+                    <th class="px-4 py-2 font-medium">База</th>
+                    <th class="py-2 pr-3 font-medium">Версия 1С</th>
+                    <th class="py-2 pr-3 font-medium">Кластер / БД</th>
+                    <th class="py-2 pr-3 font-medium">Путь к базе</th>
+                    <th class="py-2 pr-3 font-medium">Расширение</th>
+                    <th class="py-2 pr-3 font-medium">Проверка</th>
+                    <th class="py-2 pr-3 font-medium">Слияние</th>
+                    <th class="py-2 pr-3 font-medium">Обновление</th>
+                    <th class="py-2 pr-3 font-medium">Последнее обновление</th>
+                    <th class="py-2 pr-3 text-right font-medium">Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="base in localBasesOfGroup(group)"
+                    :key="base.id"
+                    class="border-b border-slate-100 last:border-0"
+                    :data-test="`lb-row-${base.id}`"
+                  >
+                    <td class="px-4 py-2">
+                      <Checkbox
+                        :model-value="localSelected.includes(base.id)"
+                        binary
+                        :data-test="`lb-select-${base.id}`"
+                        @update:model-value="toggleLocalSelect(base.id)"
+                      />
+                    </td>
+                    <td class="px-4 py-2 font-medium">
+                      {{ base.name }}
+                      <div v-if="base.comment" class="magaz-muted text-xs">{{ base.comment }}</div>
+                    </td>
+                    <td class="py-2 pr-3 whitespace-nowrap">{{ base.version_1c }}</td>
+                    <td class="py-2 pr-3">
+                      <div>{{ base.cluster_name }}</div>
+                      <div class="magaz-muted text-xs">{{ base.database_name }}</div>
+                    </td>
+                    <td class="py-2 pr-3">
+                      <span v-if="base.base_path" class="magaz-mono text-xs">{{ base.base_path }}</span>
+                      <span v-else class="magaz-muted text-xs">—</span>
+                    </td>
+                    <td class="py-2 pr-3">
+                      <span v-if="base.extension_name" class="magaz-mono text-xs">{{ base.extension_name }}</span>
+                      <span v-else class="magaz-muted text-xs">—</span>
+                    </td>
+                    <td class="py-2 pr-3 whitespace-nowrap">
+                      <Tag
+                        :value="stageStatus(lastLocalFor(localCheckJobs, base.id)).label"
+                        :severity="stageStatus(lastLocalFor(localCheckJobs, base.id)).severity"
+                        :data-test="`lb-check-status-${base.id}`"
+                      />
+                    </td>
+                    <td class="py-2 pr-3 whitespace-nowrap">
+                      <Tag
+                        :value="stageStatus(lastLocalFor(localMergeJobs, base.id)).label"
+                        :severity="stageStatus(lastLocalFor(localMergeJobs, base.id)).severity"
+                        :data-test="`lb-merge-status-${base.id}`"
+                      />
+                    </td>
+                    <td class="py-2 pr-3 whitespace-nowrap">
+                      <Tag
+                        :value="stageStatus(lastLocalFor(localJobs, base.id)).label"
+                        :severity="stageStatus(lastLocalFor(localJobs, base.id)).severity"
+                        :data-test="`lb-status-${base.id}`"
+                      />
+                    </td>
+                    <td class="py-2 pr-3 whitespace-nowrap magaz-muted">
+                      {{ lastOkAt(lastLocalFor(localJobs, base.id)) }}
+                    </td>
+                    <td class="py-2 pr-3 text-right whitespace-nowrap">
+                      <Button label="Проверить файлы" size="small" text :data-test="`lb-check-${base.id}`" @click="openLocalCheck(base)" />
+                      <Button label="Слияние…" size="small" text :data-test="`lb-merge-${base.id}`" @click="openLocalMerge(base)" />
+                      <Button label="Обновить базу" size="small" text :data-test="`lb-update-${base.id}`" @click="openLocalUpdate(base)" />
+                      <Button label="Изменить" size="small" text :data-test="`lb-edit-${base.id}`" @click="openBaseEdit(base)" />
+                      <Button label="Отключить" size="small" severity="danger" text :data-test="`lb-remove-${base.id}`" @click="removeLocalBase(base.id)" />
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
         </div>
       </section>
 
