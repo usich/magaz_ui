@@ -116,6 +116,15 @@ const changedKeys = computed(() =>
     .map((item) => item.key),
 )
 
+/**
+ * Ключи-пути (Д-28): `local_update_dir` — папка локальных обновлений 1С.
+ * Пустое значение означает «взять путь из конфигурации сервера», поэтому поле
+ * показываем моноширинным шрифтом и с подсказкой вместо обязательного значения.
+ */
+function isPathSetting(key: string): boolean {
+  return key.endsWith('_dir')
+}
+
 onMounted(() => {
   void load()
   void admins.load()
@@ -202,7 +211,8 @@ function restoreDefault(item: SettingItem): void {
             <td>
               <InputText
                 v-model="draft[item.key]"
-                class="w-full"
+                :class="isPathSetting(item.key) ? 'magaz-mono w-full' : 'w-full'"
+                :placeholder="isPathSetting(item.key) ? 'пусто — путь из конфигурации сервера' : undefined"
                 :pt="{ root: { 'data-test': `setting-${item.key}` } }"
               />
             </td>

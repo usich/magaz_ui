@@ -30,6 +30,14 @@ const SETTINGS = [
     is_default: true,
     description: 'Через сколько минут вернуть отложенное уведомление',
   },
+  {
+    // Д-28: папка локальных обновлений 1С — ключ-путь, пустое значение допустимо
+    key: 'local_update_dir',
+    value: '',
+    default: '',
+    is_default: true,
+    description: 'Папка локальных обновлений 1С (пусто — путь из конфигурации сервера)',
+  },
 ]
 
 function makeAdmin(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -243,5 +251,26 @@ describe('блок «Администраторы» на странице нас
     )
     expect(deleteCall).toBeDefined()
     expect(fetchMock.mock.calls.at(-1)?.[0]).toBe('/api/v1/admin/admins')
+  })
+
+  it('настройка `local_update_dir` — поле-путь, сохраняется одним ключом (Д-28)', async () => {
+    fetchMock.mockImplementation(apiMock())
+
+    const { wrapper } = await mountSettings(fetchMock)
+
+    const field = wrapper.find('[data-test="setting-local_update_dir"]')
+    expect(field.exists()).toBe(true)
+    // Пустое значение означает «взять путь из конфигурации сервера» — подсказка в поле
+    expect(field.attributes('placeholder')).toContain('конфигурации')
+
+    await field.setValue('D:\\Updates\\1C')
+    await flushPromises()
+    await wrapper.find('[data-test="save-settings"]').trigger('click')
+    await flushPromises()
+
+    const putCall = fetchMock.mock.calls.find(
+      (call) => String(call[0]) === '/api/v1/admin/settings' && call[1]?.method === 'PUT',
+    ) as [string, RequestInit]
+    expect(bodyOf(putCall)).toEqual({ values: { local_update_dir: 'D:\\Updates\\1C' } })
   })
 })

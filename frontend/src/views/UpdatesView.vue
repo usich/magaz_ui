@@ -64,10 +64,11 @@ const mergeJobs = ref<JobItem[]>([])
 const updateJobs = ref<JobItem[]>([])
 const checkJobs = ref<JobItem[]>([])
 const recentJobs = ref<JobItem[]>([])
-// Д-24/Д-26: операции локальных баз по видам (обновление / слияние / проверка файлов)
+// Д-24/Д-26: операции локальных баз по видам (обновление / слияние).
+// Проверку файлов построчно не показываем (Д-28): операции по локальным базам
+// запускаются только пачкой из панели массовых операций.
 const localJobs = ref<JobItem[]>([])
 const localMergeJobs = ref<JobItem[]>([])
-const localCheckJobs = ref<JobItem[]>([])
 const jobsLoading = ref(false)
 // Журнал операций по магазинам: по умолчанию свернут, разворачивается кнопкой.
 const logExpanded = ref(false)
@@ -75,14 +76,13 @@ const logExpanded = ref(false)
 async function loadJobs(): Promise<void> {
   jobsLoading.value = true
   try {
-    const [merge, update, checkFiles, recent, local, localMerge, localCheck] = await Promise.all([
+    const [merge, update, checkFiles, recent, local, localMerge] = await Promise.all([
       jobsApi.list({ kind: 'run_merge', limit: 200 }),
       jobsApi.list({ kind: 'run_update_db', limit: 200 }),
       jobsApi.list({ kind: 'check_files', limit: 200 }),
       jobsApi.list({ kind: '', limit: 40 }),
       jobsApi.list({ kind: 'run_update_db_local', limit: 200 }),
       jobsApi.list({ kind: 'run_merge_local', limit: 200 }),
-      jobsApi.list({ kind: 'check_files_local', limit: 200 }),
     ])
     mergeJobs.value = merge.items
     updateJobs.value = update.items
@@ -90,62 +90,40 @@ async function loadJobs(): Promise<void> {
     recentJobs.value = recent.items
     localJobs.value = local.items
     localMergeJobs.value = localMerge.items
-    localCheckJobs.value = localCheck.items
   } finally {
     jobsLoading.value = false
   }
 }
 
-// Д-24/Д-26: диалог операции локальной базы (merge/update), Д-25: массовое обновление.
-const updateBase = ref<LocalBaseItem | null>(null)
+// Д-25/Д-28: диалог операции локальной базы — только массовый запуск.
+// Построчные кнопки убраны: одну базу обновляют так же, как пачку (чекбокс +
+// кнопка в шапке таблицы), иначе UI провоцировал «двойной» запуск одной ИБ.
 const bulkBaseIds = ref<number[]>([])
 const localDialogMode = ref<'check' | 'merge' | 'update'>('update')
 const localUpdateVisible = computed({
-  get: () => updateBase.value !== null || bulkBaseIds.value.length > 0,
+  get: () => bulkBaseIds.value.length > 0,
   set: (value: boolean) => {
     if (!value) {
-      updateBase.value = null
       bulkBaseIds.value = []
     }
   },
 })
-function openLocalUpdate(base: LocalBaseItem): void {
-  bulkBaseIds.value = []
-  localDialogMode.value = 'update'
-  updateBase.value = base
-  localUpdateVisible.value = true
-}
-function openLocalMerge(base: LocalBaseItem): void {
-  bulkBaseIds.value = []
-  localDialogMode.value = 'merge'
-  updateBase.value = base
-  localUpdateVisible.value = true
-}
 function openLocalBulkUpdate(): void {
   if (!localSelected.value.length) return
-  updateBase.value = null
   bulkBaseIds.value = [...localSelected.value]
   localDialogMode.value = 'update'
   localUpdateVisible.value = true
 }
 function openLocalBulkMerge(): void {
   if (!localSelected.value.length) return
-  updateBase.value = null
   bulkBaseIds.value = [...localSelected.value]
   localDialogMode.value = 'merge'
   localUpdateVisible.value = true
 }
 function openLocalBulkCheck(): void {
   if (!localSelected.value.length) return
-  updateBase.value = null
   bulkBaseIds.value = [...localSelected.value]
   localDialogMode.value = 'check'
-  localUpdateVisible.value = true
-}
-function openLocalCheck(base: LocalBaseItem): void {
-  bulkBaseIds.value = []
-  localDialogMode.value = 'check'
-  updateBase.value = base
   localUpdateVisible.value = true
 }
 function onLocalUpdateSubmitted(): void {
@@ -518,7 +496,6 @@ onUnmounted(() => {
                     <th class="py-2 pr-3 font-medium">Кластер / БД</th>
                     <th class="py-2 pr-3 font-medium">Путь к базе</th>
                     <th class="py-2 pr-3 font-medium">Расширение</th>
-                    <th class="py-2 pr-3 font-medium">Проверка</th>
                     <th class="py-2 pr-3 font-medium">Слияние</th>
                     <th class="py-2 pr-3 font-medium">Обновление</th>
                     <th class="py-2 pr-3 font-medium">Последнее обновление</th>
@@ -559,13 +536,6 @@ onUnmounted(() => {
                     </td>
                     <td class="py-2 pr-3 whitespace-nowrap">
                       <Tag
-                        :value="stageStatus(lastLocalFor(localCheckJobs, base.id)).label"
-                        :severity="stageStatus(lastLocalFor(localCheckJobs, base.id)).severity"
-                        :data-test="`lb-check-status-${base.id}`"
-                      />
-                    </td>
-                    <td class="py-2 pr-3 whitespace-nowrap">
-                      <Tag
                         :value="stageStatus(lastLocalFor(localMergeJobs, base.id)).label"
                         :severity="stageStatus(lastLocalFor(localMergeJobs, base.id)).severity"
                         :data-test="`lb-merge-status-${base.id}`"
@@ -582,9 +552,6 @@ onUnmounted(() => {
                       {{ lastOkAt(lastLocalFor(localJobs, base.id)) }}
                     </td>
                     <td class="py-2 pr-3 text-right whitespace-nowrap">
-                      <Button label="Проверить файлы" size="small" text :data-test="`lb-check-${base.id}`" @click="openLocalCheck(base)" />
-                      <Button label="Слияние…" size="small" text :data-test="`lb-merge-${base.id}`" @click="openLocalMerge(base)" />
-                      <Button label="Обновить базу" size="small" text :data-test="`lb-update-${base.id}`" @click="openLocalUpdate(base)" />
                       <Button label="Изменить" size="small" text :data-test="`lb-edit-${base.id}`" @click="openBaseEdit(base)" />
                       <Button label="Отключить" size="small" severity="danger" text :data-test="`lb-remove-${base.id}`" @click="removeLocalBase(base.id)" />
                     </td>
@@ -636,7 +603,6 @@ onUnmounted(() => {
   <LocalBaseFormDialog v-model:visible="baseFormVisible" :base="editingBase" @saved="onBaseSaved" />
   <LocalBaseUpdateDialog
     v-model:visible="localUpdateVisible"
-    :base="updateBase"
     :bulk-base-ids="bulkBaseIds"
     :mode="localDialogMode"
     @submitted="onLocalUpdateSubmitted"

@@ -40,19 +40,18 @@ const visibleItems = computed(() => {
   )
 })
 
-// Д-24/Д-26: операции локальных баз по видам (обновление / слияние / проверка файлов)
+// Д-24/Д-26: операции локальных баз по видам (обновление / слияние).
+// Д-28: проверку файлов построчно не показываем — операции запускаются пачкой
+// по выбранным базам из шапки таблицы.
 const localJobs = ref<JobItem[]>([])
 const localMergeJobs = ref<JobItem[]>([])
-const localCheckJobs = ref<JobItem[]>([])
 async function loadJobs(): Promise<void> {
-  const [update, merge, check] = await Promise.all([
+  const [update, merge] = await Promise.all([
     jobsApi.list({ kind: 'run_update_db_local', limit: 200 }),
     jobsApi.list({ kind: 'run_merge_local', limit: 200 }),
-    jobsApi.list({ kind: 'check_files_local', limit: 200 }),
   ])
   localJobs.value = update.items
   localMergeJobs.value = merge.items
-  localCheckJobs.value = check.items
 }
 
 /** Последняя задача по локальной базе в заданном списке (Д-24). */
@@ -65,56 +64,33 @@ function lastLocalFor(jobs: JobItem[], localBaseId: number): JobItem | null {
   return best
 }
 
-// Диалог операции локальной базы (Д-24/Д-26); Д-25: массовое обновление
-const updateBase = ref<LocalBaseItem | null>(null)
+// Диалог операции локальной базы (Д-24/Д-26); Д-25/Д-28: только массовый запуск.
 const bulkBaseIds = ref<number[]>([])
 const localDialogMode = ref<'check' | 'merge' | 'update'>('update')
 const localUpdateVisible = computed({
-  get: () => updateBase.value !== null || bulkBaseIds.value.length > 0,
+  get: () => bulkBaseIds.value.length > 0,
   set: (value: boolean) => {
     if (!value) {
-      updateBase.value = null
       bulkBaseIds.value = []
     }
   },
 })
-function openLocalUpdate(base: LocalBaseItem): void {
-  bulkBaseIds.value = []
-  localDialogMode.value = 'update'
-  updateBase.value = base
-  localUpdateVisible.value = true
-}
-function openLocalMerge(base: LocalBaseItem): void {
-  bulkBaseIds.value = []
-  localDialogMode.value = 'merge'
-  updateBase.value = base
-  localUpdateVisible.value = true
-}
 function openLocalBulkUpdate(): void {
   if (!localSelected.value.length) return
-  updateBase.value = null
   bulkBaseIds.value = [...localSelected.value]
   localDialogMode.value = 'update'
   localUpdateVisible.value = true
 }
 function openLocalBulkMerge(): void {
   if (!localSelected.value.length) return
-  updateBase.value = null
   bulkBaseIds.value = [...localSelected.value]
   localDialogMode.value = 'merge'
   localUpdateVisible.value = true
 }
 function openLocalBulkCheck(): void {
   if (!localSelected.value.length) return
-  updateBase.value = null
   bulkBaseIds.value = [...localSelected.value]
   localDialogMode.value = 'check'
-  localUpdateVisible.value = true
-}
-function openLocalCheck(base: LocalBaseItem): void {
-  bulkBaseIds.value = []
-  localDialogMode.value = 'check'
-  updateBase.value = base
   localUpdateVisible.value = true
 }
 function onLocalUpdateSubmitted(): void {
@@ -262,7 +238,6 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               <th class="py-2 pr-3 font-medium">Пользователь</th>
               <th class="py-2 pr-3 font-medium">Путь к базе</th>
               <th class="py-2 pr-3 font-medium">Бэкап</th>
-              <th class="py-2 pr-3 font-medium">Проверка</th>
               <th class="py-2 pr-3 font-medium">Слияние</th>
               <th class="py-2 pr-3 font-medium">Обновление</th>
               <th class="py-2 pr-3 text-right font-medium">Действия</th>
@@ -305,13 +280,6 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               </td>
               <td class="py-2 pr-3 whitespace-nowrap">
                 <Tag
-                  :value="stageStatus(lastLocalFor(localCheckJobs, base.id)).label"
-                  :severity="stageStatus(lastLocalFor(localCheckJobs, base.id)).severity"
-                  :data-test="`lb-check-status-${base.id}`"
-                />
-              </td>
-              <td class="py-2 pr-3 whitespace-nowrap">
-                <Tag
                   :value="stageStatus(lastLocalFor(localMergeJobs, base.id)).label"
                   :severity="stageStatus(lastLocalFor(localMergeJobs, base.id)).severity"
                   :data-test="`lb-merge-status-${base.id}`"
@@ -325,27 +293,6 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
                 />
               </td>
               <td class="py-2 pr-3 text-right whitespace-nowrap">
-                <Button
-                  label="Проверить файлы"
-                  size="small"
-                  text
-                  :data-test="`lb-check-${base.id}`"
-                  @click="openLocalCheck(base)"
-                />
-                <Button
-                  label="Слияние…"
-                  size="small"
-                  text
-                  :data-test="`lb-merge-${base.id}`"
-                  @click="openLocalMerge(base)"
-                />
-                <Button
-                  label="Обновить базу"
-                  size="small"
-                  text
-                  :data-test="`lb-update-${base.id}`"
-                  @click="openLocalUpdate(base)"
-                />
                 <Button label="Скопировать" size="small" text :data-test="`lb-copy-${base.id}`" @click="openCopy(base)" />
                 <Button
                   label="Изменить"
@@ -365,7 +312,7 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               </td>
             </tr>
             <tr v-if="!visibleItems.filter((item) => item.group === group).length">
-              <td colspan="11" class="magaz-muted py-4 text-center">Нет баз в этой группе</td>
+              <td colspan="10" class="magaz-muted py-4 text-center">Нет баз в этой группе</td>
             </tr>
           </tbody>
         </table>
@@ -379,7 +326,6 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
     <LocalBaseFormDialog v-model:visible="formVisible" :base="editingBase" :copy-from="copyFrom" @saved="onSaved" />
     <LocalBaseUpdateDialog
       v-model:visible="localUpdateVisible"
-      :base="updateBase"
       :bulk-base-ids="bulkBaseIds"
       :mode="localDialogMode"
       @submitted="onLocalUpdateSubmitted"

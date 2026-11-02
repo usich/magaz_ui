@@ -166,18 +166,22 @@ describe('страница «Локальные базы»', () => {
     wrapper.unmount()
   })
 
-  it('кнопка «Обновить базу» открывает диалог обновления (Д-24)', async () => {
+  it('построчных кнопок операций нет — операции запускаются пачкой (Д-28)', async () => {
     fetchMock.mockImplementation(apiMock([makeBase()]))
 
     const wrapper = await mountView(fetchMock)
 
-    await wrapper.find('[data-test="lb-update-2"]').trigger('click')
-    await flushPromises()
-
-    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
-    // В режиме «Обновить базу» поле имени файла не нужно (файл нужен для слияния/проверки)
-    expect(wrapper.find('[data-test="lbu-file"]').exists()).toBe(false)
-    expect(wrapper.find('[data-test="lbu-cf"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lb-check-2"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="lb-merge-2"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="lb-update-2"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="lb-check-status-2"]').exists()).toBe(false)
+    // Массовые операции в шапке таблицы остались
+    expect(wrapper.find('[data-test="lb-check-selected"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lb-merge-selected"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lb-update-selected"]').exists()).toBe(true)
+    // Построчные действия по самой записи (CRUD) сохраняются
+    expect(wrapper.find('[data-test="lb-edit-2"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="lb-copy-2"]').exists()).toBe(true)
     wrapper.unmount()
   })
 
@@ -218,34 +222,23 @@ describe('страница «Локальные базы»', () => {
     wrapper.unmount()
   })
 
-  it('кнопка «Проверить файлы» шлёт POST .../check-files (Д-26)', async () => {
-    const checkBodies: unknown[] = []
-    fetchMock.mockImplementation(apiMock([makeBase()], [], undefined, (body) => checkBodies.push(body)))
-
-    const wrapper = await mountView(fetchMock)
-
-    await wrapper.find('[data-test="lb-check-2"]').trigger('click')
-    await flushPromises()
-
-    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
-    await wrapper.find('[data-test="lbu-file"]').setValue('update')
-    await wrapper.find('[data-test="lbu-run"]').trigger('click')
-    await flushPromises()
-
-    expect(checkBodies).toHaveLength(1)
-    expect(JSON.parse(String(checkBodies[0]))).toMatchObject({ file_name: 'update' })
-    wrapper.unmount()
-  })
-
-  it('кнопка «Слияние…» открывает диалог и шлёт POST .../run-merge (Д-26)', async () => {
-    const mergeBodies: unknown[] = []
+  it('массовое «Слияние…» шлёт bulk/update с kind=run_merge_local (Д-26)', async () => {
+    const bulkBodies: unknown[] = []
     fetchMock.mockImplementation(
-      apiMock([makeBase()], [], undefined, undefined, (body) => mergeBodies.push(body)),
+      apiMock(
+        [makeBase(), makeBase({ id: 3, name: 'Торговля', database_name: 'trade', group: 'Продажи' })],
+        [],
+        (body) => bulkBodies.push(body),
+      ),
     )
 
     const wrapper = await mountView(fetchMock)
 
-    await wrapper.find('[data-test="lb-merge-2"]').trigger('click')
+    await wrapper.find('[data-test="lb-select-2"]').setValue(true)
+    await wrapper.find('[data-test="lb-select-3"]').setValue(true)
+    await flushPromises()
+
+    await wrapper.find('[data-test="lb-merge-selected"]').trigger('click')
     await flushPromises()
 
     expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
@@ -253,8 +246,12 @@ describe('страница «Локальные базы»', () => {
     await wrapper.find('[data-test="lbu-run"]').trigger('click')
     await flushPromises()
 
-    expect(mergeBodies).toHaveLength(1)
-    expect(JSON.parse(String(mergeBodies[0]))).toMatchObject({ file_name: 'update' })
+    expect(bulkBodies).toHaveLength(1)
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      local_base_ids: [2, 3],
+      kind: 'run_merge_local',
+      file_name: 'update',
+    })
     wrapper.unmount()
   })
 

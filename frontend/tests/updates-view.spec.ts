@@ -280,35 +280,51 @@ describe('страница «Обновление 1С»', () => {
     wrapper.unmount()
   })
 
-  it('вкладка «Локальные базы»: «Обновить базу» открывает диалог (Д-24)', async () => {
+  it('вкладка «Локальные базы»: операции только пачкой, построчных кнопок нет (Д-28)', async () => {
     fetchMock.mockImplementation(apiMock([], [], [], [], [], [makeLocalBase()]))
 
     const wrapper = await mountUpdates(fetchMock)
     await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
     await flushPromises()
 
-    await wrapper.find('[data-test="lb-update-2"]').trigger('click')
-    await flushPromises()
-
-    expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
-    // В режиме «Обновить базу» поле имени файла не нужно (файл нужен для слияния/проверки)
-    expect(wrapper.find('[data-test="lbu-file"]').exists()).toBe(false)
-    expect(wrapper.find('[data-test="lbu-cf"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="lbu-cfe"]').exists()).toBe(true)
+    // Построчные запуски и построчный статус проверки убраны: базу выбирают
+    // чекбоксом, а операцию запускают кнопкой в шапке таблицы.
+    expect(wrapper.find('[data-test="lb-check-2"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="lb-merge-2"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="lb-update-2"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="lb-check-status-2"]').exists()).toBe(false)
+    // Массовые операции в шапке остались
+    expect(wrapper.find('[data-test="updates-local-check-selected"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="updates-local-merge-selected"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="updates-local-update-selected"]').exists()).toBe(true)
     wrapper.unmount()
   })
 
-  it('вкладка «Локальные базы»: запуск шлёт POST .../run-update (Д-24)', async () => {
-    const runUpdateBody: unknown[] = []
+  it('вкладка «Локальные базы»: запуск шлёт POST .../bulk/update с kind=run_update_db_local (Д-24)', async () => {
+    const bulkBodies: unknown[] = []
     fetchMock.mockImplementation(
-      apiMock([], [], [], [], [], [makeLocalBase()], [], [], [], (body) => runUpdateBody.push(body)),
+      apiMock(
+        [],
+        [],
+        [],
+        [],
+        [],
+        [makeLocalBase()],
+        [],
+        [],
+        [],
+        undefined,
+        (body) => bulkBodies.push(body),
+      ),
     )
 
     const wrapper = await mountUpdates(fetchMock)
     await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
     await flushPromises()
 
-    await wrapper.find('[data-test="lb-update-2"]').trigger('click')
+    await wrapper.find('[data-test="lb-select-2"]').setValue(true)
+    await flushPromises()
+    await wrapper.find('[data-test="updates-local-update-selected"]').trigger('click')
     await flushPromises()
 
     await wrapper.find('[data-test="lbu-cfe"]').trigger('click')
@@ -318,9 +334,11 @@ describe('страница «Обновление 1С»', () => {
     await wrapper.find('[data-test="lbu-run"]').trigger('click')
     await flushPromises()
 
-    expect(runUpdateBody).toHaveLength(1)
+    expect(bulkBodies).toHaveLength(1)
     // Имя файла обновление БД не требует — в запрос оно не попадает
-    expect(JSON.parse(String(runUpdateBody[0]))).toMatchObject({
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      local_base_ids: [2],
+      kind: 'run_update_db_local',
       is_extension: true,
       extension_name: 'БГ_Бухгалтерия',
       is_fast_update: false,
@@ -372,11 +390,11 @@ describe('страница «Обновление 1С»', () => {
     wrapper.unmount()
   })
 
-  it('вкладка «Локальные базы»: «Проверить файлы» шлёт POST .../check-files (Д-26)', async () => {
-    const checkBodies: unknown[] = []
+  it('вкладка «Локальные базы»: «Проверить файлы» шлёт bulk/update с kind=check_files_local (Д-26)', async () => {
+    const bulkBodies: unknown[] = []
     fetchMock.mockImplementation(
-      apiMock([], [], [], [], [], [makeLocalBase()], [], [], [], undefined, undefined, (body) =>
-        checkBodies.push(body),
+      apiMock([], [], [], [], [], [makeLocalBase()], [], [], [], undefined, (body) =>
+        bulkBodies.push(body),
       ),
     )
 
@@ -384,7 +402,9 @@ describe('страница «Обновление 1С»', () => {
     await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
     await flushPromises()
 
-    await wrapper.find('[data-test="lb-check-2"]').trigger('click')
+    await wrapper.find('[data-test="lb-select-2"]').setValue(true)
+    await flushPromises()
+    await wrapper.find('[data-test="updates-local-check-selected"]').trigger('click')
     await flushPromises()
 
     expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
@@ -392,16 +412,20 @@ describe('страница «Обновление 1С»', () => {
     await wrapper.find('[data-test="lbu-run"]').trigger('click')
     await flushPromises()
 
-    expect(checkBodies).toHaveLength(1)
-    expect(JSON.parse(String(checkBodies[0]))).toMatchObject({ file_name: 'update' })
+    expect(bulkBodies).toHaveLength(1)
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      local_base_ids: [2],
+      kind: 'check_files_local',
+      file_name: 'update',
+    })
     wrapper.unmount()
   })
 
-  it('вкладка «Локальные базы»: «Слияние…» открывает диалог и шлёт POST .../run-merge (Д-26)', async () => {
-    const mergeBodies: unknown[] = []
+  it('вкладка «Локальные базы»: «Слияние…» шлёт bulk/update с kind=run_merge_local (Д-26)', async () => {
+    const bulkBodies: unknown[] = []
     fetchMock.mockImplementation(
-      apiMock([], [], [], [], [], [makeLocalBase()], [], [], [], undefined, undefined, undefined, (body) =>
-        mergeBodies.push(body),
+      apiMock([], [], [], [], [], [makeLocalBase()], [], [], [], undefined, (body) =>
+        bulkBodies.push(body),
       ),
     )
 
@@ -409,7 +433,9 @@ describe('страница «Обновление 1С»', () => {
     await wrapper.find('[data-test="updates-tab-local"]').trigger('click')
     await flushPromises()
 
-    await wrapper.find('[data-test="lb-merge-2"]').trigger('click')
+    await wrapper.find('[data-test="lb-select-2"]').setValue(true)
+    await flushPromises()
+    await wrapper.find('[data-test="updates-local-merge-selected"]').trigger('click')
     await flushPromises()
 
     expect(wrapper.find('[data-test="local-base-update-dialog"]').exists()).toBe(true)
@@ -417,8 +443,10 @@ describe('страница «Обновление 1С»', () => {
     await wrapper.find('[data-test="lbu-run"]').trigger('click')
     await flushPromises()
 
-    expect(mergeBodies).toHaveLength(1)
-    expect(JSON.parse(String(mergeBodies[0]))).toMatchObject({
+    expect(bulkBodies).toHaveLength(1)
+    expect(JSON.parse(String(bulkBodies[0]))).toMatchObject({
+      local_base_ids: [2],
+      kind: 'run_merge_local',
       file_name: 'update',
       is_extension: false,
     })
