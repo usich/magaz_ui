@@ -103,6 +103,85 @@ def test_run_update_creates_local_job(auth_client: TestClient) -> None:
     assert "Пароль" not in response.text
 
 
+def test_run_update_conflict_when_another_base_uses_same_ib(auth_client: TestClient) -> None:
+    """Д-28: одну серверную ИБ (`cluster_name` + `database_name`) обновляет одна задача.
+
+    В списке локальных баз может быть несколько строк, смотрящих в одну ИБ:
+    обновление «Бухгалтерии» блокирует запуск для «Бухгалтерии (копия)», и в
+    тексте отказа видно, кто именно держит ИБ.
+    """
+    busy = auth_client.post(BASE_URL, json=make_payload()).json()
+    twin = auth_client.post(BASE_URL, json=make_payload(name="Бухгалтерия (копия)")).json()
+    assert auth_client.post(
+        f"{BASE_URL}/{busy['id']}/run-update", json={"file_name": "update"}
+    ).status_code == 202
+
+    response = auth_client.post(f"{BASE_URL}/{twin['id']}/run-update", json={"file_name": "update"})
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert "Бухгалтерия (копия)" in detail
+    assert "уже обновляет база «Бухгалтерия»" in detail, "видно, кто держит ИБ"
+    assert "srv-1c\\buh" in detail, "видно, какая ИБ занята"
+
+
+def test_merge_local_blocks_base_of_same_ib(auth_client: TestClient) -> None:
+    """Слияние конфигурации другой базы той же ИБ — тоже занято (Д-26/Д-28)."""
+    busy = auth_client.post(BASE_URL, json=make_payload()).json()
+    twin = auth_client.post(BASE_URL, json=make_payload(name="Бухгалтерия (копия)")).json()
+    assert auth_client.post(
+        f"{BASE_URL}/{busy['id']}/run-merge", json={"file_name": "update"}
+    ).status_code == 202
+
+    response = auth_client.post(f"{BASE_URL}/{twin['id']}/run-update", json={"file_name": "update"})
+
+    assert response.status_code == 409, response.text
+    assert "уже обновляет" in response.json()["detail"]
+
+
+def test_check_files_local_does_not_block_ib(auth_client: TestClient) -> None:
+    """Проверка файлов папку ИБ не трогает — запуск обновления проходит (Д-26)."""
+    busy = auth_client.post(BASE_URL, json=make_payload()).json()
+    twin = auth_client.post(BASE_URL, json=make_payload(name="Бухгалтерия (копия)")).json()
+    assert auth_client.post(
+        f"{BASE_URL}/{busy['id']}/check-files", json={"file_name": "update"}
+    ).status_code == 202
+
+    response = auth_client.post(f"{BASE_URL}/{twin['id']}/run-update", json={"file_name": "update"})
+
+    assert response.status_code == 202, response.text
+
+
+def test_other_ib_is_allowed(auth_client: TestClient) -> None:
+    """Разные ИБ (`cluster_name` или `database_name`) не конфликтуют (Д-28)."""
+    first = auth_client.post(BASE_URL, json=make_payload()).json()
+    second = auth_client.post(BASE_URL, json=make_payload(name="Торговля", database_name="trade")).json()
+    assert auth_client.post(
+        f"{BASE_URL}/{first['id']}/run-update", json={"file_name": "update"}
+    ).status_code == 202
+
+    response = auth_client.post(f"{BASE_URL}/{second['id']}/run-update", json={"file_name": "update"})
+
+    assert response.status_code == 202, response.text
+
+
+def test_bulk_update_skips_base_of_same_ib(auth_client: TestClient) -> None:
+    """Массовое обновление пропускает вторую базу той же ИБ и объясняет причину (Д-25/Д-28)."""
+    busy = auth_client.post(BASE_URL, json=make_payload()).json()
+    twin = auth_client.post(BASE_URL, json=make_payload(name="Бухгалтерия (копия)")).json()
+    auth_client.post(f"{BASE_URL}/{busy['id']}/run-update", json={"file_name": "update"})
+
+    response = auth_client.post(
+        f"{BASE_URL}/bulk/update",
+        json={"local_base_ids": [busy["id"], twin["id"]], "file_name": "update"},
+    )
+
+    assert response.status_code == 202, response.text
+    by_id = {job["local_base_id"]: job for job in response.json()["jobs"]}
+    assert by_id[twin["id"]]["status"] == "skipped"
+    assert "ИБ занята базой «Бухгалтерия»" in by_id[twin["id"]]["detail"]
+
+
 def test_run_update_conflict_when_active(auth_client: TestClient) -> None:
     """Повторный запуск, пока задача активна, — `409` (R12 для локальных баз)."""
     base = auth_client.post(BASE_URL, json=make_payload()).json()

@@ -54,6 +54,8 @@ STOP_TIMEOUT_SEC = 10
 INTERVAL_SETTING = "local_update_interval_sec"
 #: Д-25: сколько локальных баз обновлять одновременно (`local_update_concurrency`)
 CONCURRENCY_SETTING = "local_update_concurrency"
+#: Д-28: папка файлов обновления локальных баз (пусто — из конфигурации сервера)
+WORK_DIR_SETTING = "local_update_dir"
 
 #: Сообщение успеха обновления БД (перенос v2, §7.1 «менять нельзя»)
 SUCCESS_UPDATE_MSG = "Обновление конфигурации успешно завершено"
@@ -251,12 +253,26 @@ class LocalUpdateMonitor:
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    @property
+    def work_dir(self) -> Path:
+        """Папка файлов обновления локальных баз (Д-28).
+
+        Значение из UI (`/settings`, `local_update_dir`) главнее конфигурации: админ
+        может перенести папку без перезапуска сервера. Пустое значение — «взять
+        путь из конфигурации» (`settings.local_update_dir`).
+        """
+        with self._db.session() as session:
+            raw = (settings_service.get_str(session, WORK_DIR_SETTING) or "").strip()
+        if raw:
+            return Path(raw)
+        return self._settings.local_update_dir
+
     def _paths(self) -> OneCPaths | None:
         base = (self._settings.local_1c_path or "").strip()
         if not base:
             return None
         return OneCPaths(
-            work_dir=self._settings.local_update_dir,
+            work_dir=self.work_dir,
             base_1c_path=Path(base),
         )
 

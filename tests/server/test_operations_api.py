@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from server.db.models import AuditLog, Command, FileCheck, Store
 from shared.enums import CommandKind, CommandStatus
 from shared.timeutil import utcnow
+from tests.server.conftest import STORE_IP
 
 ACTIONS_URL = "/api/v1/admin/stores/{store_id}/actions"
 BULK_URL = "/api/v1/admin/bulk/actions"
@@ -55,8 +56,10 @@ def add_store(
 ) -> Store:
     """Второй магазин для массовых операций (§11.4).
 
-    `database` нужен тестам запрета R12: «одна серверная ИБ» — это совпадение
-    `cluster_name` + `database_name` (§9.2 FR-28).
+    `ip` должен отличаться от адреса основного магазина: индекс
+    `uq_stores_ip_address_active` (`models.Store`) держит `ip_address` уникальным
+    среди активных магазинов, а конфликт R12 по одному адресу проверяется на
+    уровне сервиса (`test_command_service.TestUpdateConflicts`).
     """
     session.rollback()
     store = Store(
@@ -66,7 +69,7 @@ def add_store(
         database_name=database,
         version_1c="8.3.24.1548",
         user_name_1c="Администратор",
-        agent_token=f"token-{ip.replace('.', '-')}",
+        agent_token=f"token-{len(name)}-{ip.replace('.', '-')}",
         is_active=active,
         extension_name=extension_name,
     )
@@ -782,12 +785,18 @@ class TestAgentCommandResult:
 
 
 class TestUpdateConflictBlock:
-    """Жёсткий запрет одновременного обновления одной ИБ (R12, §9.2 FR-28, П-5).
+    """Жёсткий запрет одновременного обновления по `ip_address` (R12, FR-28, Д-28).
 
     Проверяется то, что видит админ: запуск обновления отклоняется `409`, задачи
-    не создаются, а текст объясняет, кого исключить. Действия, не меняющие ИБ,
-    проходят. Диспетчер в тестах выключен, поэтому созданная задача остаётся
-    «в работе» и играет роль «ИБ уже занята».
+    не создаются, а текст объясняет, кого исключить. Ключ запрета — адрес кассы
+    (Д-28 уточнил П-5: общая серверная ИБ у разных адресов больше не блокирует).
+    Действия, не меняющие ИБ, проходят. Диспетчер в тестах выключен, поэтому
+    созданная задача остаётся «в работе» и играет роль «магазин занят».
+
+    Два магазина с одним `ip_address` через API завести нельзя — индекс
+    `uq_stores_ip_address_active` (`models.Store`) держит адрес уникальным среди
+    активных магазинов, поэтому сценарии «один адрес на двоих» проверяются на
+    уровне сервиса (`test_command_service.TestUpdateConflicts`).
     """
 
     def _launch(self, client: TestClient, store: Store, action: str = "run_merge") -> int:
@@ -798,23 +807,32 @@ class TestUpdateConflictBlock:
         return int(response.json()["job"]["id"])
 
     @pytest.mark.parametrize("action", ["run_merge", "run_update_db"])
-    def test_bulk_update_of_one_database_is_rejected(
+    def test_bulk_launch_is_rejected_when_one_store_is_busy(
         self, auth_client: TestClient, session: Session, store: Store, action: str
     ) -> None:
-        """Два магазина одной ИБ в одном запуске — `409` и ни одной задачи (FR-28)."""
+        """Массовый запуск с занятым магазином — `409`, и ни одной новой задачи.
+
+        Пара магазинов с **одним** `ip_address` через API недостижима: индекс
+        `uq_stores_ip_address_active` (`models.Store`) не даёт сохранить дубль
+        адреса среди активных магазинов, поэтому «адрес занят другим магазином»
+        проверяется на уровне сервиса (`test_command_service.TestUpdateConflicts`).
+        Здесь важно поведение широкого запуска: один конфликт отменяет весь пакет.
+        """
         second = add_store(session, name="Магазин №6", ip="10.10.5.11", cluster="srv-1c")
+        self._launch(auth_client, store)
         params = {"file_name": "update"} if action == "run_merge" else {"is_fast_update": False}
 
         response = auth_client.post(
-            BULK_URL, json={"action": action, "params": params, "all": True}
+            BULK_URL,
+            json={"action": action, "params": params, "store_ids": [store.id, second.id]},
         )
 
         assert response.status_code == 409, response.text
         detail = response.json()["detail"]
         assert "R12" in detail
-        assert "одной серверной ИБ" in detail
-        assert store.name in detail and second.name in detail, "видно, кого исключить"
-        assert jobs(session) == [], "при конфликте задачи не создаются вовсе"
+        assert "ip-адресу" in detail
+        assert store.name in detail, "видно, кого исключить"
+        assert len(jobs(session)) == 1, "новых задач при конфликте не создаётся"
 
     def test_launch_on_same_store_is_rejected(
         self, auth_client: TestClient, session: Session, store: Store
@@ -832,22 +850,6 @@ class TestUpdateConflictBlock:
         assert "уже выполняет операцию" in detail
         assert f"#{first}" in detail
         assert len(jobs(session)) == 1, "вторая задача не создана"
-
-    def test_launch_on_another_store_of_same_database_is_rejected(
-        self, auth_client: TestClient, session: Session, store: Store
-    ) -> None:
-        """ИБ занята другим магазином — `409` с указанием, кто её обновляет."""
-        second = add_store(session, name="Магазин №6", ip="10.10.5.11", cluster="srv-1c")
-        self._launch(auth_client, store)
-
-        response = auth_client.post(
-            actions_url(second.id), json={"action": "run_merge", "params": {"file_name": "update"}}
-        )
-
-        assert response.status_code == 409, response.text
-        detail = response.json()["detail"]
-        assert store.name in detail and "уже обновляет" in detail
-        assert len(jobs(session)) == 1
 
     def test_launch_is_allowed_after_previous_job_finished(
         self, auth_client: TestClient, session: Session, store: Store
@@ -899,9 +901,9 @@ class TestUpdateConflictBlock:
 
     @pytest.mark.parametrize(
         ("cluster", "database"),
-        [("srv-1c", "trade2"), ("srv-9c", "trade")],
+        [("srv-1c", "trade"), ("srv-9c", "trade2")],
     )
-    def test_other_database_or_cluster_is_allowed(
+    def test_other_ip_is_allowed_even_with_same_database(
         self,
         auth_client: TestClient,
         session: Session,
@@ -909,7 +911,7 @@ class TestUpdateConflictBlock:
         cluster: str,
         database: str,
     ) -> None:
-        """Разные ИБ (`cluster_name` или `database_name`) не конфликтуют (FR-28)."""
+        """Д-28: общая серверная ИБ разных адресов не конфликтует — запуск проходит."""
         add_store(session, name="Магазин №6", ip="10.10.5.11", cluster=cluster, database=database)
 
         response = auth_client.post(
@@ -920,11 +922,11 @@ class TestUpdateConflictBlock:
         assert response.status_code == 202, response.text
         assert response.json()["total"] == 2
 
-    def test_store_without_database_does_not_block_others(
+    def test_store_without_ip_does_not_block_others(
         self, auth_client: TestClient, session: Session, store: Store
     ) -> None:
-        """Пустая база = ИБ не определена: запрет по паре не применяется (FR-28)."""
-        add_store(session, name="Магазин №6", ip="10.10.5.11", cluster="srv-1c", database="")
+        """Пустой `ip_address` = ключа запрета нет: запуск проходит (Д-28)."""
+        add_store(session, name="Магазин №6", ip="", cluster="srv-1c")
 
         response = auth_client.post(
             BULK_URL,
@@ -937,8 +939,8 @@ class TestUpdateConflictBlock:
     def test_disabled_store_does_not_block_launch(
         self, auth_client: TestClient, session: Session, store: Store
     ) -> None:
-        """Отключённый магазин пропускается и ИБ не занимает (§11.4, FR-28)."""
-        add_store(session, name="Магазин №6", ip="10.10.5.11", cluster="srv-1c", active=False)
+        """Отключённый магазин пропускается и адрес не занимает (§11.4, FR-28)."""
+        add_store(session, name="Магазин №6", ip=STORE_IP, cluster="srv-1c", active=False)
 
         response = auth_client.post(
             BULK_URL,

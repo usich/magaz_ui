@@ -425,6 +425,34 @@ class LocalBulkUpdateOut(BaseModel):
     jobs: list[LocalBulkUpdateJobOut] = Field(default_factory=list)
 
 
+def _local_conflict_detail(row: LocalBase, busy: Command) -> str:
+    """Текст отказа `409` для R12 локальных баз (Д-24/Д-26/Д-28).
+
+    Запрет действует на серверную ИБ (`cluster_name` + `database_name`), поэтому
+    занятую ИБ может держать **другая** строка списка — тогда в тексте видно,
+    какая именно, иначе админ искал бы конфликт в своей же базе.
+    """
+    other = busy.local_base
+    if other is None or int(other.id) == int(row.id):
+        return (
+            f"База «{row.name}» уже обновляется (задача #{busy.id}) — "
+            "дождитесь завершения операции"
+        )
+    key = f"{other.cluster_name or '—'}\\{other.database_name or '—'}"
+    return (
+        f"ИБ «{key}» базы «{row.name}» уже обновляет база «{other.name}» "
+        f"(задача #{busy.id}) — дождитесь завершения операции"
+    )
+
+
+def _local_conflict_short(row: LocalBase, busy: Command) -> str:
+    """Короткая причина пропуска базы в массовой операции (Д-25/Д-28)."""
+    other = busy.local_base
+    if other is None or int(other.id) == int(row.id):
+        return f"уже обновляется (задача #{busy.id})"
+    return f"ИБ занята базой «{other.name}» (задача #{busy.id})"
+
+
 @router.post(
     "/{base_id}/run-update",
     response_model=LocalUpdateRunOut,
@@ -443,7 +471,7 @@ def run_update_local_base(
     Задачу (`run_update_db_local`) выполнит LocalUpdateMonitor напрямую на этой
     машине; ответ `202`, результат — в `/jobs` и журнале `/jobs/{id}`. Пароль 1С
     в параметры не попадает (I-7): подключение берётся из карточки базы.
-    R12-запрет «одна локальная база — одно обновление» — под `dispatch_guard`.
+    R12-запрет «одна серверная ИБ — одно обновление» — под `dispatch_guard`.
     """
     row = _get_or_404(session, base_id)
     params = _build_local_update_params(payload)
@@ -453,10 +481,7 @@ def run_update_local_base(
         if busy is not None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"База «{row.name}» уже обновляется (задача #{busy.id}) — "
-                    "дождитесь завершения операции"
-                ),
+                detail=_local_conflict_detail(row, busy),
             )
         job = command_service.create_local_command(
             session,
@@ -604,8 +629,8 @@ def bulk_update_local_bases(
                     )
                 )
                 continue
-            # R12 «одна база — одно обновление» — только для видов, меняющих ИБ;
-            # проверка файлов в папке ИБ не трогает, поэтому не блокируется.
+            # R12 «одна серверная ИБ локальных баз — одно обновление» — только для
+            # видов, меняющих ИБ; проверка файлов папку ИБ не трогает.
             if kind in command_service.LOCAL_IB_KINDS:
                 busy = command_service.find_local_update_conflict(session, base_id)
                 if busy is not None:
@@ -614,7 +639,7 @@ def bulk_update_local_bases(
                             local_base_id=base_id,
                             local_base_name=row.name,
                             status="skipped",
-                            detail=f"уже обновляется (задача #{busy.id})",
+                            detail=_local_conflict_short(row, busy),
                         )
                     )
                     continue
@@ -703,8 +728,9 @@ def _run_local_operation(
     """Создать локальную задачу под `dispatch_guard` (Д-26).
 
     Для видов, меняющих ИБ 1С (`run_merge_local`, `run_update_db_local`), сначала
-    проверяется запрет R12 «одна база — одно обновление»; проверка файлов не
-    блокируется (файлы в папке ИБ не трогают).
+    проверяется запрет R12 «одна серверная ИБ локальных баз — одно обновление»
+    (`cluster_name` + `database_name`, Д-28); проверка файлов не блокируется
+    (файлы в папке ИБ не трогают).
     """
     with command_service.dispatch_guard():
         if str(kind) in command_service.LOCAL_IB_KINDS:
@@ -712,10 +738,7 @@ def _run_local_operation(
             if busy is not None:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        f"База «{row.name}» уже обновляется (задача #{busy.id}) — "
-                        "дождитесь завершения операции"
-                    ),
+                    detail=_local_conflict_detail(row, busy),
                 )
         job = command_service.create_local_command(
             session,

@@ -14,12 +14,15 @@
 * **§4.3** — `finished_at` ставится только у завершающих статусов, а
   `started_at` — при первой попытке отправки, поэтому в UI видно и «ещё не
   началось», и «идёт N секунд»;
-* **R12/FR-28** — запуск обновления отклоняется, если ту же серверную ИБ
-  (`cluster_name` + `database_name`) уже обновляет другой магазин или у самого
-  магазина висит незавершённая задача обновления. Проверка
-  (`find_update_conflicts`) и постановка задач идут в одном критическом участке
-  (`dispatch_guard`), поэтому два администратора, нажавшие кнопку одновременно,
-  не «проскочат» запрет.
+* **R12/FR-28** — запуск обновления отклоняется, если у магазина висит
+  незавершённая задача обновления или тот же `ip_address` уже обновляет другой
+  магазин (Д-28: заказчик уточнил, что блокирует адрес кассы, а не пара
+  `cluster_name` + `database_name`). Для **локальных** баз наоборот — блокирует
+  именно серверная ИБ (`cluster_name` + `database_name`), потому что несколько
+  строк `/local-bases` могут смотреть в одну базу. Проверка
+  (`find_update_conflicts`/`find_local_update_conflict`) и постановка задач идут в
+  одном критическом участке (`dispatch_guard`), поэтому два администратора,
+  нажавшие кнопку одновременно, не «проскочат» запрет.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from server.db.models import Command, JobLog, Store
+from server.db.models import Command, JobLog, LocalBase, Store
 from shared.enums import CommandKind, CommandStatus, JobLogLevel
 from shared.timeutil import utcnow
 
@@ -483,24 +486,23 @@ def status_age_sec(command: Command, *, now: Any = None) -> float:  # noqa: ANN4
     return max(0.0, (moment - reference).total_seconds())
 
 
-# --- Запрет одновременного обновления одной ИБ (R12, FR-28, П-5) --------------
+# --- Запрет одновременного обновления магазина (R12, FR-28, П-5, Д-28) --------
 
 
 @dataclass(frozen=True)
 class UpdateConflict:
-    """Причина, по которой запуск обновления запрещён (R12, FR-28, П-5).
+    """Причина, по которой запуск обновления магазина запрещён (R12, FR-28, Д-28).
 
     Три случая одной структурой: `same_store` — у магазина уже есть незавершённая
-    задача обновления («одного `ip`» из ответа заказчика), `same_database` — ИБ
-    магазина прямо сейчас обновляет другой магазин, `same_database_batch` — в
-    одном запуске два магазина одной серверной ИБ.
+    задача обновления («одного `ip`» из ответа заказчика), `same_ip` — этот
+    `ip_address` прямо сейчас обновляет другой магазин, `same_ip_batch` — в одном
+    запуске два магазина с одним `ip_address`.
     """
 
     reason: str
     store_ids: tuple[int, ...]
     store_names: tuple[str, ...]
-    cluster_name: str | None = None
-    database_name: str | None = None
+    ip_address: str | None = None
     job_id: int | None = None
     job_kind: str | None = None
     busy_store_name: str | None = None
@@ -511,9 +513,9 @@ class UpdateConflict:
         return ", ".join(f"«{name}»" for name in self.store_names)
 
     @property
-    def database_text(self) -> str:
-        """Серверная ИБ в терминах 1С: `cluster_name\\database_name` (§2 Q2)."""
-        return f"{self.cluster_name or '—'}\\{self.database_name or '—'}"
+    def ip_text(self) -> str:
+        """Адрес кассы — ключ запрета R12 (Д-28): `10.10.5.10`."""
+        return self.ip_address or "—"
 
     @property
     def message(self) -> str:
@@ -524,31 +526,30 @@ class UpdateConflict:
                 f"магазин {self.stores_text} уже выполняет операцию «{label}» "
                 f"(задача #{self.job_id}): дождитесь её завершения и запустите снова"
             )
-        if self.reason == "same_database":
+        if self.reason == "same_ip":
             return (
-                f"серверную ИБ «{self.database_text}» уже обновляет магазин "
-                f"«{self.busy_store_name}» (задача #{self.job_id}): исключите магазин "
+                f"магазин «{self.busy_store_name}» с тем же ip «{self.ip_text}» уже "
+                f"обновляется (задача #{self.job_id}): исключите магазин "
                 f"{self.stores_text} из запуска или дождитесь завершения"
             )
         return (
-            f"магазины {self.stores_text} работают с одной серверной ИБ "
-            f"«{self.database_text}»: одновременное обновление запрещено — "
-            "исключите один из магазинов из запуска и повторите"
+            f"магазины {self.stores_text} имеют один ip-адрес «{self.ip_text}»: "
+            "одновременное обновление запрещено — исключите один из магазинов "
+            "из запуска и повторите"
         )
 
 
-def _ib_key(store: Store) -> tuple[str, str] | None:
-    """Ключ серверной ИБ магазина: `cluster_name` + `database_name` (§2 Q2).
+def _ip_key(store: Store) -> str | None:
+    """Ключ запрета R12 для магазина — нормализованный `ip_address` (Д-28).
 
-    Регистр и лишние пробелы не важны: `srv-1c` и ` SRV-1C ` — одна ИБ. `None`
-    означает «ИБ не определена» (одно из полей пустое): по такой паре запрет R12
-    не применяется, иначе магазины без заполненной базы блокировали бы друг друга.
+    Заказчик уточнил правило П-5: одновременно обновлять нельзя магазины с одним
+    `ip_address` (адресом кассы), а не с одной парой `cluster_name` +
+    `database_name` — у разных магазинов может быть одна серверная база, и это
+    больше не повод отказывать в запуске. Регистр и пробелы не важны. `None`
+    означает «адрес не заполнен»: такой магазин других не блокирует.
     """
-    cluster = (store.cluster_name or "").strip().casefold()
-    database = (store.database_name or "").strip().casefold()
-    if not cluster or not database:
-        return None
-    return cluster, database
+    ip = (store.ip_address or "").strip().casefold()
+    return ip or None
 
 
 def active_update_commands(
@@ -557,7 +558,8 @@ def active_update_commands(
     """Незавершённые задачи, меняющие серверную ИБ, — вход проверки R12.
 
     Один запрос на весь запуск: задач «в работе» мало даже при парке 35–40
-    магазинов (§2 Q7). Карточка магазина нужна для его ИБ, поэтому `selectinload`.
+    магазинов (§2 Q7). Карточка магазина нужна для его `ip_address`, поэтому
+    `selectinload`.
     """
     stmt = (
         select(Command)
@@ -576,29 +578,32 @@ def find_update_conflicts(
     *,
     kinds: Sequence[str] = UPDATE_KINDS,
 ) -> list[UpdateConflict]:
-    """Проверить запрет одновременного обновления одной ИБ (R12, FR-28, П-5).
+    """Проверить запрет одновременного обновления магазина (R12, FR-28, П-5, Д-28).
 
     Запрет жёсткий: любая найденная строка — основание отдать `409` и **не**
-    создавать задачи. Отключённые магазины не рассматриваются: по ним действие
-    всё равно пропускается (§11.4), «занимать ИБ» они не могут.
+    создавать задачи. Ключ запрета — `ip_address` магазина (Д-28), а не пара
+    `cluster_name` + `database_name`: у двух магазинов может быть одна серверная
+    база, но обновление идёт по адресу кассы. Отключённые магазины не
+    рассматриваются: по ним действие всё равно пропускается (§11.4), «занимать
+    адрес» они не могут.
     """
     targets = [store for store in stores if store.is_active]
     if not targets:
         return []
 
     busy_by_store: dict[int, Command] = {}
-    busy_by_database: dict[tuple[str, str], Command] = {}
+    busy_by_ip: dict[str, Command] = {}
     for command in active_update_commands(session, kinds=kinds):
         busy_by_store.setdefault(int(command.store_id), command)
         store_row = command.store
-        key = _ib_key(store_row) if store_row is not None else None
+        key = _ip_key(store_row) if store_row is not None else None
         if key is not None:
-            busy_by_database.setdefault(key, command)
+            busy_by_ip.setdefault(key, command)
 
     conflicts: list[UpdateConflict] = []
-    groups: dict[tuple[str, str], list[Store]] = {}
+    groups: dict[str, list[Store]] = {}
     for store in targets:
-        key = _ib_key(store)
+        key = _ip_key(store)
         if key is not None:
             groups.setdefault(key, []).append(store)
 
@@ -609,24 +614,22 @@ def find_update_conflicts(
                     reason="same_store",
                     store_ids=(int(store.id),),
                     store_names=(store.name,),
-                    cluster_name=store.cluster_name,
-                    database_name=store.database_name,
+                    ip_address=key,
                     job_id=int(busy.id),
                     job_kind=str(busy.kind),
                 )
             )
             continue
 
-        busy_other = busy_by_database.get(key) if key is not None else None
+        busy_other = busy_by_ip.get(key) if key is not None else None
         if busy_other is not None and int(busy_other.store_id) != int(store.id):
             other = busy_other.store
             conflicts.append(
                 UpdateConflict(
-                    reason="same_database",
+                    reason="same_ip",
                     store_ids=(int(store.id),),
                     store_names=(store.name,),
-                    cluster_name=store.cluster_name,
-                    database_name=store.database_name,
+                    ip_address=key,
                     job_id=int(busy_other.id),
                     job_kind=str(busy_other.kind),
                     busy_store_name=getattr(other, "name", None) or f"id={busy_other.store_id}",
@@ -634,17 +637,16 @@ def find_update_conflicts(
             )
 
     for key, group in groups.items():
-        # Если ИБ уже занята, точнее сообщить «её обновляет магазин X» (выше),
+        # Если адрес уже занят, точнее сообщить «его обновляет магазин X» (выше),
         # чем перечислять пару магазинов одного запуска.
-        if len(group) < 2 or key in busy_by_database:
+        if len(group) < 2 or key in busy_by_ip:
             continue
         conflicts.append(
             UpdateConflict(
-                reason="same_database_batch",
+                reason="same_ip_batch",
                 store_ids=tuple(int(item.id) for item in group),
                 store_names=tuple(item.name for item in group),
-                cluster_name=group[0].cluster_name,
-                database_name=group[0].database_name,
+                ip_address=key,
             )
         )
 
@@ -666,12 +668,33 @@ def dispatch_guard() -> Iterator[None]:
         yield
 
 
+def _local_ib_key(base: LocalBase | None) -> tuple[str, str] | None:
+    """Ключ серверной ИБ локальной базы: `cluster_name` + `database_name` (Д-28).
+
+    Регистр и лишние пробелы не важны: `SRV-1C` и ` srv-1c ` — одна ИБ. `None`
+    означает «ИБ не определена» (одно из полей пустое): тогда запрет R12
+    применяется только к самой базе, иначе базы без заполненных реквизитов
+    блокировали бы друг друга.
+    """
+    if base is None:
+        return None
+    cluster = (base.cluster_name or "").strip().casefold()
+    database = (base.database_name or "").strip().casefold()
+    if not cluster or not database:
+        return None
+    return cluster, database
+
+
 def find_local_update_conflict(session: Session, local_base_id: int) -> Command | None:
     """Вернуть активную задачу, меняющую ИБ той же **локальной** базы, если есть (Д-24/Д-26).
 
-    Аналог R12 для магазинов, но без «общей серверной ИБ»: локальная база — одна
-    на машину, поэтому достаточно запрета «одна база — одно обновление». Активной
-    считается любая локальная задача, меняющая ИБ (`run_merge_local`,
+    Запрет R12 для локальных баз повторяет правило магазинов, но по своей паре
+    реквизитов (Д-28): одна серверная ИБ — одно обновление, то есть блокируются
+    базы с совпадающими `cluster_name` + `database_name` (в списке `/local-bases`
+    может быть несколько строк, смотрящих в одну базу). Если реквизиты ИБ у базы
+    не заполнены, работает прежний запрет «одна база — одно обновление» по
+    `local_base_id`, иначе такие базы блокировали бы друг друга без причины.
+    Активной считается любая локальная задача, меняющая ИБ (`run_merge_local`,
     `run_update_db_local`), в статусе `queued`/`running`. Проверка файлов не
     блокируется — файлы в папке ИБ не трогают. Вызывается под `dispatch_guard()`,
     чтобы два администратора не проскочили запрет.
@@ -679,12 +702,18 @@ def find_local_update_conflict(session: Session, local_base_id: int) -> Command 
     stmt = (
         select(Command)
         .where(
-            Command.local_base_id == local_base_id,
+            Command.local_base_id.is_not(None),
             Command.kind.in_(list(LOCAL_IB_KINDS)),
             Command.status.in_(ACTIVE_STATUSES),
         )
+        .options(selectinload(Command.local_base))
         .order_by(Command.id)
-        .limit(1)
     )
-    return session.scalar(stmt)
+    key = _local_ib_key(session.get(LocalBase, local_base_id))
+    for command in session.scalars(stmt).all():
+        if key is not None and _local_ib_key(command.local_base) == key:
+            return command
+        if int(command.local_base_id or 0) == int(local_base_id):
+            return command
+    return None
 

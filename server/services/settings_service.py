@@ -1,7 +1,8 @@
 """Настройки сервера (§4.9): значения по умолчанию, чтение, валидация, запись.
 
-Все ключи — целые, кроме `default_file_name` (имя файла обновления по умолчанию).
-Настройки читаются из БД, поэтому меняются из UI без перезапуска сервера.
+Почти все ключи — целые, кроме `default_file_name` (имя файла обновления по
+умолчанию) и `local_update_dir` (папка локальных обновлений 1С, Д-28). Настройки
+читаются из БД, поэтому меняются из UI без перезапуска сервера.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from shared.timeutil import utcnow
 __all__ = [
     "DEFAULT_SETTINGS",
     "INT_SETTING_KEYS",
+    "PATH_SETTING_KEYS",
     "ensure_defaults",
     "get_all",
     "get_int",
@@ -54,10 +56,19 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "local_update_interval_sec": "5",
     #: Д-25: сколько локальных баз обновлять одновременно (сколько `1cv8.exe`)
     "local_update_concurrency": "5",
+    #: Д-28: папка локальных обновлений 1С. Пусто — путь берётся из конфигурации
+    #: сервера (`local_update_dir`, по умолчанию `<данные>\\local-updates`)
+    "local_update_dir": "",
 }
 
+#: Ключи-пути (Д-28): значение может быть пустым — «взять путь из конфигурации»
+PATH_SETTING_KEYS: frozenset[str] = frozenset({"local_update_dir"})
+
 #: Ключи, значение которых обязано быть неотрицательным целым
-INT_SETTING_KEYS: frozenset[str] = frozenset(DEFAULT_SETTINGS) - {"default_file_name"}
+INT_SETTING_KEYS: frozenset[str] = frozenset(DEFAULT_SETTINGS) - {
+    "default_file_name",
+    *PATH_SETTING_KEYS,
+}
 
 
 def validate_value(key: str, value: str) -> str:
@@ -66,6 +77,13 @@ def validate_value(key: str, value: str) -> str:
         raise ValueError(f"Неизвестная настройка: {key}")
 
     raw = str(value).strip()
+    if key in PATH_SETTING_KEYS:
+        # Пустой путь — «оставить как в конфигурации сервера» (Д-28), поэтому
+        # проверяется только отсутствие кавычек, которые ломают запуск 1С.
+        if '"' in raw:
+            raise ValueError(f"Настройка {key} не должна содержать кавычек")
+        return raw
+
     if not raw:
         raise ValueError(f"Значение настройки {key} не может быть пустым")
 

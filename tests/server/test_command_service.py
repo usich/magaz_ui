@@ -246,11 +246,18 @@ class TestDeleteCommands:
 
 
 class TestUpdateConflicts:
-    """Запрет одновременного обновления одной ИБ (§9.2 FR-28, П-5) — сервисный слой."""
+    """Запрет одновременного обновления по `ip_address` (R12, FR-28, П-5, Д-28)."""
+
     def _store(
-        self, session: Session, *, name: str, ip: str, cluster: str, database: str
+        self,
+        session: Session,
+        *,
+        name: str,
+        ip: str,
+        cluster: str = "srv-1c",
+        database: str = "trade",
     ) -> Store:
-        """Магазин с явной серверной ИБ (`cluster_name` + `database_name`)."""
+        """Магазин с явным адресом кассы — ключом запрета R12 (Д-28)."""
         store = Store(
             name=name,
             ip_address=ip,
@@ -258,7 +265,7 @@ class TestUpdateConflicts:
             database_name=database,
             version_1c="8.3.24.1548",
             user_name_1c="Администратор",
-            agent_token=f"token-{ip.replace('.', '-')}",
+            agent_token=f"token-{name}-{ip}".replace(" ", "").replace(".", "-"),
         )
         session.add(store)
         session.commit()
@@ -272,16 +279,45 @@ class TestUpdateConflicts:
         session.commit()
         return command
 
-    def _pair(self, session: Session, *, second_cluster: str, second_database: str) -> tuple:
-        """Два магазина: первый — `srv-1c\\trade`, второй — с заданными реквизитами ИБ."""
-        first = self._store(session, name="Магазин №5", ip="10.10.5.10", cluster="srv-1c", database="trade")
+    def _pair(
+        self, session: Session, *, second_ip: str, second_cluster: str = "srv-1c", second_database: str = "trade"
+    ) -> tuple[Store, Store]:
+        """Два магазина: первый — `10.10.5.10`, второй — с заданными адресом и ИБ."""
+        first = self._store(session, name="Магазин №5", ip="10.10.5.10")
         second = self._store(
-            session, name="Магазин №6", ip="10.10.5.11", cluster=second_cluster, database=second_database
+            session,
+            name="Магазин №6",
+            ip=second_ip,
+            cluster=second_cluster,
+            database=second_database,
         )
         return first, second
 
+    def _ghost(self, *, store_id: int, ip: str, name: str = "Магазин №6") -> Store:
+        """Магазин «в памяти» с заданным `id` — для сценариев двух касс с одним адресом.
+
+        `uq_stores_ip_address_active` (`models.Store`) запрещает двум **активным**
+        магазинам один `ip_address`, поэтому пару с общим адресом нельзя сохранить
+        в БД. Правило R12 обязано выдержать такие данные, если они придут мимо API
+        (импорт, ручная правка БД) или если уникальность адреса когда-нибудь
+        ослабят ради нескольких агентов на одном хосте (Д-28).
+        """
+        store = Store(
+            name=name,
+            ip_address=ip,
+            cluster_name="srv-1c",
+            database_name="trade",
+            version_1c="8.3.24.1548",
+            user_name_1c="Администратор",
+            agent_token=f"ghost-{store_id}",
+        )
+        store.id = store_id
+        # `default=True` модели срабатывает только на INSERT, а объект не сохраняется.
+        store.is_active = True
+        return store
+
     def test_same_store_busy_is_conflict(self, session: Session) -> None:
-        store = self._store(session, name="Магазин №5", ip="10.10.5.10", cluster="srv-1c", database="trade")
+        store = self._store(session, name="Магазин №5", ip="10.10.5.10")
         job = self._job(session, store)
 
         conflicts = command_service.find_update_conflicts(session, [store])
@@ -290,55 +326,78 @@ class TestUpdateConflicts:
         assert f"#{job.id}" in conflicts[0].message
         assert "слияние конфигурации" in conflicts[0].message, "видно, что именно идёт"
 
-    def test_same_database_in_one_run_is_conflict(self, session: Session) -> None:
-        first, second = self._pair(session, second_cluster="srv-1c", second_database="trade")
+    def test_same_ip_in_one_run_is_conflict(self, session: Session) -> None:
+        first = self._store(session, name="Магазин №5", ip="10.10.5.10")
+        second = self._ghost(store_id=900, ip="10.10.5.10")
 
         conflicts = command_service.find_update_conflicts(session, [first, second])
 
-        assert [item.reason for item in conflicts] == ["same_database_batch"]
+        assert [item.reason for item in conflicts] == ["same_ip_batch"]
         assert first.name in conflicts[0].message and second.name in conflicts[0].message
-        assert "srv-1c\\trade" in conflicts[0].message
+        assert "10.10.5.10" in conflicts[0].message
 
-    def test_busy_database_of_another_store_is_conflict(self, session: Session) -> None:
-        first, second = self._pair(session, second_cluster="srv-1c", second_database="trade")
+    def test_busy_ip_of_another_store_is_conflict(self, session: Session) -> None:
+        first = self._store(session, name="Магазин №5", ip="10.10.5.10")
+        second = self._ghost(store_id=901, ip="10.10.5.10")
         self._job(session, first)
 
         conflicts = command_service.find_update_conflicts(session, [second])
 
-        assert [item.reason for item in conflicts] == ["same_database"]
-        assert "уже обновляет" in conflicts[0].message
+        assert [item.reason for item in conflicts] == ["same_ip"]
+        assert "уже" in conflicts[0].message
         assert first.name in conflicts[0].message
+        assert "10.10.5.10" in conflicts[0].message
 
-    def test_case_and_spaces_do_not_hide_same_database(self, session: Session) -> None:
-        """`SRV-1C` и `srv-1c`, `Trade` и `trade` — одна ИБ (FR-28)."""
-        first, second = self._pair(session, second_cluster=" SRV-1C ", second_database="Trade")
+    def test_case_and_spaces_do_not_hide_same_ip(self, session: Session) -> None:
+        """` 10.10.5.10 ` и `10.10.5.10` — один адрес кассы (Д-28)."""
+        first = self._store(session, name="Магазин №5", ip="10.10.5.10")
+        second = self._ghost(store_id=902, ip=" 10.10.5.10 ")
 
         conflicts = command_service.find_update_conflicts(session, [first, second])
 
-        assert [item.reason for item in conflicts] == ["same_database_batch"]
+        assert [item.reason for item in conflicts] == ["same_ip_batch"]
 
-    @pytest.mark.parametrize(
-        ("cluster", "database"),
-        [("srv-1c", "trade2"), ("srv-9c", "trade"), ("srv-1c", "")],
-    )
-    def test_other_database_is_not_a_conflict(
-        self, session: Session, cluster: str, database: str
-    ) -> None:
-        """Другая ИБ или незаполненная база — запрета нет (FR-28)."""
-        first, second = self._pair(session, second_cluster=cluster, second_database=database)
+    def test_shared_database_of_another_store_is_not_a_conflict(self, session: Session) -> None:
+        """Д-28: общая серверная ИБ и разные `ip_address` — запуск разрешён."""
+        first, second = self._pair(
+            session, second_ip="10.10.5.11", second_cluster="srv-1c", second_database="trade"
+        )
+
+        assert command_service.find_update_conflicts(session, [first, second]) == []
+
+    def test_busy_database_of_another_store_is_not_a_conflict(self, session: Session) -> None:
+        """Занятая задачами ИБ другого адреса не блокирует новый запуск (Д-28)."""
+        first, second = self._pair(
+            session, second_ip="10.10.5.11", second_cluster="srv-1c", second_database="trade"
+        )
+        self._job(session, first)
+
+        assert command_service.find_update_conflicts(session, [second]) == []
+
+    @pytest.mark.parametrize("ip", ["10.10.5.11", "10.10.5.12"])
+    def test_other_ip_is_not_a_conflict(self, session: Session, ip: str) -> None:
+        first, second = self._pair(session, second_ip=ip)
+
+        assert command_service.find_update_conflicts(session, [first, second]) == []
+
+    def test_blank_ip_does_not_block(self, session: Session) -> None:
+        """Пустой адрес кассы — не ключ запрета: ни сам не блокируется, ни блокирует."""
+        first = self._ghost(store_id=903, ip="", name="Магазин №5")
+        second = self._ghost(store_id=904, ip="   ")
 
         assert command_service.find_update_conflicts(session, [first, second]) == []
 
     def test_finished_job_is_not_a_conflict(self, session: Session) -> None:
-        store = self._store(session, name="Магазин №5", ip="10.10.5.10", cluster="srv-1c", database="trade")
+        store = self._store(session, name="Магазин №5", ip="10.10.5.10")
         job = self._job(session, store)
         command_service.set_status(session, job, CommandStatus.SUCCESS)
 
         assert command_service.find_update_conflicts(session, [store]) == []
 
     def test_disabled_store_is_ignored(self, session: Session) -> None:
-        """Отключённый магазин в выборку не попадает и ИБ не «занимает» (§11.4)."""
-        first, second = self._pair(session, second_cluster="srv-1c", second_database="trade")
+        """Отключённый магазин в выборку не попадает и адрес не «занимает» (§11.4)."""
+        first = self._store(session, name="Магазин №5", ip="10.10.5.10")
+        second = self._ghost(store_id=905, ip="10.10.5.10")
         second.is_active = False
 
         assert command_service.find_update_conflicts(session, [first, second]) == []

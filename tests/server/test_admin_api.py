@@ -111,7 +111,7 @@ class TestSettingsApi:
 
         assert response.status_code == 200
         by_key = {item["key"]: item for item in body}
-        assert len(by_key) == 21, "все ключи §4.9 присутствуют (включая добавки Д-7/Д-21/Д-24/Д-25/Д-27)"
+        assert len(by_key) == 22, "все ключи §4.9 присутствуют (включая добавки Д-7/Д-21/Д-24/Д-25/Д-27/Д-28)"
         assert by_key["health_interval_sec"]["value"] == "15"
         assert by_key["health_interval_sec"]["default"] == "15"
         assert by_key["health_interval_sec"]["is_default"] is True
@@ -120,6 +120,41 @@ class TestSettingsApi:
         assert by_key["local_update_interval_sec"]["value"] == "5"  # Д-24
         assert by_key["local_update_concurrency"]["value"] == "5"  # Д-25
         assert by_key["backup_end_hour"]["value"] == "15"  # Д-27
+        assert by_key["local_update_dir"]["value"] == "", "Д-28: пусто — путь из конфигурации"
+        assert by_key["local_update_dir"]["description"]
+
+    def test_local_update_dir_accepts_path_and_empty_value(
+        self, auth_client: TestClient, admin  # noqa: ANN001, ARG002
+    ) -> None:
+        """Д-28: папку локальных обновлений можно задать из UI и снова очистить.
+
+        Пустое значение — «взять путь из конфигурации сервера», поэтому оно
+        допустимо (в отличие от остальных строковых настроек).
+        """
+        response = auth_client.put(
+            SETTINGS_URL, json={"values": {"local_update_dir": "D:/Updates/1C"}}
+        )
+
+        assert response.status_code == 200, response.text
+        by_key = {item["key"]: item for item in response.json()}
+        assert by_key["local_update_dir"]["value"] == "D:/Updates/1C"
+        assert by_key["local_update_dir"]["is_default"] is False
+
+        cleared = auth_client.put(SETTINGS_URL, json={"values": {"local_update_dir": ""}})
+        assert cleared.status_code == 200, cleared.text
+        by_key = {item["key"]: item for item in cleared.json()}
+        assert by_key["local_update_dir"]["value"] == ""
+
+    def test_local_update_dir_with_quotes_is_422(
+        self, auth_client: TestClient, admin  # noqa: ANN001, ARG002
+    ) -> None:
+        """Кавычки ломают вызов `1cv8.exe` — настройка отклоняется (Д-28)."""
+        response = auth_client.put(
+            SETTINGS_URL, json={"values": {"local_update_dir": '"D:/Updates/1C"'}}
+        )
+
+        assert response.status_code == 422
+        assert "кавычек" in response.text
 
     def test_update_changes_value_and_writes_audit(
         self, auth_client: TestClient, admin, engine: Engine  # noqa: ANN001, ARG002
@@ -197,7 +232,7 @@ class TestSystemInfo:
         assert body["counts"]["stores_inactive"] == 0
         assert body["counts"]["admins_total"] == 1
         assert body["counts"]["jobs_active"] == 0, "Э4: плитка «Задач в работе»"
-        assert body["settings_keys"] == 21  # §4.9, включая Д-7/Д-21/Д-24/Д-25/Д-27
+        assert body["settings_keys"] == 22  # §4.9, включая Д-7/Д-21/Д-24/Д-25/Д-27/Д-28
 
 
 class TestSystemCountersForDisabledStores:
