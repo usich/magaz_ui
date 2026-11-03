@@ -20,8 +20,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from server.db.models import Command, Store, UpdateCycle
-from server.services import settings_service, update_cycle_service
-from shared.enums import CommandStatus
+from server.services import command_service, settings_service, update_cycle_service
+from shared.enums import CommandKind, CommandStatus
 from shared.timeutil import utcnow
 
 ACTIONS_URL = "/api/v1/admin/stores/{store_id}/actions"
@@ -304,4 +304,113 @@ class TestIdleAutoClose:
             session, update_cycle_service.SCOPE_STORES, kind="check_files", actor="admin"
         )
         assert second.id == first.id, "долгий проход не разрезается по времени"
+
+
+class TestOrphanChecksRepair:
+    """Ремонт данных Д-32: проверки диспетчера, созданные без цикла.
+
+    На боевом стенде после рассылки ссылки 22 повторные проверки оказались
+    с `cycle_id IS NULL` (цикл заполнял только API-слой), поэтому в таблице
+    «Магазины и статусы обновления» колонка «Проверка» показывала прочерк,
+    хотя файлы проверены. `attach_orphan_checks` привязывает такие задачи к
+    циклу родительского скачивания; без `apply` — только показывает план.
+    """
+
+    def _seed(self, session: Session, store: Store, *, parent_cycle: bool) -> Command:
+        """Скачивание (родитель) + повторная проверка без цикла, как у диспетчера."""
+        cycle_id = None
+        if parent_cycle:
+            cycle, _ = update_cycle_service.open_new(
+                session, scope=update_cycle_service.SCOPE_STORES, actor="adm3"
+            )
+            cycle_id = cycle.id
+        batch = update_cycle_service.new_batch_id()
+        parent = command_service.create_command(
+            session,
+            store_id=store.id,
+            kind=CommandKind.DOWNLOAD_FILE,
+            params={"url-file": "https://disk.yandex.ru/d/XXXX/update.cf"},
+            created_by="adm3",
+            cycle_id=cycle_id,
+            batch_id=batch,
+        )
+        follow_up = command_service.create_command(
+            session,
+            store_id=store.id,
+            kind=CommandKind.CHECK_FILES,
+            params={"filename": "update.cf"},
+            created_by="dispatcher",
+        )
+        command_service.add_log(
+            session,
+            follow_up,
+            f"{update_cycle_service.FOLLOW_UP_LOG_PREFIX} (задача {parent.id})",
+        )
+        session.commit()
+        return follow_up
+
+    def test_report_only_shows_plan_without_changes(self, session: Session, store: Store) -> None:
+        follow_up = self._seed(session, store, parent_cycle=True)
+
+        report = update_cycle_service.attach_orphan_checks(session, apply=False)
+
+        assert report.checked == 1
+        assert report.updated == 0, "без --apply база не меняется"
+        assert report.skipped == 0
+        session.expire_all()
+        assert session.get(Command, follow_up.id).cycle_id is None
+
+    def test_apply_inherits_cycle_and_batch_of_download(
+        self, session: Session, store: Store
+    ) -> None:
+        follow_up = self._seed(session, store, parent_cycle=True)
+        parent = session.scalars(
+            select(Command).where(Command.kind == str(CommandKind.DOWNLOAD_FILE))
+        ).one()
+
+        report = update_cycle_service.attach_orphan_checks(session, apply=True)
+        session.commit()
+
+        assert (report.checked, report.updated, report.skipped) == (1, 1, 0)
+        session.expire_all()
+        repaired = session.get(Command, follow_up.id)
+        assert repaired is not None
+        assert repaired.cycle_id == parent.cycle_id, "цикл скачивания"
+        assert repaired.batch_id == parent.batch_id, "та же «пачка запуска»"
+
+    def test_apply_opens_cycle_when_parent_has_none(self, session: Session, store: Store) -> None:
+        """Родитель вне цикла и открытого цикла нет — открывается новый (§11.6)."""
+        follow_up = self._seed(session, store, parent_cycle=False)
+
+        report = update_cycle_service.attach_orphan_checks(session, apply=True)
+        session.commit()
+
+        assert report.updated == 1
+        session.expire_all()
+        repaired = session.get(Command, follow_up.id)
+        assert repaired is not None and repaired.cycle_id is not None
+        cycle = session.get(UpdateCycle, repaired.cycle_id)
+        assert cycle is not None and cycle.scope == update_cycle_service.SCOPE_STORES
+
+    def test_skips_when_parent_is_gone(self, session: Session, store: Store) -> None:
+        """Родителя удалили из админки — задачу не трогаем и честно сообщаем."""
+        orphan = command_service.create_command(
+            session,
+            store_id=store.id,
+            kind=CommandKind.CHECK_FILES,
+            params={"filename": "update.cf"},
+            created_by="dispatcher",
+        )
+        command_service.add_log(
+            session,
+            orphan,
+            f"{update_cycle_service.FOLLOW_UP_LOG_PREFIX} (задача 9999)",
+        )
+        session.commit()
+
+        report = update_cycle_service.attach_orphan_checks(session, apply=True)
+
+        assert (report.checked, report.updated, report.skipped) == (1, 0, 1)
+        session.expire_all()
+        assert session.get(Command, orphan.id).cycle_id is None
 

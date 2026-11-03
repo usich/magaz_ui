@@ -9,6 +9,8 @@
     python -m server.cli info
     python -m server.cli preflight            # предполётная проверка перед приёмкой (Э7)
     python -m server.cli preflight --json     # отчёт для протокола docs/ACCEPTANCE.md
+    python -m server.cli repair-cycles        # проверки диспетчера без цикла: только план (Д-32)
+    python -m server.cli repair-cycles --apply  # привязать их к циклу обновления
 """
 
 from __future__ import annotations
@@ -50,6 +52,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     preflight = sub.add_parser("preflight", help="проверить готовность сервера к приёмке (Э7)")
     preflight.add_argument("--json", action="store_true", help="отчёт в JSON — приложить к протоколу")
+
+    repair = sub.add_parser(
+        "repair-cycles",
+        help="привязать повторные проверки диспетчера к циклу обновления (Д-32)",
+    )
+    repair.add_argument(
+        "--apply",
+        action="store_true",
+        help="записать изменения в БД (без флага — только показать план)",
+    )
     return parser
 
 
@@ -137,6 +149,35 @@ def _cmd_preflight(db: DatabaseManager, args: argparse.Namespace) -> int:
     return report.exit_code
 
 
+def _cmd_repair_cycles(db: DatabaseManager, args: argparse.Namespace) -> int:
+    """Привязать «осиротевшие» проверки диспетчера к циклу обновления (Д-32).
+
+    Запускается на самом сервере: SQLite в режиме WAL по сети (SMB) не
+    поддерживается — «database is locked», `disk I/O error` и риск порчи
+    файла. На сервере проще `deploy\\repair_cycles.bat [apply]`: он снимает
+    бэкап и останавливает службу. Без `--apply` печатает план и ничего не
+    меняет.
+    """
+    from server.services import update_cycle_service
+
+    with db.session() as session:
+        report = update_cycle_service.attach_orphan_checks(
+            session, apply=bool(args.apply), actor="cli"
+        )
+        for line in report.details:
+            print(line)
+        print(
+            f"Проверок без цикла: {report.checked}, привязано: {report.updated}, "
+            f"пропущено: {report.skipped}, запасной цикл: {report.cycle_id or '—'}"
+        )
+        if not args.apply:
+            print("Режим просмотра: добавьте --apply, чтобы записать изменения")
+            return 0
+        session.commit()
+    print("Готово")
+    return 0
+
+
 def _cmd_info(db: DatabaseManager) -> int:
     from sqlalchemy import inspect
 
@@ -168,6 +209,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_seed_settings(db)
         if args.command == "preflight":
             return _cmd_preflight(db, args)
+        if args.command == "repair-cycles":
+            return _cmd_repair_cycles(db, args)
         if args.command == "info":
             return _cmd_info(db)
     finally:

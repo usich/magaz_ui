@@ -25,13 +25,14 @@ from server.config import Settings
 from server.core.client_http import AgentProtocolError
 from server.core.dispatcher import CommandDispatcher, build_1c_payload
 from server.core.security import SecretBox
-from server.db.models import Command, FileCheck, JobLog, Notification, Store
+from server.db.models import Command, FileCheck, JobLog, Notification, Store, UpdateCycle
 from server.db.session import DatabaseManager
 from server.services import (
     command_service,
     device_service,
     notification_service,
     settings_service,
+    update_cycle_service,
 )
 from shared.enums import CommandKind, CommandStatus
 from shared.timeutil import utcnow
@@ -1065,6 +1066,78 @@ class TestDownloadScenario:
         await dispatcher.process_once()
         snapshots = list(session.scalars(select(FileCheck)))
         assert snapshots and snapshots[-1].cf_exists
+
+    async def test_follow_up_check_inherits_cycle_of_download(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        """Д-32: повторная проверка попадает в тот же цикл, что и скачивание.
+
+        Вкладка «Обновление 1С» читает задачи **текущего цикла** (`/jobs?cycle_id=`),
+        поэтому проверка, созданная диспетчером без `cycle_id`, не поднимала статус
+        в колонке «Проверка»: на боевом стенде 22 проверки после скачивания
+        оказались «вне цикла», и таблица «Магазины и статусы обновления» показывала
+        прочерк при успешно проверенных файлах.
+        """
+        seed_settings(session)
+        store = make_store(session, online=True)
+        cycle, _ = update_cycle_service.open_new(
+            session, scope=update_cycle_service.SCOPE_STORES, actor="adm3"
+        )
+        batch = update_cycle_service.new_batch_id()
+        command = command_service.create_command(
+            session,
+            store_id=store.id,
+            kind=CommandKind.DOWNLOAD_FILE,
+            params={"url-file": "https://disk.yandex.ru/d/XXXX/update.cf"},
+            created_by="adm3",
+            cycle_id=cycle.id,
+            batch_id=batch,
+        )
+        session.commit()
+
+        agent = ScriptedAgent()
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+        await dispatcher.process_once()  # /download-file
+        await dispatcher.process_once()  # файл появился → success + повторная проверка
+
+        assert fresh(session, command.id).status == CommandStatus.SUCCESS
+        follow_ups = list(
+            session.scalars(select(Command).where(Command.kind == str(CommandKind.CHECK_FILES)))
+        )
+        assert len(follow_ups) == 1, "повторная проверка создана автоматически"
+        assert follow_ups[0].cycle_id == cycle.id, "проверка внутри цикла скачивания"
+        assert follow_ups[0].batch_id == batch, "та же «пачка запуска», что у скачивания"
+
+    async def test_follow_up_check_opens_cycle_when_parent_has_none(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        """Родитель вне цикла (старая задача) — проверка всё равно получает цикл.
+
+        Иначе автоматическая задача выпала бы из статусов навсегда: у неё нет
+        ни `cycle_id`, ни кнопки «поставить в цикл» в UI.
+        """
+        seed_settings(session)
+        store = make_store(session, online=True)
+        command = add_command(
+            session,
+            store,
+            CommandKind.DOWNLOAD_FILE,
+            {"url-file": "https://disk.yandex.ru/d/XXXX/update.cf"},
+        )
+        assert command.cycle_id is None
+
+        agent = ScriptedAgent()
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+        await dispatcher.process_once()
+        await dispatcher.process_once()
+
+        assert fresh(session, command.id).status == CommandStatus.SUCCESS
+        follow_up = session.scalars(
+            select(Command).where(Command.kind == str(CommandKind.CHECK_FILES))
+        ).first()
+        assert follow_up is not None and follow_up.cycle_id is not None
+        cycle = session.get(UpdateCycle, follow_up.cycle_id)
+        assert cycle is not None and cycle.scope == update_cycle_service.SCOPE_STORES
 
     async def test_download_uses_real_filename_from_agent(
         self, manager: DatabaseManager, settings: Settings, session: Session

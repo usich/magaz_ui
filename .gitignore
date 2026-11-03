@@ -10,6 +10,7 @@ htmlcov/
 
 # --- Данные и секреты сервера (не в git) ---
 server/data/*.db
+server/data/*.db.bak-*
 server/data/*.db-journal
 server/data/*.db-wal
 server/data/*.db-shm

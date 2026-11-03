@@ -24,14 +24,15 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from server.db.models import Command, UpdateCycle
+from server.db.models import Command, JobLog, UpdateCycle
 from server.services import settings_service
 from shared.enums import CommandKind, CommandStatus
 from shared.timeutil import utcnow
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "CYCLE_KINDS",
+    "FOLLOW_UP_LOG_PREFIX",
     "IDLE_SETTING",
     "LOCAL_KINDS",
     "SCOPES",
@@ -47,6 +49,8 @@ __all__ = [
     "SCOPE_STORES",
     "STORES_KINDS",
     "CycleStats",
+    "OrphanCheckReport",
+    "attach_orphan_checks",
     "close_cycle",
     "current",
     "get_or_open",
@@ -325,4 +329,108 @@ def suggest_new_cycle(session: Session, cycle: UpdateCycle | None) -> bool:
     if cycle is None:
         return False
     return stats(session, cycle).finished_stages > 0
+
+
+#: Метка журнала, по которой находится родительское скачивание (Д-32).
+FOLLOW_UP_LOG_PREFIX = "Повторная проверка после скачивания"
+#: `… (задача 42)` — идентификатор родителя в той же метке журнала.
+_PARENT_RE = re.compile(r"\(задача (\d+)\)")
+
+
+@dataclass(slots=True)
+class OrphanCheckReport:
+    """Итог привязки «осиротевших» задач к циклу (Д-32).
+
+    `checked` — сколько задач проверки без цикла найдено, `updated` — сколько
+    привязано, `skipped` — где родитель не найден (удалён админом или задача
+    создана не диспетчером), `cycle_id` — цикл, взятый как запасной вариант.
+    """
+
+    checked: int = 0
+    updated: int = 0
+    skipped: int = 0
+    cycle_id: int | None = None
+    details: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "checked": self.checked,
+            "updated": self.updated,
+            "skipped": self.skipped,
+            "cycle_id": self.cycle_id,
+            "details": list(self.details),
+        }
+
+
+def attach_orphan_checks(
+    session: Session,
+    *,
+    apply: bool = False,
+    actor: str = "cli",
+) -> OrphanCheckReport:
+    """Привязать повторные проверки, созданные диспетчером без цикла (Д-32).
+
+    До Д-32 `cycle_id`/`batch_id` заполнял только API-слой, поэтому проверки,
+    поставленные диспетчером после скачивания, оказывались «вне цикла» и не
+    попадали в `/jobs?cycle_id=<текущий>` — в таблице «Магазины и статусы
+    обновления» колонка «Проверка» оставалась пустой.
+
+    Цикл и «пачку запуска» берём у родительского скачивания (связь видна в
+    журнале задачи). Если у родителя цикла нет — берём текущий открытый цикл
+    магазинов, а при `apply=True` открываем новый, как это делает API при
+    постановке задачи. `apply=False` — только показать план, ничего не меняя.
+    """
+    rows = session.execute(
+        select(Command.id, Command.store_id, JobLog.message)
+        .join(JobLog, JobLog.command_id == Command.id)
+        .where(Command.kind == str(CommandKind.CHECK_FILES))
+        .where(Command.cycle_id.is_(None))
+        .where(JobLog.message.like(f"{FOLLOW_UP_LOG_PREFIX}%"))
+        .order_by(Command.id)
+    ).all()
+
+    report = OrphanCheckReport(checked=len(rows))
+    fallback: UpdateCycle | None = current(session, SCOPE_STORES)
+    report.cycle_id = int(fallback.id) if fallback is not None else None
+
+    for command_id, store_id, message in rows:
+        match = _PARENT_RE.search(message or "")
+        parent = session.get(Command, int(match.group(1))) if match else None
+        if parent is None or parent.store_id != store_id:
+            report.skipped += 1
+            report.details.append(f"задача {command_id}: родитель не найден — пропущено")
+            continue
+
+        cycle_id = parent.cycle_id
+        if cycle_id is None:
+            if apply:
+                cycle = get_or_open(
+                    session, SCOPE_STORES, kind=CommandKind.CHECK_FILES, actor=actor
+                )
+                cycle_id = int(cycle.id)
+            elif fallback is not None:
+                cycle_id = int(fallback.id)
+            else:
+                report.skipped += 1
+                report.details.append(
+                    f"задача {command_id}: у родителя нет цикла, открытого цикла тоже нет"
+                )
+                continue
+
+        report.details.append(
+            f"задача {command_id} (магазин {store_id}) -> цикл {cycle_id}, "
+            f"пачка {parent.batch_id or '—'}"
+        )
+        if not apply:
+            continue
+
+        command = session.get(Command, command_id)
+        if command is not None:
+            command.cycle_id = cycle_id
+            command.batch_id = parent.batch_id
+            report.updated += 1
+
+    if apply:
+        session.flush()
+    return report
 

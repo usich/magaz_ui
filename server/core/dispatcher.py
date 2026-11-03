@@ -61,6 +61,7 @@ from server.services import (
     device_service,
     notification_service,
     settings_service,
+    update_cycle_service,
 )
 from shared.enums import (
     CommandKind,
@@ -1046,18 +1047,49 @@ class CommandDispatcher:
         )
         # ФН2 + §11.3: «→ затем повторная проверка». Отдельной задачей, чтобы
         # повторная проверка была видна в истории, а не «внутри» скачивания.
+        # Д-32: проверка — часть того же прохода, поэтому цикл обновления (Д-29)
+        # наследуется от задачи скачивания: иначе она оставалась без `cycle_id`,
+        # и таблица «Магазины и статусы обновления» показывала в колонке
+        # «Проверка» прочерк, хотя файлы уже проверены (UI читает задачи цикла).
         follow_up = command_service.create_command(
             session,
             store_id=store.id,
             kind=CommandKind.CHECK_FILES,
             params={"filename": filename},
             created_by="dispatcher",
+            cycle_id=self._cycle_id_for_follow_up(session, command),
+            batch_id=command.batch_id,
         )
         command_service.add_log(
             session,
             follow_up,
             f"Повторная проверка после скачивания (задача {command.id})",
         )
+
+    def _cycle_id_for_follow_up(self, session: Any, command: Command) -> int | None:  # noqa: ANN401
+        """Цикл обновления для автоматической задачи-продолжения (Д-32).
+
+        Обычно это цикл родительской задачи: скачивание и повторная проверка —
+        один проход, а не два. Если родитель поставлен вне цикла (старая задача
+        или запуск не из UI), берём текущий открытый цикл магазинов, а при его
+        отсутствии открываем новый — как это делает API при постановке задачи:
+        задача без `cycle_id` выпадает из статусов на вкладке «Обновление 1С».
+        """
+        if command.cycle_id is not None:
+            return command.cycle_id
+        try:
+            cycle = update_cycle_service.get_or_open(
+                session,
+                update_cycle_service.SCOPE_STORES,
+                kind=CommandKind.CHECK_FILES,
+                actor="dispatcher",
+            )
+        except Exception:  # noqa: BLE001 - задача важнее привязки к циклу
+            logger.exception(
+                "Не удалось определить цикл для повторной проверки (задача id=%s)", command.id
+            )
+            return None
+        return int(cycle.id)
 
     # --- Ошибки отправки и опроса -------------------------------------------
 
