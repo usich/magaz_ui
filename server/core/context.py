@@ -52,7 +52,13 @@ def build_app_context(
     resolved = settings or get_settings()
     return AppContext(
         settings=resolved,
-        db=DatabaseManager(resolved.database_url, echo=resolved.sql_echo),
+        db=DatabaseManager(
+            resolved.database_url,
+            echo=resolved.sql_echo,
+            pool_size=resolved.db_pool_size,
+            max_overflow=resolved.db_max_overflow,
+            pool_timeout=resolved.db_pool_timeout_sec,
+        ),
         secret_box=SecretBox.from_path(resolved.secrets_key_path, resolved.secret_key or None),
         session_signer=SessionSigner(
             load_or_create_secret(resolved.cookie_secret_path, resolved.cookie_secret or None),

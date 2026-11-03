@@ -65,6 +65,12 @@ class Settings(BaseSettings):
     #: СУБД (Q12): SQLite по умолчанию, PostgreSQL — только строкой подключения
     database_url: str = ""
     sql_echo: bool = False
+    #: Пул соединений (Д-30): умолчания SQLAlchemy (5 + 10, ожидание 30 с) не
+    #: выдерживали опросы SPA + фоновые циклы + запросы агентов — пул кончался
+    #: и диспетчер с админкой вставали на `QueuePool limit ... reached`
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_timeout_sec: float = 15.0
 
     #: Автоприменение Alembic-миграций при старте (`alembic upgrade head` в
     #: `lifespan`). Идемпотентно; защищает от «no such column», когда к рабочей

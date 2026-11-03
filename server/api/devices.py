@@ -479,6 +479,36 @@ def _check_timeout_sec(specs: list[DeviceCheckSpec], timeout_ms: int) -> float:
     )
 
 
+def _persist_device_batch(
+    context: AppContext,
+    *,
+    store_id: int,
+    batch: DeviceStatusBatch,
+    admin_username: str,
+    details: dict[str, object],
+    request: Request,
+) -> dict[str, int]:
+    """Записать итог проверки **отдельной короткой сессией** (Д-30).
+
+    Сессия открывается только на время записи: HTTP-запрос к кассе идёт без
+    соединения из пула, иначе ожидание таймаута офлайн-кассы вычерпывало пул.
+    """
+    with context.db.session() as session:
+        store = _get_store_or_404(session, store_id)
+        summary = device_service.apply_status_batch(session, store, batch)
+        audit_service.record(
+            session,
+            action="device_check",
+            actor=admin_username,
+            entity="store",
+            entity_id=store_id,
+            details={**details, "updated": summary["updated"]},
+            ip_address=get_client_ip(request),
+        )
+        session.commit()
+    return summary
+
+
 @router.post(
     "/stores/{store_id}/devices/check",
     response_model=DeviceCheckResponse,
@@ -498,8 +528,10 @@ async def check_store_devices(
     путаем «нет связи с кассой» и «нет связи с камерой» (§4.11). Ответ в этом
     случае всё равно `200`: админ должен видеть причину, а не «ошибку 503».
 
-    Сессия БД открывается внутри: запрос асинхронный (httpx), а работа с SQLite
-    короткая — как в проверке магазина `POST /stores/{id}/check` (Д-3).
+    Д-30: соединение пула держится только на время чтения карточки и записи
+    итога. Сам HTTP-запрос к кассе (таймаут до нескольких секунд, а у офлайн-
+    кассы — весь таймаут) идёт **без** соединения из пула: иначе параллельные
+    «Проверить сейчас» вычерпывали пул и вешали диспетчер с админкой.
     """
     wanted = set(payload.device_ids) if payload else set()
     with context.db.session() as session:
@@ -524,77 +556,69 @@ async def check_store_devices(
         timeout_ms = settings_service.get_int(session, device_service.TIMEOUT_SETTING)
         target = build_agent_target(store, context.settings)
         details = {"store_id": store.id, "devices": len(specs)}
+        device_ips = [item.ip_address for item in devices]
 
-        try:
-            async with AgentClient(
-                target,
-                timeout=_check_timeout_sec(specs, timeout_ms),
-                transport=context.agent_transport,
-            ) as client:
-                results = await client.check_devices_now(DeviceCheckRequest(devices=specs))
-        except AgentOfflineError as exc:
-            summary = device_service.apply_status_batch(
-                session,
-                store,
-                DeviceStatusBatch(
-                    store_id=store.id,
-                    agent_ok=False,
-                    devices=[
-                        DeviceCheckResult(
-                            ip=item.ip_address,
-                            status=DeviceStatus.UNKNOWN,
-                            error="касса не ответила",
-                        )
-                        for item in devices
-                    ],
-                ),
-            )
-            audit_service.record(
-                session,
-                action="device_check",
-                actor=admin.username,
-                entity="store",
-                entity_id=store.id,
-                details={**details, "agent_ok": False, "reason": "offline"},
-                ip_address=get_client_ip(request),
-            )
-            session.commit()
-            logger.warning("Магазин id=%s: «Проверить сейчас» — касса не ответила (%s)", store.id, exc.message)
-            return DeviceCheckResponse(
-                store_id=store.id,
-                checked_at=checked_at,
+    try:
+        async with AgentClient(
+            target,
+            timeout=_check_timeout_sec(specs, timeout_ms),
+            transport=context.agent_transport,
+        ) as client:
+            results = await client.check_devices_now(DeviceCheckRequest(devices=specs))
+    except AgentOfflineError as exc:
+        # Касса не ответила → «нет данных», а не «нет связи с камерой» (§4.11)
+        summary = _persist_device_batch(
+            context,
+            store_id=store_id,
+            batch=DeviceStatusBatch(
+                store_id=store_id,
                 agent_ok=False,
-                message=f"Касса не ответила: {exc.message}",
-                checked=len(specs),
-                updated=summary["updated"],
-                ignored=summary["ignored"],
-            )
-        except AgentAuthError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=(
-                    f"Агент отклонил запрос статусом {exc.status_code}: "
-                    "проверьте токен магазина и IP источника"
-                ),
-            ) from exc
-        except AgentProtocolError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.message
-            ) from exc
+                devices=[
+                    DeviceCheckResult(
+                        ip=ip,
+                        status=DeviceStatus.UNKNOWN,
+                        error="касса не ответила",
+                    )
+                    for ip in device_ips
+                ],
+            ),
+            admin_username=admin.username,
+            details={**details, "agent_ok": False, "reason": "offline"},
+            request=request,
+        )
+        logger.warning(
+            "Магазин id=%s: «Проверить сейчас» — касса не ответила (%s)",
+            store_id,
+            exc.message,
+        )
+        return DeviceCheckResponse(
+            store_id=store_id,
+            checked_at=checked_at,
+            agent_ok=False,
+            message=f"Касса не ответила: {exc.message}",
+            checked=len(specs),
+            updated=summary["updated"],
+            ignored=summary["ignored"],
+        )
+    except AgentAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Агент отклонил запрос статусом {exc.status_code}: "
+                "проверьте токен магазина и IP источника"
+            ),
+        ) from exc
+    except AgentProtocolError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.message) from exc
 
-        summary = device_service.apply_status_batch(
-            session, store, DeviceStatusBatch(store_id=store.id, devices=results)
-        )
-        audit_service.record(
-            session,
-            action="device_check",
-            actor=admin.username,
-            entity="store",
-            entity_id=store.id,
-            details={**details, "agent_ok": True, "updated": summary["updated"]},
-            ip_address=get_client_ip(request),
-        )
-        session.commit()
+    summary = _persist_device_batch(
+        context,
+        store_id=store_id,
+        batch=DeviceStatusBatch(store_id=store_id, devices=results),
+        admin_username=admin.username,
+        details={**details, "agent_ok": True},
+        request=request,
+    )
 
     online = sum(1 for item in results if str(item.status) == DeviceStatus.ONLINE.value)
     return DeviceCheckResponse(

@@ -82,6 +82,8 @@ deploy\run_server.bat
 | `MAGAZ_COOKIE_SECURE` | `false` | `true` при работе через HTTPS-туннель (§8.2) |
 | `MAGAZ_SERVE_SPA` | `true` | отдавать SPA из `frontend\dist` |
 | `MAGAZ_AGENT_SCHEME` | `http` | схема обращения к агентам внутри туннеля |
+| `MAGAZ_DB_POOL_SIZE`, `MAGAZ_DB_MAX_OVERFLOW` | `10`, `20` | пул соединений с БД: «живых» соединений и «перелив» под пик (Д-30) |
+| `MAGAZ_DB_POOL_TIMEOUT_SEC` | `15` | сколько ждать свободное соединение, прежде чем отдать `503` вместо зависания (Д-30) |
 
 Настройки мониторинга, операций, оборудования и уведомлений (интервалы, пороги,
 `notification_snooze_min`) меняются в дашборде на странице `/settings` (§4.9) —

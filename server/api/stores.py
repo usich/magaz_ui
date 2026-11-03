@@ -576,48 +576,57 @@ async def check_store_endpoint(
 ) -> StoreHealthOut:
     """Живой `GET /health` агента (Д-3): `busy`, сессии, пути, версии (П-1, Д-1).
 
-    Сессия БД открывается здесь же, в потоке цикла событий: запрос асинхронный
-    (httpx), а работа с SQLite короткая.
+    Д-30: карточка читается в короткой сессии, которая **закрывается до**
+    HTTP-запроса к кассе. Ожидание агента — это таймаут `health_timeout_sec`
+    (офлайн-касса ждёт его целиком), и держать всё это время соединение пула
+    нельзя: несколько таких проверок вычерпывали пул, после чего диспетчер и
+    админка получали `QueuePool limit ... reached`. Запись результата идёт
+    отдельной короткой сессией.
     """
     with context.db.session() as session:
         store = _get_or_404(session, store_id)
         target = build_agent_target(store, context.settings)
         timeout = float(settings_service.get_int(session, HEALTH_TIMEOUT_SETTING))
         window = _online_window(session)
+        # Версии, с которыми сравниваем ответ кассы, — из карточки до опроса
+        stored_credentials_version = store.credentials_version
+        stored_devices_version = store.devices_version
 
-        started = time.perf_counter()
-        try:
-            async with AgentClient(
-                target, timeout=timeout, transport=context.agent_transport
-            ) as client:
-                health = await client.get_health()
-        except AgentOfflineError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Магазин недоступен (офлайн): {exc.message}",
-            ) from exc
-        except AgentAuthError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=(
-                    f"Агент отклонил запрос статусом {exc.status_code}: "
-                    "проверьте токен магазина и IP источника"
-                ),
-            ) from exc
-        except AgentProtocolError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.message
-            ) from exc
+    started = time.perf_counter()
+    try:
+        async with AgentClient(
+            target, timeout=timeout, transport=context.agent_transport
+        ) as client:
+            health = await client.get_health()
+    except AgentOfflineError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Магазин недоступен (офлайн): {exc.message}",
+        ) from exc
+    except AgentAuthError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Агент отклонил запрос статусом {exc.status_code}: "
+                "проверьте токен магазина и IP источника"
+            ),
+        ) from exc
+    except AgentProtocolError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.message
+        ) from exc
 
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        checked_at = utcnow()
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    checked_at = utcnow()
+    credentials_push_required = health.credentials_version != stored_credentials_version
+    devices_push_required = health.devices_version != stored_devices_version
+    agent_version = health.agent_version
+    with context.db.session() as session:
+        store = _get_or_404(session, store_id)
         store.last_seen_at = checked_at
         store.agent_version = health.agent_version
         store.os_info = health.os
         session.flush()
-        credentials_push_required = health.credentials_version != store.credentials_version
-        devices_push_required = health.devices_version != store.devices_version
-        agent_version = health.agent_version
         session.commit()
 
     logger.info(

@@ -218,7 +218,6 @@ async def backup_check_endpoint(
     request: Request,
     admin: Annotated[AdminUser, Depends(require_active_admin)],
     context: Annotated[AppContext, Depends(get_context)],
-    session: Annotated[Session, Depends(get_db)],
 ) -> dict[str, int]:
     """Проверить вручную только те бэкапы, которые ещё не найдены (Д-21).
 
@@ -227,6 +226,10 @@ async def backup_check_endpoint(
     по 10+ сек на объект, поэтому выполняется в отдельном потоке через
     `asyncio.to_thread` (по образцу BackupMonitor) — иначе он занял бы поток
     threadpool FastAPI на минуты и затормозил бы остальную админку.
+
+    Д-30: сессия HTTP-запроса тоже не держится — соединение из пула берётся
+    только на короткую запись аудита. Раньше `Depends(get_db)` висел всё время
+    SMB-опроса, и пара таких проверок занимала соединения пула на минуты.
     """
 
     def _run_check_sync() -> int:
@@ -252,12 +255,14 @@ async def backup_check_endpoint(
 
     checked = await asyncio.to_thread(_run_check_sync)
 
-    audit_service.record(
-        session,
-        action="backup_check_manual",
-        actor=admin.username,
-        entity="backup",
-        details={"checked": checked},
-        ip_address=get_client_ip(request),
-    )
+    with context.db.session() as session:
+        audit_service.record(
+            session,
+            action="backup_check_manual",
+            actor=admin.username,
+            entity="backup",
+            details={"checked": checked},
+            ip_address=get_client_ip(request),
+        )
+        session.commit()
     return {"checked": checked}

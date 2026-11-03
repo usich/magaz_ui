@@ -4,6 +4,15 @@ SQLite требует двух вещей, без которых поведен�
 1. `PRAGMA foreign_keys=ON` — иначе `ON DELETE CASCADE` не работает и FK не
    проверяются (тесты на целостность §4 молча проходили бы);
 2. `check_same_thread=False` — FastAPI обслуживает запросы в пуле потоков.
+
+Д-30: размер пула задаётся явно. Один сервер обслуживает сразу несколько
+потребителей БД — фоновые циклы (диспетчер, мониторинг магазинов, проверка
+бэкапов, обновлятор), опросы открытых вкладок SPA (`/system/info`, `/jobs`,
+`/stores`, `/devices` каждые 10–15 с) и запросы агентов с касс. Умолчаний
+SQLAlchemy (`pool_size=5`, `max_overflow=10`, `pool_timeout=30`) не хватало:
+когда несколько запросов ждали блокировку SQLite, пул кончался, и вместо
+ошибки в лог уходил `QueuePool limit of size 5 overflow 10 reached`, а вместе с
+ним вставали диспетчер и админка.
 """
 
 from __future__ import annotations
@@ -20,6 +29,14 @@ from server.config import get_settings
 
 #: Сколько секунд SQLite ждёт освобождения блокировки файла БД (фоновые задачи + API)
 SQLITE_BUSY_TIMEOUT_SEC = 60
+
+#: Размер пула соединений (Д-30): «живых» соединений держим с запасом
+DEFAULT_POOL_SIZE = 10
+#: Сколько соединений разрешено взять сверх `pool_size` под пиковую нагрузку
+DEFAULT_MAX_OVERFLOW = 20
+#: Сколько ждать свободное соединение, прежде чем отдать `503` вместо 30-секундного
+#: зависания запроса и трассировки `QueuePool limit ... reached`
+DEFAULT_POOL_TIMEOUT_SEC = 15.0
 
 #: Сколько попыток записи с rollback делаем при «database is locked». WAL снимает
 #: конфликты читатель/писатель, но фоновый цикл диспетчера держит write-транзакцию
@@ -63,8 +80,20 @@ def ensure_sqlite_wal(engine: Engine) -> None:
         connection.exec_driver_sql("PRAGMA journal_mode=WAL")
 
 
-def create_db_engine(url: str, *, echo: bool = False) -> Engine:
-    """Создать engine с корректными настройками для SQLite/PostgreSQL."""
+def create_db_engine(
+    url: str,
+    *,
+    echo: bool = False,
+    pool_size: int | None = None,
+    max_overflow: int | None = None,
+    pool_timeout: float | None = None,
+) -> Engine:
+    """Создать engine с корректными настройками для SQLite/PostgreSQL.
+
+    `pool_size`/`max_overflow`/`pool_timeout` (Д-30) передаются, только если
+    заданы: у in-memory баз SQLAlchemy использует `StaticPool`/`SingletonThreadPool`,
+    которым параметры очереди не подходят, а тестам они и не нужны.
+    """
     connect_args: dict[str, Any] = {}
     if url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
@@ -73,16 +102,81 @@ def create_db_engine(url: str, *, echo: bool = False) -> Engine:
         # locked»: секунды ожидания дешевле потерянной задачи.
         connect_args["timeout"] = SQLITE_BUSY_TIMEOUT_SEC
 
+    pool_kwargs: dict[str, Any] = {}
+    if not is_in_memory_sqlite(url):
+        if pool_size is not None:
+            pool_kwargs["pool_size"] = pool_size
+        if max_overflow is not None:
+            pool_kwargs["max_overflow"] = max_overflow
+        if pool_timeout is not None:
+            # `QueuePool.timeout` ждёт float — принимает и int, и float
+            pool_kwargs["pool_timeout"] = pool_timeout
+
     engine = create_engine(
         url,
         echo=echo,
         future=True,
         pool_pre_ping=True,
         connect_args=connect_args,
+        **pool_kwargs,
     )
     if url.startswith("sqlite"):
         event.listen(engine, "connect", _enable_sqlite_foreign_keys)
     return engine
+
+
+def is_in_memory_sqlite(url: str) -> bool:
+    """БД живёт в памяти процесса (`sqlite://` или `sqlite:///:memory:`)."""
+    return url.startswith("sqlite") and (":memory:" in url or url.rstrip("/") == "sqlite:")
+
+
+def _read_pool_value(pool: Any, name: str, cast: Any) -> Any:  # noqa: ANN401
+    """Прочитать поле пула, которое может быть и методом, и атрибутом.
+
+    У `QueuePool` `size`/`checkedout` — методы, `timeout` — свойство, а
+    `_max_overflow` — обычный атрибут; у `StaticPool`/`NullPool` части из них нет
+    вовсе. Диагностика не должна падать из-за этого: не прочиталось — ключа
+    просто не будет.
+    """
+    try:
+        value = getattr(pool, name)
+        if callable(value):
+            value = value()
+        return cast(value)
+    except (AttributeError, NotImplementedError, TypeError, ValueError):
+        return None
+
+
+def pool_status(engine: Engine) -> dict[str, Any]:
+    """Занятость пула соединений — для `/system/info` (§11.1, Д-30).
+
+    Отдаём то, по чему видно приближение к исчерпанию: сколько соединений
+    занято сейчас, сколько всего можно взять (`size + max_overflow`) и сколько
+    ещё свободно. Сырое `pool.overflow()` намеренно не используется — у
+    `QueuePool` оно отрицательное, пока есть свободные слоты, и в диагностике
+    только путает.
+
+    Значения читаются «мягко»: у `StaticPool`/`NullPool` нет ни размера, ни
+    очереди, и диагностика не должна падать из-за этого.
+    """
+    pool = engine.pool
+    size = _read_pool_value(pool, "size", int)
+    checked_out = _read_pool_value(pool, "checkedout", int)
+    max_overflow = _read_pool_value(pool, "_max_overflow", int)
+    timeout = _read_pool_value(pool, "timeout", float)
+
+    status: dict[str, Any] = {"class": type(pool).__name__}
+    if size is not None:
+        status["size"] = size
+    if max_overflow is not None:
+        status["max_overflow"] = max_overflow
+    if checked_out is not None:
+        status["checked_out"] = checked_out
+    if size is not None and max_overflow is not None and checked_out is not None:
+        status["available"] = max(0, size + max_overflow - checked_out)
+    if timeout is not None:
+        status["timeout_sec"] = timeout
+    return status
 
 
 def commit_with_retry(session: Session) -> None:
@@ -133,9 +227,23 @@ class DatabaseManager:
     поэтому тесты могут поднимать несколько независимых БД в одном процессе.
     """
 
-    def __init__(self, url: str, *, echo: bool = False) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        echo: bool = False,
+        pool_size: int | None = DEFAULT_POOL_SIZE,
+        max_overflow: int | None = DEFAULT_MAX_OVERFLOW,
+        pool_timeout: float | None = DEFAULT_POOL_TIMEOUT_SEC,
+    ) -> None:
         self.url = url
-        self.engine = create_db_engine(url, echo=echo)
+        self.engine = create_db_engine(
+            url,
+            echo=echo,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
+        )
         self.sessionmaker = sessionmaker(
             bind=self.engine,
             autoflush=False,
@@ -148,6 +256,10 @@ class DatabaseManager:
         """Новая сессия (вызывающий закрывает её сам)."""
         return self.sessionmaker()
 
+    def pool_status(self) -> dict[str, Any]:
+        """Занятость пула соединений (Д-30, диагностика `/system/info`)."""
+        return pool_status(self.engine)
+
     def dispose(self) -> None:
         """Закрыть пул соединений."""
         self.engine.dispose()
@@ -157,7 +269,13 @@ class DatabaseManager:
 def get_engine() -> Engine:
     """Engine по настройкам приложения (без сайд-эффектов на импорте)."""
     settings = get_settings()
-    return create_db_engine(settings.database_url, echo=settings.sql_echo)
+    return create_db_engine(
+        settings.database_url,
+        echo=settings.sql_echo,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout_sec,
+    )
 
 
 @lru_cache(maxsize=1)

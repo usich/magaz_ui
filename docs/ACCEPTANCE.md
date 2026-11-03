@@ -219,6 +219,10 @@ python -m client.tray --ack <id>                             # «Ознаком�
 | Д-29 (циклы обновления): таблица `update_cycles` + `commands.cycle_id`/`batch_id`; цикл открывается первой операцией, «Начать новый цикл» закрывает прошлый (активные задачи переносятся), авто-закрытие по простою — только при `update_cycle_idle_min>0` | `tests/server/test_update_cycles.py` |
 | Д-29 (API): `GET /update-cycles/current`, `GET /update-cycles`, `POST /update-cycles/new`, `POST /update-cycles/{id}/close`; фильтры `cycle_id`/`batch_id` в `GET /jobs` | `tests/server/test_update_cycles.py` |
 | Д-29 (UI): статусы «Проверка/Merge/Update» и «Статус задачи» считаются только по текущему циклу, бейдж цикла и кнопка «Начать новый цикл», колонка «Цикл» в журнале | `frontend/tests/updates-view.spec.ts`, `frontend/tests/local-bases-view.spec.ts` |
+| Д-30 (пул соединений): `pool_status()` — размер, перелив, занятые и свободные соединения; умолчания `DatabaseManager` — 10/20/15 с; для in-memory SQLite параметры очереди не передаются (`SingletonThreadPool`), `NullPool` не роняет диагностику | `tests/server/test_db_pool.py` |
+| Д-30 (быстрый отказ): исчерпанный пул → `503` + `Retry-After: 5` с текстом «Сервер занят…», а не 500 с трассировкой; при свободном соединении запрос работает штатно; `get_db` берёт соединение до тела обработчика (проверено `checked_out == 1` внутри обработчика) | `tests/server/test_db_pool.py` |
+| Д-30 (диагностика): `GET /admin/system/info` отдаёт `database.pool` с текущими числами пула | `tests/server/test_db_pool.py` |
+| Д-30 (без соединения на время `await`): «Проверить сейчас» в момент опроса кассы держит `checked_out == 0` — сессия аутентификации (`get_current_admin`) и чтение карточки закрыты до сетевого вызова, запись результата тоже возвращает соединение | `tests/server/test_db_pool.py` |
 
 | Разметка уведомления: санитайз, метки `magaz-image:` без файла, лимиты картинок | `tests/shared/test_richtext.py`, `tests/server/test_notification_images.py`, `frontend/tests/notification-editor.spec.ts` |
 | Кэш картинок на кассе, справочник прочитанного, `delete_after_read` до кассы | `tests/client/test_agent_notifications.py` |

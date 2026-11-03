@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -286,7 +287,9 @@ def system_info_payload(session: Session, context: AppContext) -> dict[str, Any]
         "app_version": context.settings.app_version,
         "database": {
             "kind": "sqlite" if context.settings.is_sqlite else "other",
-            "schema_version": _alembic_revision(context),
+            "schema_version": _alembic_revision(context, session),
+            # Д-30: занятость пула — видно, когда запросы начинают ждать соединение
+            "pool": context.db.pool_status(),
         },
         "spa": {
             "dist_dir": str(dist_dir),
@@ -320,16 +323,47 @@ def system_info_payload(session: Session, context: AppContext) -> dict[str, Any]
     }
 
 
-def _alembic_revision(context: AppContext) -> str | None:
-    """Текущая ревизия Alembic (без импорта alembic в рантайм API при ошибке)."""
+#: Как долго помним ревизию Alembic (Д-30): она меняется только миграцией, а
+#: `/system/info` опрашивает каждая открытая вкладка SPA каждые 10 с
+_SCHEMA_VERSION_TTL_SEC = 60.0
+#: Кэш `URL БД -> (ревизия, момент чтения по monotonic)`. Ключ — URL, а не
+#: «одно значение на процесс»: в тестах и в диагностике из CLI в одном процессе
+#: живут разные БД, и ревизия одной не должна выдаваться за ревизию другой.
+_schema_version_cache: dict[str, tuple[str | None, float]] = {}
+#: Больше стольких БД в кэше не держим (в норме она одна)
+_SCHEMA_VERSION_CACHE_MAX = 8
+
+
+def _alembic_revision(context: AppContext, session: Session | None = None) -> str | None:
+    """Текущая ревизия Alembic (без импорта alembic в рантайм API при ошибке).
+
+    Д-30: ревизия читается из **соединения запроса** и кэшируется на минуту.
+    Раньше на каждый вызов открывалось отдельное `context.db.engine.connect()`,
+    то есть `/system/info`, опрашиваемый каждой открытой вкладкой, занимал в
+    пуле два соединения вместо одного — при перегрузке это ускоряло его
+    исчерпание. Отдельное соединение осталось только на случай вызова без
+    сессии (диагностика из CLI/тестов).
+    """
+    cache_key = context.settings.database_url
+    cached = _schema_version_cache.get(cache_key)
+    if cached is not None:
+        cached_revision, cached_at = cached
+        if time.monotonic() - cached_at < _SCHEMA_VERSION_TTL_SEC:
+            return cached_revision
     try:
-        from alembic.config import Config
         from alembic.runtime.migration import MigrationContext
 
-        with context.db.engine.connect() as connection:
-            return MigrationContext.configure(connection).get_current_revision()
+        if session is not None:
+            revision = MigrationContext.configure(session.connection()).get_current_revision()
+        else:
+            with context.db.engine.connect() as connection:
+                revision = MigrationContext.configure(connection).get_current_revision()
     except Exception:  # pragma: no cover - БД без Alembic (тесты на create_all)
         return None
+    if len(_schema_version_cache) >= _SCHEMA_VERSION_CACHE_MAX:
+        _schema_version_cache.clear()
+    _schema_version_cache[cache_key] = (revision, time.monotonic())
+    return revision
 
 
 @protected_router.get("/system/info", summary="Состояние сервера")
