@@ -197,6 +197,61 @@ class TestQueueForOfflineStores:
         assert report.failed == 1
 
 
+class TestCommandDeletedByAdmin:
+    """Э10, §11.6: «снять с очереди» — жёсткое удаление задачи в любом статусе.
+
+    Удалять разрешено и активную задачу, поэтому диспетчер может держать в своей
+    сессии объект, строки которого уже нет: очередной `UPDATE` не находит её, и
+    SQLAlchemy бросает `StaleDataError`. Раньше это исключение вылетало из
+    `_handle_error` мимо защитного `except` (тот охранял только `_send`/`_poll`)
+    и валило весь проход трейсбеком «Сбой цикла диспетчера»:
+
+        StaleDataError: UPDATE statement on table 'commands' expected to
+        update 1 row(s); 0 were matched
+    """
+
+    async def test_deleted_command_does_not_kill_cycle(
+        self, manager: DatabaseManager, settings: Settings, session: Session
+    ) -> None:
+        seed_settings(session)
+        store = make_store(session, online=False)
+        command = add_command(session, store, CommandKind.CHECK_FILES, {"filename": "update"})
+        command_id = command.id
+        store_id = store.id
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            """Админ удаляет задачу, пока диспетчер ждёт ответа офлайн-кассы."""
+            other = manager.session()
+            try:
+                command_service.delete_command(other, command_id)
+                other.commit()
+            finally:
+                other.close()
+            raise httpx.ConnectTimeout("агент не отвечает", request=request)
+
+        dispatcher = build_dispatcher(manager, settings, transport=transport_from_handler(handler))
+        report = await dispatcher.process_once()  # не должно бросить StaleDataError
+
+        assert report.deleted == 1, "исчезнувшая задача учтена в отчёте, а не «уронила» проход"
+        session.expunge_all()
+        session.rollback()
+        assert session.get(Command, command_id) is None, "задачу удалили — и она не «воскресла»"
+
+        # Сессия диспетчера не «залипла»: следующий тик обрабатывает очередь штатно
+        store = session.get(Store, store_id)
+        assert store is not None
+        store.last_seen_at = utcnow()
+        session.commit()
+        agent = ScriptedAgent()
+        next_command = add_command(session, store, CommandKind.CHECK_FILES, {"filename": "update"})
+
+        again = build_dispatcher(manager, settings, transport=agent.transport)
+        await again.process_once()
+
+        assert "/check-files" in agent.paths()
+        assert fresh(session, next_command.id).status == CommandStatus.SUCCESS
+
+
 class TestRetryWithBackoff:
     """§13.2: retry с backoff и лимит попыток (`command_retry_max`)."""
 

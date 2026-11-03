@@ -41,6 +41,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from sqlalchemy import select
+from sqlalchemy.orm.exc import StaleDataError
 
 from server.config import Settings
 from server.core.client_http import (
@@ -214,6 +215,8 @@ class DispatchReport:
     waiting: int = 0
     credentials_pushed: int = 0
     devices_pushed: int = 0
+    #: Задач удалили из админки прямо во время прохода («снять с очереди», Э10)
+    deleted: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -391,6 +394,27 @@ class CommandDispatcher:
             self._prune(seen)
             await self._sync_pushes(session, report)
             await asyncio.to_thread(commit_with_retry, session)
+        except StaleDataError as exc:
+            # Задачу удалили из админки прямо во время прохода: «снять с очереди»
+            # (Э10) — это жёсткое удаление строки, разрешённое в любом статусе
+            # (§11.6), в том числе пока диспетчер её ведёт. Диспетчер к этому
+            # моменту держит ORM-объект в своей сессии, и очередной `UPDATE` /
+            # каскад журнала не находит строку — SQLAlchemy бросает
+            # `StaleDataError: UPDATE statement on table 'commands' expected to
+            # update 1 row(s); 0 were matched`. Раньше он вылетал из
+            # `_handle_error` мимо защитного `except` (тот охранял только
+            # `_send`/`_poll`) и валил весь проход трейсбеком «Сбой цикла
+            # диспетчера», хотя удаление задачи — штатное действие админа.
+            # Откатываем транзакцию и прерываем проход: оставшиеся объекты в
+            # сессии истекли и могут указывать на уже удалённые строки, поэтому
+            # очередь перечитываем заново на следующем тике.
+            session.rollback()
+            report.deleted += 1
+            logger.info(
+                "Задача удалена из админки во время прохода — проход прерван, "
+                "продолжаем со следующего (%s)",
+                exc,
+            )
         finally:
             session.close()
 
