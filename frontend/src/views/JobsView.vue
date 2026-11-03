@@ -15,6 +15,8 @@ import Tag from 'primevue/tag'
 
 import ConfirmDeleteDialog from '@/components/ConfirmDeleteDialog.vue'
 import StatusTile from '@/components/StatusTile.vue'
+import { updateCyclesApi } from '@/api/endpoints'
+import type { UpdateCycle } from '@/api/types'
 import {
   JOB_KIND_LABELS,
   JOB_STATUS_LABELS,
@@ -51,10 +53,31 @@ const failed = computed(
   () => (jobs.counts.failed ?? 0) + (jobs.counts.error ?? 0) + (jobs.counts.timeout ?? 0),
 )
 
+/** Д-29: список циклов обновления для фильтра журнала. */
+const cycles = ref<UpdateCycle[]>([])
+
+async function loadCycles(): Promise<void> {
+  try {
+    const page = await updateCyclesApi.list(undefined, 20)
+    cycles.value = page.items
+  } catch {
+    // Журнал должен открываться и без истории циклов
+    cycles.value = []
+  }
+}
+
+/** Подпись цикла в списке: `№15 · магазины · 02.11.2026, 12:25`. */
+function cycleOptionLabel(cycle: UpdateCycle): string {
+  const scope = cycle.scope === 'local' ? 'локальные базы' : 'магазины'
+  const started = cycle.started_at ? new Date(cycle.started_at).toLocaleString('ru-RU') : '—'
+  return `№${cycle.id} · ${scope} · ${started}`
+}
+
 onMounted(async () => {
   if (!stores.items.length) {
     await stores.load()
   }
+  void loadCycles()
   jobs.startPolling()
 })
 
@@ -163,7 +186,7 @@ async function confirmDelete(): Promise<void> {
     </Message>
 
     <section class="rounded-xl border border-slate-200 bg-white p-5">
-      <div class="grid gap-3 md:grid-cols-4">
+      <div class="grid gap-3 md:grid-cols-5">
         <label class="space-y-1">
           <span class="magaz-muted text-xs">Магазин</span>
           <select
@@ -203,6 +226,20 @@ async function confirmDelete(): Promise<void> {
             <option value="">Любой статус</option>
             <option v-for="status in STATUS_OPTIONS" :key="status" :value="status">
               {{ statusLabel(status) }}
+            </option>
+          </select>
+        </label>
+        <label class="space-y-1">
+          <span class="magaz-muted text-xs">Цикл обновления</span>
+          <select
+            v-model.number="jobs.cycleId"
+            class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+            data-test="jobs-cycle-filter"
+            @change="jobs.load()"
+          >
+            <option :value="null">Все циклы</option>
+            <option v-for="cycle in cycles" :key="cycle.id" :value="cycle.id">
+              {{ cycleOptionLabel(cycle) }}
             </option>
           </select>
         </label>

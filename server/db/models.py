@@ -56,6 +56,7 @@ __all__ = [
     "Store",
     "StoreDevice",
     "TimestampMixin",
+    "UpdateCycle",
 ]
 
 
@@ -267,6 +268,55 @@ class AdminUser(TimestampMixin, Base):
         return f"<AdminUser id={self.id} username={self.username!r}>"
 
 
+class UpdateCycle(TimestampMixin, Base):
+    """Цикл обновления 1С (Д-29) — один проход «скачивание → проверка → слияние →
+    обновление БД» по парку магазинов или локальных баз.
+
+    Зачем: до Д-29 вкладка «Обновление 1С» показывала *последнюю задачу данного
+    вида за всю историю*, поэтому успешное слияние прошлой недели светилось
+    зелёным и после старта нового прохода, а старая ошибка — красным после
+    успешного повтора. Цикл даёт границу: статусы этапов считаются только по
+    задачам текущего цикла, остальное живёт в истории `/jobs`.
+
+    Границы задаёт человек (кнопка «Начать новый цикл»): проход может длиться
+    несколько дней (слияние в пятницу, обновление в понедельник), поэтому
+    авто-закрытие по простою выключено по умолчанию (`update_cycle_idle_min=0`).
+    `scope` разделяет магазины (`stores`) и локальные базы (`local`) — это разные
+    проходы, и «новый цикл» на одной вкладке не должен обнулять статусы другой.
+    """
+
+    __tablename__ = "update_cycles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    #: `stores` | `local` (§4.9, Д-29)
+    scope: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    started_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    #: Вид задачи, открывшей цикл (`check_files`, `run_merge_local`, …)
+    trigger_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    #: Свободная заметка (например «пакет update.cf от 02.11»)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    closed_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    #: `manual` (нажали «Начать новый цикл»/«Завершить») | `idle` (закрыт по простою)
+    closed_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    commands: Mapped[list["Command"]] = relationship(
+        back_populates="cycle",
+        passive_deletes=True,
+    )
+
+    @property
+    def is_open(self) -> bool:
+        """Цикл открыт: задачи, поставленные сейчас, попадут в него."""
+        return self.closed_at is None
+
+    def __repr__(self) -> str:  # pragma: no cover - отладка
+        return (
+            f"<UpdateCycle id={self.id} scope={self.scope!r} "
+            f"open={self.closed_at is None}>"
+        )
+
+
 class Command(TimestampMixin, Base):
     """Задача (история операций, §4.3, Q54).
 
@@ -286,6 +336,14 @@ class Command(TimestampMixin, Base):
     local_base_id: Mapped[int | None] = mapped_column(
         ForeignKey("local_bases.id", ondelete="CASCADE"), nullable=True, index=True
     )
+    #: Д-29: цикл обновления, в котором поставлена задача (`NULL` — до Д-29 либо
+    #: задача вне цикла: уведомления, сообщения, удаление файлов)
+    cycle_id: Mapped[int | None] = mapped_column(
+        ForeignKey("update_cycles.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    #: Д-29: «пачка запуска» — один запуск массовой операции на N магазинов/баз.
+    #: Позволяет отфильтровать ровно те задачи, что поставлены одним нажатием.
+    batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
@@ -299,6 +357,7 @@ class Command(TimestampMixin, Base):
 
     store: Mapped["Store"] = relationship()
     local_base: Mapped["LocalBase | None"] = relationship()
+    cycle: Mapped["UpdateCycle | None"] = relationship(back_populates="commands")
     logs: Mapped[list["JobLog"]] = relationship(
         back_populates="command",
         cascade="all, delete-orphan",

@@ -68,8 +68,39 @@ function apiMock(
   onBulkUpdate?: (body: unknown) => void,
   onCheckFiles?: (body: unknown) => void,
   onRunMerge?: (body: unknown) => void,
+  // Д-29: что лежит в текущем цикле (по умолчанию — задачи этапов из аргументов)
+  storesCycleJobs?: unknown[],
+  localCycleJobs?: unknown[],
 ) {
+  const storesCycle = {
+    id: 15, scope: 'stores', started_at: '2026-10-13T10:00:00Z', started_by: 'admin',
+    trigger_kind: 'check_files', note: null, closed_at: null, closed_by: null,
+    closed_reason: null, is_open: true,
+    stats: { total: 2, active: 1, success: 1, failed: 0, finished_stages: 1 },
+  }
+  const localCycle = {
+    ...storesCycle, id: 16, scope: 'local', trigger_kind: 'run_update_db_local',
+    stats: { total: 1, active: 0, success: 1, failed: 0, finished_stages: 1 },
+  }
+  const inCycle = (items: unknown[] | undefined, fallback: unknown[], cycleId: number) =>
+    (items ?? fallback).map((item) => ({ ...(item as Record<string, unknown>), cycle_id: cycleId }))
+
   return async (url: string, init: RequestInit = {}): Promise<Response> => {
+    if (url.includes('/admin/update-cycles/current')) {
+      const scope = url.includes('scope=local') ? 'local' : 'stores'
+      return jsonResponse({
+        scope,
+        cycle: scope === 'local' ? localCycle : storesCycle,
+        suggest_new: false,
+        idle_min: 0,
+      })
+    }
+    if (init.method === 'POST' && url.includes('/admin/update-cycles/new')) {
+      return jsonResponse(
+        { cycle: { ...storesCycle, id: 16 }, transferred: 0, message: 'Начат новый цикл №16' },
+        201,
+      )
+    }
     if (init.method === 'POST' && url.includes('/check-files')) {
       onCheckFiles?.(init.body)
       return jsonResponse(
@@ -118,6 +149,19 @@ function apiMock(
     if (url.includes('/admin/local-bases')) return jsonResponse(localBases)
     if (url.includes('/admin/files/matrix')) return jsonResponse({ rows, total: rows.length, present: 1, missing: 0 })
     if (url.includes('/admin/jobs')) {
+      // Д-29: задачи текущего цикла (по ним считаются статусы этапов)
+      if (url.includes('cycle_id=15')) {
+        return jsonResponse({
+          items: inCycle(storesCycleJobs, [...merge, ...upd], 15),
+          counts: {}, total: 0, active: 0,
+        })
+      }
+      if (url.includes('cycle_id=16')) {
+        return jsonResponse({
+          items: inCycle(localCycleJobs, [...localJobs, ...localMergeJobs], 16),
+          counts: {}, total: 0, active: 0,
+        })
+      }
       if (url.includes('kind=run_merge_local')) return jsonResponse({ items: localMergeJobs, counts: {}, total: 0, active: 0 })
       if (url.includes('kind=check_files_local')) return jsonResponse({ items: localCheckJobs, counts: {}, total: 0, active: 0 })
       if (url.includes('kind=run_update_db_local')) return jsonResponse({ items: localJobs, counts: {}, total: 0, active: 0 })
@@ -618,4 +662,90 @@ describe('страница «Обновление 1С»', () => {
     })
     wrapper.unmount()
   })
+
+  // --- Д-29: циклы обновления ------------------------------------------------
+
+  it('статусы этапов берутся только из текущего цикла (Д-29)', async () => {
+    // Слияние и обновление прошлого прохода есть в истории, но в текущем цикле
+    // их не было — в колонках должно быть «—», а не «успех» прошлой недели
+    fetchMock.mockImplementation(
+      apiMock(
+        [makeStore()],
+        [makeMatrixRow()],
+        [makeJob({ kind: 'run_merge', status: 'success', cycle_id: null })],
+        [makeJob({ id: 8, kind: 'run_update_db', status: 'success' })],
+        [],
+        [],
+        [],
+        [],
+        [],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        [], // в текущем цикле задач нет
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+
+    expect(wrapper.find('[data-test="updates-merge-1"]').text()).toBe('—')
+    expect(wrapper.find('[data-test="updates-update-1"]').text()).toBe('—')
+    // История «последнее обновление» при этом видна — это факт, а не статус этапа
+    expect(wrapper.find('[data-test="updates-store-1"]').text()).toContain('13.10.2026')
+    wrapper.unmount()
+  })
+
+  it('«Статус задачи» гаснет после успешного повтора (Д-29)', async () => {
+    // В цикле: сначала падение, потом повтор с успехом — красный текст не горит
+    fetchMock.mockImplementation(
+      apiMock(
+        [makeStore()],
+        [makeMatrixRow()],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        [
+          makeJob({
+            id: 30, kind: 'run_merge', status: 'failed', created_at: '2026-10-30T09:57:00Z',
+            last_error: '1С-операция на кассе не выполняется, а лог операции пуст',
+          }),
+          makeJob({
+            id: 31, kind: 'run_merge', status: 'success', created_at: '2026-10-30T12:34:00Z',
+          }),
+        ],
+      ),
+    )
+
+    const wrapper = await mountUpdates(fetchMock)
+
+    const row = wrapper.find('[data-test="updates-store-1"]')
+    expect(row.text()).not.toContain('1С-операция')
+    expect(wrapper.find('[data-test="updates-merge-1"]').text()).toBe('успех')
+    wrapper.unmount()
+  })
+
+  it('кнопка «Начать новый цикл» шлёт POST /update-cycles/new (Д-29)', async () => {
+    fetchMock.mockImplementation(apiMock([makeStore()], [makeMatrixRow()], [], [], []))
+
+    const wrapper = await mountUpdates(fetchMock)
+    expect(wrapper.find('[data-test="updates-cycle-badge"]').text()).toContain('Цикл №15')
+
+    await wrapper.find('[data-test="updates-cycle-new"]').trigger('click')
+    await flushPromises()
+
+    const call = fetchMock.mock.calls.find(([url]) => String(url).includes('/admin/update-cycles/new'))
+    expect(call).toBeTruthy()
+    expect(String(call?.[1]?.body)).toContain('"scope":"stores"')
+    wrapper.unmount()
+  })
+
 })

@@ -44,8 +44,26 @@ function apiMock(
   onBulkUpdate?: (body: unknown) => void,
   onCheckFiles?: (body: unknown) => void,
   onRunMerge?: (body: unknown) => void,
+  // Д-29: задачи текущего цикла локальных баз (по умолчанию — `localJobs`)
+  cycleJobs?: unknown[],
 ) {
+  const cycle = {
+    id: 16, scope: 'local', started_at: '2026-10-13T10:00:00Z', started_by: 'admin',
+    trigger_kind: 'run_update_db_local', note: null, closed_at: null, closed_by: null,
+    closed_reason: null, is_open: true,
+    stats: { total: 1, active: 0, success: 1, failed: 0, finished_stages: 1 },
+  }
   return async (url: string, init: RequestInit = {}): Promise<Response> => {
+    if (url.includes('/admin/update-cycles/current')) {
+      return jsonResponse({ scope: 'local', cycle, suggest_new: false, idle_min: 0 })
+    }
+    if (init.method === 'POST' && url.includes('/admin/update-cycles/new')) {
+      return jsonResponse({
+        cycle: { ...cycle, id: 17 },
+        transferred: 0,
+        message: 'Начат новый цикл №17',
+      })
+    }
     if (init.method === 'POST' && url.includes('/check-files')) {
       onCheckFiles?.(init.body)
       return jsonResponse({
@@ -73,6 +91,13 @@ function apiMock(
     }
     if (url.includes('/admin/local-bases')) return jsonResponse(localBases)
     if (url.includes('/admin/jobs')) {
+      // Д-29: статусы этапов берутся из задач текущего цикла
+      if (url.includes('cycle_id=16')) {
+        return jsonResponse({
+          items: (cycleJobs ?? localJobs).map((job) => ({ ...(job as Record<string, unknown>), cycle_id: 16 })),
+          counts: {}, total: 0, active: 0,
+        })
+      }
       if (url.includes('kind=run_update_db_local'))
         return jsonResponse({ items: localJobs, counts: {}, total: 0, active: 0 })
       return jsonResponse({ items: [], counts: {}, total: 0, active: 0 })

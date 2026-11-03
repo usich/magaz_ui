@@ -111,7 +111,7 @@ class TestSettingsApi:
 
         assert response.status_code == 200
         by_key = {item["key"]: item for item in body}
-        assert len(by_key) == 22, "все ключи §4.9 присутствуют (включая добавки Д-7/Д-21/Д-24/Д-25/Д-27/Д-28)"
+        assert len(by_key) == 23, "все ключи §4.9 присутствуют (включая добавки Д-7/Д-21/Д-24/Д-25/Д-27/Д-28/Д-29)"
         assert by_key["health_interval_sec"]["value"] == "15"
         assert by_key["health_interval_sec"]["default"] == "15"
         assert by_key["health_interval_sec"]["is_default"] is True
@@ -122,6 +122,8 @@ class TestSettingsApi:
         assert by_key["backup_end_hour"]["value"] == "15"  # Д-27
         assert by_key["local_update_dir"]["value"] == "", "Д-28: пусто — путь из конфигурации"
         assert by_key["local_update_dir"]["description"]
+        assert by_key["update_cycle_idle_min"]["value"] == "0", "Д-29: авто-закрытие выключено"
+        assert by_key["update_cycle_idle_min"]["description"]
 
     def test_local_update_dir_accepts_path_and_empty_value(
         self, auth_client: TestClient, admin  # noqa: ANN001, ARG002
@@ -232,7 +234,7 @@ class TestSystemInfo:
         assert body["counts"]["stores_inactive"] == 0
         assert body["counts"]["admins_total"] == 1
         assert body["counts"]["jobs_active"] == 0, "Э4: плитка «Задач в работе»"
-        assert body["settings_keys"] == 22  # §4.9, включая Д-7/Д-21/Д-24/Д-25/Д-27/Д-28
+        assert body["settings_keys"] == 23  # §4.9, включая Д-7/Д-21/Д-24/Д-25/Д-27/Д-28/Д-29
 
 
 class TestSystemCountersForDisabledStores:

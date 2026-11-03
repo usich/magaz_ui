@@ -386,6 +386,9 @@ export interface JobItem {
   store_name: string | null
   local_base_id: number | null
   local_base_name: string | null
+  // Д-29: цикл обновления и «пачка запуска» (`null` — задача вне цикла / до Д-29)
+  cycle_id: number | null
+  batch_id: string | null
   kind: string
   status: string
   params: Record<string, unknown> | null
@@ -440,8 +443,59 @@ export interface JobFilters {
   kind?: string
   status?: string
   activeOnly?: boolean
+  // Д-29: фильтры журнала по циклу обновления и «пачке запуска»
+  cycleId?: number | null
+  batchId?: string | null
   limit?: number
   offset?: number
+}
+
+/** Счётчики задач цикла обновления (Д-29). */
+export interface CycleStats {
+  total: number
+  active: number
+  success: number
+  failed: number
+  /** Сколько завершённых «этапов ИБ» (слияние/обновление) — для подсказки «начать новый» */
+  finished_stages: number
+}
+
+/** Цикл обновления 1С (Д-29): граница прохода. */
+export interface UpdateCycle {
+  id: number
+  scope: string
+  started_at: string | null
+  started_by: string | null
+  trigger_kind: string | null
+  note: string | null
+  closed_at: string | null
+  closed_by: string | null
+  closed_reason: string | null
+  is_open: boolean
+  stats: CycleStats
+}
+
+/** Ответ `GET /update-cycles/current` (Д-29). */
+export interface CurrentCycle {
+  scope: string
+  cycle: UpdateCycle | null
+  /** В цикле уже есть завершённые этапы — UI предлагает начать новый */
+  suggest_new: boolean
+  /** `update_cycle_idle_min` (0 — авто-закрытие выключено) */
+  idle_min: number
+}
+
+/** Ответ `GET /update-cycles` (Д-29). */
+export interface CycleList {
+  items: UpdateCycle[]
+  total: number
+}
+
+/** Ответ `POST /update-cycles/new` (Д-29). */
+export interface OpenCycleResult {
+  cycle: UpdateCycle
+  transferred: number
+  message: string
 }
 
 /** Строка матрицы файлов (§11.3): последний снимок проверки на магазин. */

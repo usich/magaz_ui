@@ -24,6 +24,8 @@ export const JOB_KIND_LABELS: Record<string, string> = {
   run_merge: 'Слияние конфигурации',
   run_update_db: 'Обновление БД',
   run_update_db_local: 'Обновление локальной базы',
+  check_files_local: 'Проверка файлов локальной базы',
+  run_merge_local: 'Слияние локальной базы',
   send_message: 'Сообщение пользователям',
   notify: 'Уведомление',
   notify_cancel: 'Отзыв уведомления',
@@ -64,6 +66,8 @@ export const useJobsStore = defineStore('jobs', () => {
   const kind = ref('')
   const status = ref('')
   const activeOnly = ref(false)
+  // Д-29: «показать задачи одного цикла обновления»
+  const cycleId = ref<number | null>(null)
 
   const detail = ref<JobDetail | null>(null)
   const isDetailLoading = ref(false)
@@ -77,6 +81,7 @@ export const useJobsStore = defineStore('jobs', () => {
     kind: kind.value,
     status: status.value,
     activeOnly: activeOnly.value,
+    cycleId: cycleId.value,
     limit: 100,
   }))
 
@@ -209,6 +214,7 @@ export const useJobsStore = defineStore('jobs', () => {
     kind,
     status,
     activeOnly,
+    cycleId,
     filters,
     detail,
     isDetailLoading,

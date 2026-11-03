@@ -35,12 +35,13 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from server.core.dependencies import get_client_ip, get_db, require_active_admin
-from server.db.models import AdminUser, Command, FileCheck, JobLog, Store
+from server.db.models import AdminUser, Command, FileCheck, JobLog, Store, UpdateCycle
 from server.services import (
     audit_service,
     command_service,
     notification_service,
     settings_service,
+    update_cycle_service,
 )
 from shared.enums import ActionKind, CommandKind, CommandStatus, TargetType
 from shared.paths import UPDATE_FILE_SUFFIXES, is_extension_operation, split_merge_file_name
@@ -123,6 +124,9 @@ class JobOut(BaseModel):
     store_name: str | None = None
     local_base_id: int | None = None
     local_base_name: str | None = None
+    #: Д-29: цикл обновления и «пачка запуска» (`None` — вне цикла / до Д-29)
+    cycle_id: int | None = None
+    batch_id: str | None = None
     kind: str
     status: str
     params: dict[str, Any] | None = None
@@ -145,6 +149,8 @@ class JobOut(BaseModel):
             store_name=getattr(command.store, "name", None),
             local_base_id=command.local_base_id,
             local_base_name=getattr(command.local_base, "name", None),
+            cycle_id=command.cycle_id,
+            batch_id=command.batch_id,
             kind=command.kind,
             status=command.status,
             params=command.params,
@@ -537,6 +543,8 @@ def _create_job(
     author: str,
     action_name: str,
     defer_log: bool = False,
+    cycle: UpdateCycle | None = None,
+    batch_id: str | None = None,
 ) -> Command:
     """Поставить задачу в очередь и объяснить это в её журнале (§4.3, §11.6).
 
@@ -544,9 +552,25 @@ def _create_job(
     отложен), а `job_logs.command_id` — NOT NULL. Пачка ставит все задачи,
     делает один flush (id появляются) и затем пишет журналы — иначе каждый
     INSERT ждал блокировки БД и запуск из UI «подвешивался».
+
+    Д-29: задачи обновления попадают в цикл. Массовая операция передаёт `cycle`
+    и `batch_id` (одна пачка — один `batch_id`), одиночная — только `batch_id`,
+    а цикл берётся открытый либо создаётся.
     """
+    scope = update_cycle_service.scope_for_kind(kind)
+    if scope is not None and cycle is None:
+        cycle = update_cycle_service.get_or_open(
+            session, scope, kind=kind, actor=author
+        )
     command = command_service.create_command(
-        session, store_id=store.id, kind=kind, params=params, created_by=author, flush=False
+        session,
+        store_id=store.id,
+        kind=kind,
+        params=params,
+        created_by=author,
+        flush=False,
+        cycle_id=cycle.id if cycle is not None else None,
+        batch_id=batch_id,
     )
     command.store = store
     if defer_log:
@@ -610,10 +634,20 @@ def _dispatch_bulk(
 
     Идёт внутри `command_service.dispatch_guard()`. Отключённый магазин даёт
     строку `skipped`: админ видит, что магазин пропущен, а не «ничего не вышло».
+
+    Д-29: на всю пачку — один `batch_id` и один цикл (`get_or_open` вызывается
+    один раз, а не на каждый магазин): 34 задачи одного нажатия потом можно
+    отфильтровать в журнале и повторить только упавшие.
     """
     results: list[BulkActionJobOut] = []
     warning: str | None = None
     created: list[tuple[Store, Command]] = []
+
+    batch_id = update_cycle_service.new_batch_id()
+    scope = update_cycle_service.scope_for_kind(kind)
+    cycle: UpdateCycle | None = None
+    if scope is not None:
+        cycle = update_cycle_service.get_or_open(session, scope, kind=kind, actor=author)
 
     for store in stores:
         if not store.is_active:
@@ -634,6 +668,8 @@ def _dispatch_bulk(
             author=author,
             action_name=action_name,
             defer_log=True,
+            cycle=cycle,
+            batch_id=batch_id,
         )
         created.append((store, command))
 
@@ -718,6 +754,7 @@ def store_action(  # noqa: PLR0913 - параметры HTTP-точки
             params=params,
             author=admin.username,
             action_name=payload.action,
+            batch_id=update_cycle_service.new_batch_id(),
         )
 
     warning: str | None = None
@@ -861,10 +898,16 @@ def list_jobs(  # noqa: PLR0913 - параметры HTTP-точки
     kind: Annotated[str | None, Query(max_length=32)] = None,
     job_status: Annotated[str | None, Query(alias="status", max_length=32)] = None,
     active_only: Annotated[bool, Query()] = False,
+    cycle_id: Annotated[int | None, Query(ge=1)] = None,
+    batch_id: Annotated[str | None, Query(max_length=36)] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> JobsPageOut:
-    """Список задач с фильтрами: магазин, локальная база, тип, статус, «только в работе» (§11.6)."""
+    """Список задач с фильтрами: магазин, локальная база, тип, статус, «только в работе» (§11.6).
+
+    Д-29: `cycle_id` и `batch_id` фильтруют журнал по циклу обновления и по
+    «пачке запуска» — так админ видит, что именно входило в проход.
+    """
     commands = command_service.list_commands(
         session,
         store_id=store_id,
@@ -872,6 +915,8 @@ def list_jobs(  # noqa: PLR0913 - параметры HTTP-точки
         kind=(kind or "").strip() or None,
         status=(job_status or "").strip() or None,
         active_only=active_only,
+        cycle_id=cycle_id,
+        batch_id=(batch_id or "").strip() or None,
         limit=limit,
         offset=offset,
     )

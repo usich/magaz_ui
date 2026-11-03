@@ -20,7 +20,13 @@ from sqlalchemy.orm import Session
 from server.core.context import AppContext
 from server.core.dependencies import get_client_ip, get_context, get_db, require_active_admin
 from server.db.models import AdminUser, Command, LocalBase
-from server.services import audit_service, backup_service, local_base_service, command_service
+from server.services import (
+    audit_service,
+    backup_service,
+    command_service,
+    local_base_service,
+    update_cycle_service,
+)
 from shared.enums import CommandKind, CommandStatus
 from shared.timeutil import to_iso_z
 
@@ -489,6 +495,13 @@ def run_update_local_base(
             kind=CommandKind.RUN_UPDATE_DB_LOCAL,
             params=params,
             created_by=admin.username,
+            cycle_id=update_cycle_service.get_or_open(
+                session,
+                update_cycle_service.SCOPE_LOCAL,
+                kind=CommandKind.RUN_UPDATE_DB_LOCAL,
+                actor=admin.username,
+            ).id,
+            batch_id=update_cycle_service.new_batch_id(),
         )
         session.commit()
 
@@ -616,7 +629,11 @@ def bulk_update_local_bases(
     kind = _validate_bulk_kind(payload.kind)
 
     results: list[LocalBulkUpdateJobOut] = []
+    batch_id = update_cycle_service.new_batch_id()
     with command_service.dispatch_guard():
+        cycle = update_cycle_service.get_or_open(
+            session, update_cycle_service.SCOPE_LOCAL, kind=kind, actor=admin.username
+        )
         for base_id in ids:
             row = session.get(LocalBase, base_id)
             if row is None:
@@ -650,6 +667,8 @@ def bulk_update_local_bases(
                 kind=kind,
                 params=params,
                 created_by=admin.username,
+                cycle_id=cycle.id,
+                batch_id=batch_id,
             )
             results.append(
                 LocalBulkUpdateJobOut(
@@ -740,12 +759,18 @@ def _run_local_operation(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=_local_conflict_detail(row, busy),
                 )
+        # Д-29: задача попадает в цикл локальных баз (или открывает его)
+        cycle = update_cycle_service.get_or_open(
+            session, update_cycle_service.SCOPE_LOCAL, kind=kind, actor=admin.username
+        )
         job = command_service.create_local_command(
             session,
             local_base_id=row.id,
             kind=kind,
             params=params,
             created_by=admin.username,
+            cycle_id=cycle.id,
+            batch_id=update_cycle_service.new_batch_id(),
         )
         session.commit()
     return job

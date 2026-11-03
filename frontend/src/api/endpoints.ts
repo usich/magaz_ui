@@ -60,6 +60,9 @@ import type {
   StoreUpdatePayload,
   SystemInfo,
   TokenRotateResult,
+  CurrentCycle,
+  CycleList,
+  OpenCycleResult,
 } from './types'
 
 export const authApi = {
@@ -198,6 +201,8 @@ export const jobsApi = {
     if (filters.kind) query.set('kind', filters.kind)
     if (filters.status) query.set('status', filters.status)
     if (filters.activeOnly) query.set('active_only', 'true')
+    if (filters.cycleId) query.set('cycle_id', String(filters.cycleId))
+    if (filters.batchId) query.set('batch_id', filters.batchId)
     if (filters.limit !== undefined) query.set('limit', String(filters.limit))
     if (filters.offset !== undefined) query.set('offset', String(filters.offset))
     const suffix = query.toString() ? `?${query}` : ''
@@ -216,6 +221,31 @@ export const jobsApi = {
   /** Прервать незавершённую задачу (`POST /jobs/{id}/cancel`, Д-22): статус `canceled`. */
   cancel: (id: number) =>
     api.post<{ job_id: number; status: string; message: string }>(`/admin/jobs/${id}/cancel`),
+}
+
+/** Циклы обновления 1С (Д-29): границы прохода «скачивание → … → обновление БД». */
+export const updateCyclesApi = {
+  /** Текущий (открытый) цикл области `stores` | `local`. */
+  current: (scope: 'stores' | 'local' = 'stores') =>
+    api.get<CurrentCycle>(`/admin/update-cycles/current?scope=${scope}`),
+
+  /** История циклов (новые первыми) — для фильтра журнала по циклу. */
+  list: (scope?: 'stores' | 'local', limit = 30) => {
+    const query = new URLSearchParams()
+    if (scope) query.set('scope', scope)
+    query.set('limit', String(limit))
+    return api.get<CycleList>(`/admin/update-cycles?${query}`)
+  },
+
+  /** Начать новый цикл: закрывает предыдущий, активные задачи переносятся. */
+  openNew: (payload: { scope: 'stores' | 'local'; note?: string; transfer_active?: boolean }) =>
+    api.post<OpenCycleResult>('/admin/update-cycles/new', payload),
+
+  /** Завершить цикл, не открывая новый. */
+  close: (cycleId: number) =>
+    api.post<{ cycle: unknown; active_left: number; message: string }>(
+      `/admin/update-cycles/${cycleId}/close`,
+    ),
 }
 
 /** Матрица файлов обновления (§11.3, Q52). */

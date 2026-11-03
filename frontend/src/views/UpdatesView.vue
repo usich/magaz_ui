@@ -7,8 +7,9 @@ import Checkbox from 'primevue/checkbox'
 import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
-import { jobsApi } from '@/api/endpoints'
-import type { JobItem, LocalBaseItem } from '@/api/types'
+import { ApiError } from '@/api/client'
+import { jobsApi, updateCyclesApi } from '@/api/endpoints'
+import type { CurrentCycle, JobItem, LocalBaseItem } from '@/api/types'
 import StoreOperationStrip from '@/components/StoreOperationStrip.vue'
 import StatusTile from '@/components/StatusTile.vue'
 import LocalBaseFormDialog from '@/components/LocalBaseFormDialog.vue'
@@ -59,39 +60,78 @@ function toggleAll(): void {
   selected.value = allSelected.value ? [] : stores.items.map((item) => item.id)
 }
 
-// Задачи этапов
-const mergeJobs = ref<JobItem[]>([])
-const updateJobs = ref<JobItem[]>([])
-const checkJobs = ref<JobItem[]>([])
+// Задачи этапов (Д-29): статусы считаются только по задачам **текущего цикла**,
+// поэтому успех прошлой недели не светится после старта нового прохода, а старая
+// ошибка не висит красным после успешного повтора.
+const cycleInfo = ref<CurrentCycle | null>(null)
+const localCycleInfo = ref<CurrentCycle | null>(null)
+//: Задачи текущего цикла магазинов (все виды: проверка/скачивание/слияние/обновление)
+const cycleJobs = ref<JobItem[]>([])
+//: Задачи текущего цикла локальных баз
+const localCycleJobs = ref<JobItem[]>([])
+//: История `run_update_db` за всё время — только для колонки «Последнее обновление»
+const updateHistory = ref<JobItem[]>([])
+const localUpdateHistory = ref<JobItem[]>([])
 const recentJobs = ref<JobItem[]>([])
-// Д-24/Д-26: операции локальных баз по видам (обновление / слияние).
-// Проверку файлов построчно не показываем (Д-28): операции по локальным базам
-// запускаются только пачкой из панели массовых операций.
-const localJobs = ref<JobItem[]>([])
-const localMergeJobs = ref<JobItem[]>([])
 const jobsLoading = ref(false)
-// Журнал операций по магазинам: по умолчанию свернут, разворачивается кнопкой.
+//: Журнал операций: по умолчанию свернут, разворачивается кнопкой.
 const logExpanded = ref(false)
+//: Д-29: показывать в журнале только задачи текущего цикла
+const journalCycleOnly = ref(false)
+const isCycleStarting = ref(false)
 
 async function loadJobs(): Promise<void> {
   jobsLoading.value = true
   try {
-    const [merge, update, checkFiles, recent, local, localMerge] = await Promise.all([
-      jobsApi.list({ kind: 'run_merge', limit: 200 }),
-      jobsApi.list({ kind: 'run_update_db', limit: 200 }),
-      jobsApi.list({ kind: 'check_files', limit: 200 }),
-      jobsApi.list({ kind: '', limit: 40 }),
-      jobsApi.list({ kind: 'run_update_db_local', limit: 200 }),
-      jobsApi.list({ kind: 'run_merge_local', limit: 200 }),
+    const [storesCycle, localCycle] = await Promise.all([
+      updateCyclesApi.current('stores'),
+      updateCyclesApi.current('local'),
     ])
-    mergeJobs.value = merge.items
-    updateJobs.value = update.items
-    checkJobs.value = checkFiles.items
-    recentJobs.value = recent.items
-    localJobs.value = local.items
-    localMergeJobs.value = localMerge.items
+    cycleInfo.value = storesCycle
+    localCycleInfo.value = localCycle
+    const storesCycleId = storesCycle.cycle?.id ?? null
+    const localCycleId = localCycle.cycle?.id ?? null
+
+    const [storesJobs, localJobsPage, updatePage, localUpdatePage, recentPage] =
+      await Promise.all([
+        storesCycleId ? jobsApi.list({ cycleId: storesCycleId, limit: 500 }) : null,
+        localCycleId ? jobsApi.list({ cycleId: localCycleId, limit: 500 }) : null,
+        jobsApi.list({ kind: 'run_update_db', limit: 200 }),
+        jobsApi.list({ kind: 'run_update_db_local', limit: 200 }),
+        jobsApi.list({
+          kind: '',
+          limit: 40,
+          cycleId: journalCycleOnly.value ? storesCycleId : null,
+        }),
+      ])
+    cycleJobs.value = storesJobs?.items ?? []
+    localCycleJobs.value = localJobsPage?.items ?? []
+    updateHistory.value = updatePage.items
+    localUpdateHistory.value = localUpdatePage.items
+    recentJobs.value = recentPage.items
   } finally {
     jobsLoading.value = false
+  }
+}
+
+/** Начать новый цикл обновления (Д-29): статусы прошлого прохода очищаются. */
+async function startNewCycle(scope: 'stores' | 'local'): Promise<void> {
+  isCycleStarting.value = true
+  try {
+    const result = await updateCyclesApi.openNew({ scope, transfer_active: true })
+    toast.add({
+      severity: 'success',
+      summary: 'Начат новый цикл',
+      detail: result.message,
+      life: 5000,
+    })
+    await loadJobs()
+  } catch (error) {
+    const message =
+      error instanceof ApiError ? error.message : 'Не удалось начать новый цикл'
+    toast.add({ severity: 'error', summary: 'Новый цикл не начат', detail: message, life: 6000 })
+  } finally {
+    isCycleStarting.value = false
   }
 }
 
@@ -162,23 +202,45 @@ function toggleLocalGroup(group: string): void {
 }
 
 
-function lastFor(jobs: JobItem[], storeId: number): JobItem | null {
+/** Статусы «в работе» (§4.3): задача ещё не завершена. */
+const ACTIVE_JOB_STATUSES = ['queued', 'sent', 'running']
+/** Статусы провала: именно они дают красный текст в колонке «Статус задачи». */
+const FAILED_JOB_STATUSES = ['failed', 'timeout', 'error']
+
+/** Самая свежая задача из списка (по `created_at`, при равенстве — по `id`). */
+function latestJob(jobs: JobItem[]): JobItem | null {
   let best: JobItem | null = null
   for (const job of jobs) {
-    if (job.store_id !== storeId) continue
-    if (best === null || (job.created_at ?? '') > (best.created_at ?? '')) best = job
+    if (best === null) {
+      best = job
+      continue
+    }
+    const newer =
+      (job.created_at ?? '') > (best.created_at ?? '') ||
+      ((job.created_at ?? '') === (best.created_at ?? '') && job.id > best.id)
+    if (newer) best = job
   }
   return best
 }
 
-/** Последняя задача обновления по локальной базе (Д-24). */
-function lastLocalFor(jobs: JobItem[], localBaseId: number): JobItem | null {
-  let best: JobItem | null = null
-  for (const job of jobs) {
-    if (job.local_base_id !== localBaseId) continue
-    if (best === null || (job.created_at ?? '') > (best.created_at ?? '')) best = job
-  }
-  return best
+/**
+ * Задача этапа магазина **в текущем цикле** (Д-29).
+ *
+ * Раньше здесь бралась последняя задача данного вида за всю историю — из-за
+ * этого успешное слияние прошлого прохода светилось зелёным и после старта
+ * нового, а старая ошибка висела красным после успешного повтора.
+ */
+function stageOf(storeId: number, kind: string): JobItem | null {
+  return latestJob(
+    cycleJobs.value.filter((job) => job.store_id === storeId && job.kind === kind),
+  )
+}
+
+/** Задача этапа локальной базы в текущем цикле (Д-29). */
+function localStageOf(baseId: number, kind: string): JobItem | null {
+  return latestJob(
+    localCycleJobs.value.filter((job) => job.local_base_id === baseId && job.kind === kind),
+  )
 }
 
 function stageStatus(job: JobItem | null): { label: string; severity: string } {
@@ -186,17 +248,30 @@ function stageStatus(job: JobItem | null): { label: string; severity: string } {
   return { label: JOB_STATUS_LABELS[job.status] ?? job.status, severity: jobStatusSeverity(job.status) }
 }
 
-function lastOkAt(job: JobItem | null): string {
-  if (!job || job.status !== 'success') return '—'
-  return formatTime(job.finished_at)
+/** Последнее успешное обновление БД магазина за всё время (факт, а не статус этапа). */
+function lastUpdateOkAt(storeId: number): string {
+  const job = latestJob(
+    updateHistory.value.filter((item) => item.store_id === storeId && item.status === 'success'),
+  )
+  return job ? formatTime(job.finished_at) : '—'
+}
+
+/** Последнее успешное обновление локальной базы за всё время (Д-24). */
+function lastLocalUpdateOkAt(baseId: number): string {
+  const job = latestJob(
+    localUpdateHistory.value.filter(
+      (item) => item.local_base_id === baseId && item.status === 'success',
+    ),
+  )
+  return job ? formatTime(job.finished_at) : '—'
 }
 
 const counts = computed(() => {
   const active = stores.items.filter((item) => item.is_active)
   const online = active.filter((item) => item.is_online)
   const ready = files.rows.filter((row) => row.cf_exists || row.cfe_exists).length
-  const activeJobs = [...mergeJobs.value, ...updateJobs.value, ...checkJobs.value].filter((job) =>
-    ['queued', 'sent', 'running'].includes(job.status),
+  const activeJobs = [...cycleJobs.value, ...localCycleJobs.value].filter((job) =>
+    ACTIVE_JOB_STATUSES.includes(job.status),
   )
   return { active: active.length, online: online.length, offline: active.length - online.length, ready, activeJobs: activeJobs.length }
 })
@@ -206,22 +281,67 @@ function formatTime(value: string | null): string {
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('ru-RU')
 }
+
+/**
+ * Текст ошибки в колонке «Статус задачи» (Д-29).
+ *
+ * Показываем ошибку только если **последняя** задача магазина в текущем цикле
+ * провалилась: после успешного повтора (пусть и новой задачей) красный текст
+ * гаснет. Раньше здесь искалась любая `failed`-задача из 200 последних.
+ */
 function storeError(storeId: number): string {
-  const failed = [...mergeJobs.value, ...updateJobs.value].find(
-    (j) => j.store_id === storeId && j.status === 'failed',
-  )
-  return failed?.last_error ?? ''
+  const last = latestJob(cycleJobs.value.filter((job) => job.store_id === storeId))
+  if (!last || !FAILED_JOB_STATUSES.includes(last.status)) return ''
+  return last.last_error ?? 'Задача не выполнена'
 }
+
+/** Что сейчас выполняется по магазину в текущем цикле. */
 function storeActivity(storeId: number): string {
   const parts: string[] = []
-  const merge = lastFor(mergeJobs.value, storeId)
-  const update = lastFor(updateJobs.value, storeId)
-  const check = lastFor(checkJobs.value, storeId)
-  if (merge && merge.status === 'running') parts.push('merge выполняется')
-  if (update && update.status === 'running') parts.push('update выполняется')
-  const checkActive = check && ['queued', 'sent', 'running'].includes(check.status)
-  if (checkActive) parts.push('проверка файлов выполняется')
-  return parts.join(' · ') || '—'
+  for (const job of cycleJobs.value) {
+    if (job.store_id !== storeId) continue
+    if (!ACTIVE_JOB_STATUSES.includes(job.status)) continue
+    const kind = JOB_KIND_LABELS[job.kind] ?? job.kind
+    const status = JOB_STATUS_LABELS[job.status] ?? job.status
+    parts.push(`${kind}: ${status}`)
+  }
+  return Array.from(new Set(parts)).join(' · ') || '—'
+}
+
+/** Подпись бейджа текущего цикла магазинов (Д-29). */
+const cycleLabel = computed(() => {
+  const cycle = cycleInfo.value?.cycle
+  if (!cycle) return 'Цикл ещё не начат'
+  const parts = [`Цикл №${cycle.id}`, `открыт ${formatTime(cycle.started_at)}`]
+  parts.push(`задач: ${cycle.stats.total}`)
+  if (cycle.stats.active) parts.push(`в работе: ${cycle.stats.active}`)
+  return parts.join(' · ')
+})
+
+/** Тон бейджа: жёлтый — в цикле уже есть завершённые этапы (пора начинать новый). */
+const cycleTone = computed(() => {
+  if (!cycleInfo.value?.cycle) return 'secondary'
+  return cycleInfo.value.suggest_new ? 'warn' : 'info'
+})
+
+/** То же для вкладки локальных баз. */
+const localCycleLabel = computed(() => {
+  const cycle = localCycleInfo.value?.cycle
+  if (!cycle) return 'Цикл ещё не начат'
+  const parts = [`Цикл №${cycle.id}`, `открыт ${formatTime(cycle.started_at)}`]
+  parts.push(`задач: ${cycle.stats.total}`)
+  if (cycle.stats.active) parts.push(`в работе: ${cycle.stats.active}`)
+  return parts.join(' · ')
+})
+const localCycleTone = computed(() => {
+  if (!localCycleInfo.value?.cycle) return 'secondary'
+  return localCycleInfo.value.suggest_new ? 'warn' : 'info'
+})
+
+/** Переключить режим журнала «только текущий цикл» и перечитать его. */
+function toggleJournalCycle(): void {
+  journalCycleOnly.value = !journalCycleOnly.value
+  void loadJobs()
 }
 
 let timer: ReturnType<typeof setInterval> | null = null
@@ -277,14 +397,36 @@ onUnmounted(() => {
       <section class="rounded-xl border border-slate-200 bg-white p-5">
         <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
           <h2 class="font-semibold">Магазины и статусы обновления</h2>
-          <Button
-            label="Выбрать все"
-            severity="secondary"
-            size="small"
-            outlined
-            :data-test="`updates-select-all-${allSelected ? 'on' : 'off'}`"
-            @click="toggleAll"
-          />
+          <div class="flex flex-wrap items-center gap-2">
+            <!-- Д-29: статусы этапов считаются только по текущему циклу -->
+            <Tag
+              :value="cycleLabel"
+              :severity="cycleTone"
+              :title="
+                cycleInfo?.suggest_new
+                  ? 'В цикле уже есть завершённые этапы — вероятно, пора начать новый'
+                  : 'Статусы этапов относятся к этому циклу'
+              "
+              data-test="updates-cycle-badge"
+            />
+            <Button
+              label="Начать новый цикл"
+              size="small"
+              severity="secondary"
+              outlined
+              :loading="isCycleStarting"
+              data-test="updates-cycle-new"
+              @click="startNewCycle('stores')"
+            />
+            <Button
+              label="Выбрать все"
+              severity="secondary"
+              size="small"
+              outlined
+              :data-test="`updates-select-all-${allSelected ? 'on' : 'off'}`"
+              @click="toggleAll"
+            />
+          </div>
         </div>
 
         <div class="overflow-x-auto">
@@ -338,25 +480,27 @@ onUnmounted(() => {
                 </td>
                 <td class="py-2 pr-3 whitespace-nowrap">
                   <Tag
-                    :value="stageStatus(lastFor(checkJobs, store.id)).label"
-                    :severity="stageStatus(lastFor(checkJobs, store.id)).severity"
+                    :value="stageStatus(stageOf(store.id, 'check_files')).label"
+                    :severity="stageStatus(stageOf(store.id, 'check_files')).severity"
                     :data-test="`updates-check-${store.id}`"
                   />
                 </td>
                 <td class="py-2 pr-3 whitespace-nowrap">
                   <Tag
-                    :value="stageStatus(lastFor(mergeJobs, store.id)).label"
-                    :severity="stageStatus(lastFor(mergeJobs, store.id)).severity"
+                    :value="stageStatus(stageOf(store.id, 'run_merge')).label"
+                    :severity="stageStatus(stageOf(store.id, 'run_merge')).severity"
+                    :data-test="`updates-merge-${store.id}`"
                   />
                 </td>
                 <td class="py-2 pr-3 whitespace-nowrap">
                   <Tag
-                    :value="stageStatus(lastFor(updateJobs, store.id)).label"
-                    :severity="stageStatus(lastFor(updateJobs, store.id)).severity"
+                    :value="stageStatus(stageOf(store.id, 'run_update_db')).label"
+                    :severity="stageStatus(stageOf(store.id, 'run_update_db')).severity"
+                    :data-test="`updates-update-${store.id}`"
                   />
                 </td>
                 <td class="py-2 pr-3 whitespace-nowrap magaz-muted">
-                  {{ lastOkAt(lastFor(updateJobs, store.id)) }}
+                  {{ lastUpdateOkAt(store.id) }}
                 </td>
                 <td class="py-2 pr-3">
                   <div v-if="storeError(store.id)" class="text-rose-600 text-xs">{{ storeError(store.id) }}</div>
@@ -382,12 +526,22 @@ onUnmounted(() => {
             <i class="pi" :class="logExpanded ? 'pi-chevron-up' : 'pi-chevron-down'"></i>
           </span>
         </button>
+        <label v-if="logExpanded" class="mt-3 flex items-center gap-2 text-sm">
+          <Checkbox
+            :model-value="journalCycleOnly"
+            binary
+            data-test="updates-log-cycle-only"
+            @update:model-value="toggleJournalCycle"
+          />
+          <span>Только текущий цикл</span>
+        </label>
         <div v-if="logExpanded" class="overflow-x-auto">
           <table class="w-full text-sm">
             <thead>
               <tr class="magaz-muted border-b border-slate-200 text-left text-xs">
                 <th class="py-2 pr-3 font-medium">Магазин</th>
                 <th class="py-2 pr-3 font-medium">Операция</th>
+                <th class="py-2 pr-3 font-medium">Цикл</th>
                 <th class="py-2 pr-3 font-medium">Статус</th>
                 <th class="py-2 pr-3 font-medium">Начато</th>
                 <th class="py-2 pr-3 font-medium">Завершено</th>
@@ -398,6 +552,9 @@ onUnmounted(() => {
               <tr v-for="job in recentJobs" :key="job.id" class="border-b border-slate-100">
                 <td class="py-2 pr-3">{{ job.store_name }}</td>
                 <td class="py-2 pr-3">{{ JOB_KIND_LABELS[job.kind] ?? job.kind }}</td>
+                <td class="py-2 pr-3 magaz-muted whitespace-nowrap">
+                  {{ job.cycle_id ? `№${job.cycle_id}` : '—' }}
+                </td>
                 <td class="py-2 pr-3">
                   <Tag :value="JOB_STATUS_LABELS[job.status] ?? job.status" :severity="jobStatusSeverity(job.status)" />
                 </td>
@@ -410,7 +567,7 @@ onUnmounted(() => {
                 </td>
               </tr>
               <tr v-if="!recentJobs.length && !jobsLoading">
-                <td colspan="6" class="magaz-muted py-6 text-center">Операций ещё не было.</td>
+                <td colspan="7" class="magaz-muted py-6 text-center">Операций ещё не было.</td>
               </tr>
             </tbody>
           </table>
@@ -431,6 +588,26 @@ onUnmounted(() => {
         <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
           <h2 class="font-semibold">Локальные базы и статусы обновления</h2>
           <div class="flex flex-wrap gap-2">
+            <!-- Д-29: свой цикл для локальных баз — «новый цикл» магазинов его не трогает -->
+            <Tag
+              :value="localCycleLabel"
+              :severity="localCycleTone"
+              :title="
+                localCycleInfo?.suggest_new
+                  ? 'В цикле уже есть завершённые этапы — вероятно, пора начать новый'
+                  : 'Статусы этапов относятся к этому циклу'
+              "
+              data-test="updates-local-cycle-badge"
+            />
+            <Button
+              label="Начать новый цикл"
+              size="small"
+              severity="secondary"
+              outlined
+              :loading="isCycleStarting"
+              data-test="updates-local-cycle-new"
+              @click="startNewCycle('local')"
+            />
             <Button
               label="Выбрать все"
               severity="secondary"
@@ -536,20 +713,20 @@ onUnmounted(() => {
                     </td>
                     <td class="py-2 pr-3 whitespace-nowrap">
                       <Tag
-                        :value="stageStatus(lastLocalFor(localMergeJobs, base.id)).label"
-                        :severity="stageStatus(lastLocalFor(localMergeJobs, base.id)).severity"
+                        :value="stageStatus(localStageOf(base.id, 'run_merge_local')).label"
+                        :severity="stageStatus(localStageOf(base.id, 'run_merge_local')).severity"
                         :data-test="`lb-merge-status-${base.id}`"
                       />
                     </td>
                     <td class="py-2 pr-3 whitespace-nowrap">
                       <Tag
-                        :value="stageStatus(lastLocalFor(localJobs, base.id)).label"
-                        :severity="stageStatus(lastLocalFor(localJobs, base.id)).severity"
+                        :value="stageStatus(localStageOf(base.id, 'run_update_db_local')).label"
+                        :severity="stageStatus(localStageOf(base.id, 'run_update_db_local')).severity"
                         :data-test="`lb-status-${base.id}`"
                       />
                     </td>
                     <td class="py-2 pr-3 whitespace-nowrap magaz-muted">
-                      {{ lastOkAt(lastLocalFor(localJobs, base.id)) }}
+                      {{ lastLocalUpdateOkAt(base.id) }}
                     </td>
                     <td class="py-2 pr-3 text-right whitespace-nowrap">
                       <Button label="Изменить" size="small" text :data-test="`lb-edit-${base.id}`" @click="openBaseEdit(base)" />
@@ -570,6 +747,7 @@ onUnmounted(() => {
             <thead>
               <tr class="magaz-muted border-b border-slate-200 text-left text-xs">
                 <th class="py-2 pr-3 font-medium">База</th>
+                <th class="py-2 pr-3 font-medium">Цикл</th>
                 <th class="py-2 pr-3 font-medium">Статус</th>
                 <th class="py-2 pr-3 font-medium">Начато</th>
                 <th class="py-2 pr-3 font-medium">Завершено</th>
@@ -577,8 +755,11 @@ onUnmounted(() => {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="job in localJobs" :key="job.id" class="border-b border-slate-100">
+              <tr v-for="job in localCycleJobs" :key="job.id" class="border-b border-slate-100">
                 <td class="py-2 pr-3">{{ job.local_base_name }}</td>
+                <td class="py-2 pr-3 magaz-muted whitespace-nowrap">
+                  {{ job.cycle_id ? `№${job.cycle_id}` : '—' }}
+                </td>
                 <td class="py-2 pr-3">
                   <Tag :value="JOB_STATUS_LABELS[job.status] ?? job.status" :severity="jobStatusSeverity(job.status)" />
                 </td>
@@ -590,8 +771,8 @@ onUnmounted(() => {
                   <span v-else class="magaz-muted text-xs">—</span>
                 </td>
               </tr>
-              <tr v-if="!localJobs.length && !jobsLoading">
-                <td colspan="5" class="magaz-muted py-6 text-center">Обновлений локальных баз ещё не было.</td>
+              <tr v-if="!localCycleJobs.length && !jobsLoading">
+                <td colspan="6" class="magaz-muted py-6 text-center">Обновлений локальных баз ещё не было.</td>
               </tr>
             </tbody>
           </table>

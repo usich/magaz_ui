@@ -26,6 +26,7 @@ from server.api import local_bases as local_bases_api
 from server.api import notifications as notifications_api
 from server.api import operations as operations_api
 from server.api import stores as stores_api
+from server.api import update_cycles as update_cycles_api
 from server.api.admins import AdminOut
 from server.config import API_PREFIX
 from server.core.context import AppContext
@@ -128,6 +129,11 @@ SETTINGS_DESCRIPTIONS: dict[str, str] = {
         "Папка файлов обновления локальных баз 1С (.cf/.cfe/.xml); "
         "пусто — путь из конфигурации сервера"
     ),
+    # Д-29: авто-закрытие цикла обновления по простою (0 — выключено)
+    "update_cycle_idle_min": (
+        "Минуты простоя цикла обновления, после которых он закрывается сам; "
+        "0 — не закрывать (границы задаёт кнопка «Начать новый цикл»)"
+    ),
 }
 
 # --- Роутеры ----------------------------------------------------------------
@@ -152,6 +158,8 @@ router.include_router(notifications_api.router)
 router.include_router(admins_api.router)
 #: Локальные базы 1С (Д-20): CRUD, учётные данные 1С (П-1), группировка по `group`
 router.include_router(local_bases_api.router)
+#: Циклы обновления (Д-29): текущий цикл, «начать новый», история, закрытие
+router.include_router(update_cycles_api.router)
 #: Бэкапы 1С (Д-21): сводка для главной и список статусов
 router.include_router(backups_api.router)
 

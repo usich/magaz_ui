@@ -15,8 +15,8 @@ import Tag from 'primevue/tag'
 import { useToast } from 'primevue/usetoast'
 
 import { ApiError } from '@/api/client'
-import { jobsApi } from '@/api/endpoints'
-import type { JobItem, LocalBaseItem } from '@/api/types'
+import { jobsApi, updateCyclesApi } from '@/api/endpoints'
+import type { CurrentCycle, JobItem, LocalBaseItem } from '@/api/types'
 import LocalBaseFormDialog from '@/components/LocalBaseFormDialog.vue'
 import LocalBaseUpdateDialog from '@/components/LocalBaseUpdateDialog.vue'
 import { useLocalBasesStore } from '@/stores/local_bases'
@@ -43,26 +43,58 @@ const visibleItems = computed(() => {
 // Д-24/Д-26: операции локальных баз по видам (обновление / слияние).
 // Д-28: проверку файлов построчно не показываем — операции запускаются пачкой
 // по выбранным базам из шапки таблицы.
-const localJobs = ref<JobItem[]>([])
-const localMergeJobs = ref<JobItem[]>([])
+// Д-29: статусы этапов считаются только по задачам **текущего цикла** локальных
+// баз — иначе успех прошлого прохода висел зелёным, а старая ошибка красной.
+const localCycle = ref<CurrentCycle | null>(null)
+const cycleJobs = ref<JobItem[]>([])
+const isCycleStarting = ref(false)
+
 async function loadJobs(): Promise<void> {
-  const [update, merge] = await Promise.all([
-    jobsApi.list({ kind: 'run_update_db_local', limit: 200 }),
-    jobsApi.list({ kind: 'run_merge_local', limit: 200 }),
-  ])
-  localJobs.value = update.items
-  localMergeJobs.value = merge.items
+  const info = await updateCyclesApi.current('local')
+  localCycle.value = info
+  const cycleId = info.cycle?.id ?? null
+  const page = cycleId ? await jobsApi.list({ cycleId, limit: 500 }) : null
+  cycleJobs.value = page?.items ?? []
 }
 
-/** Последняя задача по локальной базе в заданном списке (Д-24). */
-function lastLocalFor(jobs: JobItem[], localBaseId: number): JobItem | null {
+/** Начать новый цикл обновления локальных баз (Д-29). */
+async function startNewCycle(): Promise<void> {
+  isCycleStarting.value = true
+  try {
+    const result = await updateCyclesApi.openNew({ scope: 'local', transfer_active: true })
+    toast.add({ severity: 'success', summary: 'Начат новый цикл', detail: result.message, life: 5000 })
+    await loadJobs()
+  } catch (error) {
+    const message = error instanceof ApiError ? error.message : 'Не удалось начать новый цикл'
+    toast.add({ severity: 'error', summary: 'Новый цикл не начат', detail: message, life: 6000 })
+  } finally {
+    isCycleStarting.value = false
+  }
+}
+
+/** Последняя задача этапа локальной базы в текущем цикле (Д-29). */
+function localStageOf(localBaseId: number, kind: string): JobItem | null {
   let best: JobItem | null = null
-  for (const job of jobs) {
+  for (const job of cycleJobs.value) {
     if (job.local_base_id !== localBaseId) continue
+    if (job.kind !== kind) continue
     if (best === null || (job.created_at ?? '') > (best.created_at ?? '')) best = job
   }
   return best
 }
+
+/** Подпись бейджа цикла локальных баз. */
+const cycleLabel = computed(() => {
+  const cycle = localCycle.value?.cycle
+  if (!cycle) return 'Цикл ещё не начат'
+  return `Цикл №${cycle.id} · задач: ${cycle.stats.total}${
+    cycle.stats.active ? ` · в работе: ${cycle.stats.active}` : ''
+  }`
+})
+const cycleTone = computed(() => {
+  if (!localCycle.value?.cycle) return 'secondary'
+  return localCycle.value.suggest_new ? 'warn' : 'info'
+})
 
 // Диалог операции локальной базы (Д-24/Д-26); Д-25/Д-28: только массовый запуск.
 const bulkBaseIds = ref<number[]>([])
@@ -179,6 +211,21 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
         <span class="magaz-muted text-sm">всего {{ store.items.length }}</span>
       </div>
       <div class="flex flex-wrap items-center gap-2">
+        <!-- Д-29: статусы этапов относятся только к этому циклу -->
+        <Tag
+          :value="cycleLabel"
+          :severity="cycleTone"
+          data-test="lb-cycle-badge"
+        />
+        <Button
+          label="Начать новый цикл"
+          size="small"
+          severity="secondary"
+          outlined
+          :loading="isCycleStarting"
+          data-test="lb-cycle-new"
+          @click="startNewCycle"
+        />
         <Button
           label="Выбрать все"
           severity="secondary"
@@ -280,15 +327,15 @@ async function removeBase(base: LocalBaseItem): Promise<void> {
               </td>
               <td class="py-2 pr-3 whitespace-nowrap">
                 <Tag
-                  :value="stageStatus(lastLocalFor(localMergeJobs, base.id)).label"
-                  :severity="stageStatus(lastLocalFor(localMergeJobs, base.id)).severity"
+                  :value="stageStatus(localStageOf(base.id, 'run_merge_local')).label"
+                  :severity="stageStatus(localStageOf(base.id, 'run_merge_local')).severity"
                   :data-test="`lb-merge-status-${base.id}`"
                 />
               </td>
               <td class="py-2 pr-3 whitespace-nowrap">
                 <Tag
-                  :value="stageStatus(lastLocalFor(localJobs, base.id)).label"
-                  :severity="stageStatus(lastLocalFor(localJobs, base.id)).severity"
+                  :value="stageStatus(localStageOf(base.id, 'run_update_db_local')).label"
+                  :severity="stageStatus(localStageOf(base.id, 'run_update_db_local')).severity"
                   :data-test="`lb-status-${base.id}`"
                 />
               </td>

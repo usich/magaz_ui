@@ -106,6 +106,7 @@ describe('стор задач (§11.6)', () => {
     jobs.kind = 'run_merge'
     jobs.status = 'failed'
     jobs.activeOnly = true
+    jobs.cycleId = 15 // Д-29: «показать задачи одного цикла»
 
     await jobs.load()
 
@@ -115,6 +116,7 @@ describe('стор задач (§11.6)', () => {
     expect(url).toContain('kind=run_merge')
     expect(url).toContain('status=failed')
     expect(url).toContain('active_only=true')
+    expect(url).toContain('cycle_id=15')
   })
 
   it('карточка задачи тянет полный журнал', async () => {

@@ -238,6 +238,8 @@ def create_command(
     params: dict[str, Any] | None = None,
     created_by: str | None = None,
     flush: bool = True,
+    cycle_id: int | None = None,
+    batch_id: str | None = None,
 ) -> Command:
     """Создать задачу в статусе `queued` (§4.3): её подхватит диспетчер.
 
@@ -247,6 +249,10 @@ def create_command(
     `flush=False` используют массовые операции: они ставят десятки задач в одну
     транзакцию и делают единственный flush в конце. Промежуточный flush на
     каждую задачу упирался в блокировку БД и «подвешивал» запуск из UI.
+
+    Д-29: `cycle_id` и `batch_id` заполняет вызывающий код (API-слой) через
+    `update_cycle_service`: сервис задач не знает про циклы, чтобы не появился
+    циклический импорт.
     """
     command = Command(
         store_id=store_id,
@@ -255,6 +261,8 @@ def create_command(
         status=CommandStatus.QUEUED,
         attempts=0,
         created_by=created_by,
+        cycle_id=cycle_id,
+        batch_id=batch_id,
     )
     session.add(command)
     if flush:
@@ -277,6 +285,8 @@ def create_local_command(
     params: dict[str, Any] | None = None,
     created_by: str | None = None,
     flush: bool = True,
+    cycle_id: int | None = None,
+    batch_id: str | None = None,
 ) -> Command:
     """Создать задачу обновления **локальной** базы (Д-24) в статусе `queued`.
 
@@ -286,6 +296,7 @@ def create_local_command(
     `commands.params` (I-7); подключение берётся из карточки базы.
 
     `flush=False` — для массовой постановки (аналог `create_command`).
+    Д-29: `cycle_id`/`batch_id` заполняет API-слой (`update_cycle_service`).
     """
     command = Command(
         store_id=None,
@@ -295,6 +306,8 @@ def create_local_command(
         status=CommandStatus.QUEUED,
         attempts=0,
         created_by=created_by,
+        cycle_id=cycle_id,
+        batch_id=batch_id,
     )
     session.add(command)
     if flush:
@@ -364,6 +377,8 @@ def list_commands(
     kind: str | None = None,
     status: str | None = None,
     active_only: bool = False,
+    cycle_id: int | None = None,
+    batch_id: str | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[Command]:
@@ -371,6 +386,8 @@ def list_commands(
 
     `store_id` и `local_base_id` взаимоисключающие (Д-24): задача магазина
     ссылается на магазин, локальная — на базу. Оба не заданы — все задачи.
+
+    Д-29: `cycle_id`/`batch_id` — фильтры по циклу обновления и «пачке запуска».
     """
     stmt = (
         select(Command)
@@ -387,6 +404,10 @@ def list_commands(
         stmt = stmt.where(Command.status == status)
     if active_only:
         stmt = stmt.where(Command.status.in_(ACTIVE_STATUSES))
+    if cycle_id is not None:
+        stmt = stmt.where(Command.cycle_id == cycle_id)
+    if batch_id:
+        stmt = stmt.where(Command.batch_id == batch_id)
     return list(session.scalars(stmt.limit(max(1, limit)).offset(max(0, offset))).all())
 
 
