@@ -138,6 +138,7 @@ class ScriptedAgent:
         downloaded_file_name: str | None = None,
         download_failed: bool = False,
         download_error: str | None = None,
+        download_failures_before_success: int = 0,
         credentials_version: int = 1,
         devices_version: int = 1,
         device_status: str = "online",
@@ -156,6 +157,13 @@ class ScriptedAgent:
         self.downloaded_file_name = downloaded_file_name
         self.download_failed = download_failed
         self.download_error = download_error
+        #: Д-33: сколько первых запусков скачивания провалить. Так ведёт себя
+        #: касса, когда Диск отвечает `429`: `last-download.json` = `failed`, а
+        #: следующий `/download-file` проходит.
+        self.download_failures_before_success = download_failures_before_success
+        self.download_failures_left = download_failures_before_success
+        #: Провалилась ли текущая (последняя запрошенная) попытка скачивания
+        self.download_failed_now = False
         self.download_polls = 0
         self.download_requested = False
         self.credentials_version = credentials_version
@@ -258,6 +266,11 @@ class ScriptedAgent:
         if path == "/download-file":
             self.download_polls = 0
             self.download_requested = True
+            # Д-33: запрошенная попытка скачивания может провалиться (429), но
+            # следующий `/download-file` её повторит — как на реальной кассе.
+            self.download_failed_now = self.download_failures_left > 0
+            if self.download_failed_now:
+                self.download_failures_left -= 1
             return httpx.Response(202, json={"message": "Download started in the background."})
         if path == "/send-message":
             return httpx.Response(
@@ -305,7 +318,7 @@ class ScriptedAgent:
             downloaded_name[: len(downloaded_name) - len(suffix) - 1] if dot else downloaded_name
         )
         has_cf = bool(self.cf_exists or (appeared and stem == filename))
-        if self.download_failed:
+        if self.download_failed or self.download_failed_now:
             download_status = "failed"
             download_error = self.download_error or "ссылка не получена"
         elif appeared:

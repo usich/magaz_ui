@@ -23,7 +23,11 @@ from sqlalchemy.orm import Session
 
 from server.config import Settings
 from server.core.client_http import AgentProtocolError
-from server.core.dispatcher import CommandDispatcher, build_1c_payload
+from server.core.dispatcher import (
+    CommandDispatcher,
+    build_1c_payload,
+    is_retryable_download_error,
+)
 from server.core.security import SecretBox
 from server.db.models import Command, FileCheck, JobLog, Notification, Store, UpdateCycle
 from server.db.session import DatabaseManager
@@ -1032,6 +1036,36 @@ class TestDevicesPush:
 
 
 
+class TestDownloadErrorClassification:
+    """Д-33: повторяем только временные отказы Яндекс.Диска.
+
+    `429 Too Many Requests` — лимит на IP кассы (она скачивает сама), `5xx` и
+    сетевой сбой — тоже временные: задача должна дождаться файла. Постоянные
+    отказы (`404`, `403`, «ссылка не получена») повторять бессмысленно — задача
+    закрывается `failed` сразу (Д-7а, §11.4).
+    """
+
+    @pytest.mark.parametrize(
+        ("reason", "expected"),
+        [
+            ("HTTP 429", True),
+            ("HTTP 500", True),
+            ("HTTP 502", True),
+            ("HTTP 503", True),
+            ("HTTP 504", True),
+            ("сетевой сбой", True),
+            ("HTTP 404", False),
+            ("HTTP 403", False),
+            ("HTTP 401", False),
+            ("ссылка не получена", False),
+            ("", False),
+            ("[WinError 112] На диске недостаточно места", False),
+        ],
+    )
+    def test_only_temporary_errors_are_retried(self, reason: str, expected: bool) -> None:
+        assert is_retryable_download_error(reason) is expected
+
+
 class TestDownloadScenario:
     """ФН2: «разослать ссылку» → дождаться файла → повторная проверка (§11.3)."""
 
@@ -1195,6 +1229,57 @@ class TestDownloadScenario:
         assert fresh(session, command.id).status == CommandStatus.TIMEOUT
 
 
+    @pytest.mark.parametrize("reason", ["HTTP 429", "HTTP 503", "сетевой сбой"])
+    async def test_temporary_download_error_is_retried_until_file_appears(
+        self,
+        manager: DatabaseManager,
+        settings: Settings,
+        session: Session,
+        reason: str,
+    ) -> None:
+        """Д-33: временный отказ Диска задачу не роняет — скачивание повторяется.
+
+        Пакет скачивает касса, поэтому `429 Too Many Requests` — это лимит на её
+        IP: раньше такая задача закрывалась `failed`, и админу приходилось
+        ставить её заново. Теперь диспетчер возвращает задачу в очередь и после
+        паузы backoff отправляет `/download-file` ещё раз, а `success` ставит,
+        когда файл действительно появился в рабочей папке кассы.
+        """
+        seed_settings(session)
+        store = make_store(session, online=True)
+        command = add_command(
+            session,
+            store,
+            CommandKind.DOWNLOAD_FILE,
+            {"url-file": "https://disk.yandex.ru/d/XXXX/update.cf"},
+        )
+        command_id = command.id
+        agent = ScriptedAgent(download_failures_before_success=1, download_error=reason)
+        dispatcher = build_dispatcher(manager, settings, transport=agent.transport)
+
+        await dispatcher.process_once()  # попытка 1: /download-file
+        assert fresh(session, command_id).status == CommandStatus.RUNNING
+
+        report = await dispatcher.process_once()  # /check-files → failed → повтор
+        state = fresh(session, command_id)
+        assert state.status == CommandStatus.QUEUED, "временный отказ не закрывает задачу"
+        assert state.last_error == reason, "причина видна админу в задаче"
+        assert report.retried == 1
+        assert agent.paths().count("/download-file") == 1, "повтор отложен паузой backoff"
+        messages = [
+            row.message
+            for row in session.scalars(
+                select(JobLog).where(JobLog.command_id == command_id).order_by(JobLog.id)
+            )
+        ]
+        assert any(reason in message and "повторяем" in message for message in messages)
+
+        await dispatcher.process_once()  # попытка 2: /download-file снова
+        await dispatcher.process_once()  # файл появился → success
+
+        assert fresh(session, command_id).status == CommandStatus.SUCCESS
+        assert agent.paths().count("/download-file") == 2, "скачивание повторено на кассе"
+
     async def test_download_failed_status_completes_failed(
         self, manager: DatabaseManager, settings: Settings, session: Session
     ) -> None:
@@ -1230,6 +1315,8 @@ class TestDownloadScenario:
         assert state.log_files == [
             "ukPxhdZu6Ax4WQ"
         ], "log_files — имя из ссылки (basename), файл не появился"
+        # Д-33: постоянный отказ (ресурса нет) не повторяем — задача закрыта сразу
+        assert agent.paths().count("/download-file") == 1
 
 
 class TestDispatcherLifecycle:

@@ -19,6 +19,13 @@
 6. **проверка после скачивания** (§11.3) — задача `download_file` закрывается
    успехом, когда `/check-files` реально видит скачанный файл, и заодно
    сохраняет снимок в `file_checks` (Q52) — это и есть «повторная проверка».
+7. **повтор временных отказов Яндекс.Диска** (Д-33): `429 Too Many Requests`,
+   `5xx` и сетевой сбой не закрывают задачу `download_file`, а возвращают её
+   в `queued` — скачивание уходит на кассу заново после паузы backoff. Диск
+   ограничивает частоту скачиваний **с одного IP** (касса качает сама), и через
+   паузу тот же файл скачивается. Постоянные отказы (`404`, `403`, «ссылка не
+   получена») по-прежнему закрывают задачу `failed` сразу (Д-7а), а общий предел
+   ожидания остаётся один — `command_poll_timeout_sec` (§11.4).
 
 Урок этапа Э3 (наблюдение №7): **нельзя верить только `/check-*`** — упавший
 запуск 1С не пишет лог, и `/check-merge` честно отвечает `202 in_progress`.
@@ -35,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -81,10 +89,12 @@ __all__ = [
     "BACKOFF_MAX_SEC",
     "BUSY_GRACE_SEC",
     "CommandDispatcher",
+    "DOWNLOAD_RETRYABLE_STATUSES",
     "DispatchReport",
     "STOP_TIMEOUT_SEC",
     "expected_file_kind",
     "extract_file_name",
+    "is_retryable_download_error",
 ]
 
 #: Ключи настроек §4.9, от которых зависит диспетчер
@@ -110,6 +120,36 @@ FILE_KIND_BY_SUFFIX: dict[str, str] = {".cf": "cf", ".cfe": "cfe", ".xml": "xml"
 POLLABLE_KINDS: frozenset[str] = frozenset(
     {str(CommandKind.RUN_MERGE), str(CommandKind.RUN_UPDATE_DB)}
 )
+
+#: Д-33: отказы Яндекс.Диска, которые проходят сами — скачивание повторяем.
+#: `429` — «слишком много запросов»: Диск ограничивает частоту скачиваний с
+#: одного IP (касса качает сама), `5xx` — временный сбой на стороне Диска.
+#: `404`/`403`/`400` сюда не входят: ресурс удалён или закрыт, повтор бесполезен.
+DOWNLOAD_RETRYABLE_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+#: Код ответа в тексте ошибки агента: `downloader.py` пишет `"HTTP 429"` (`exc`)
+_DOWNLOAD_HTTP_STATUS_RE = re.compile(r"HTTP\s+(\d{3})", re.IGNORECASE)
+#: Текст сетевого сбоя в `last-download.json` (`client/agent/downloader.py`)
+_DOWNLOAD_NETWORK_ERROR = "сетевой сбой"
+
+
+def is_retryable_download_error(reason: str) -> bool:
+    """Временный ли это отказ Яндекс.Диска — тогда скачивание повторяем (Д-33).
+
+    Касса скачивает пакет сама, поэтому `429 Too Many Requests` означает лимит
+    **на её IP**: через паузу тот же запрос проходит, и «ронять» из-за него
+    задачу нельзя — админу пришлось бы ставить её заново вручную. Сетевой сбой
+    и `5xx` — того же класса. Постоянные отказы (`404` — ресурс удалён, `403` —
+    ссылка закрыта, «ссылка не получена») возвращают `False`: повторять
+    бессмысленно, задача закрывается `failed` с текстом причины (Д-7а, §11.4).
+    """
+    text = str(reason or "").strip()
+    if not text:
+        return False
+    if _DOWNLOAD_NETWORK_ERROR in text.casefold():
+        return True
+    match = _DOWNLOAD_HTTP_STATUS_RE.search(text)
+    return bool(match) and int(match.group(1)) in DOWNLOAD_RETRYABLE_STATUSES
+
 
 def extract_file_name(url_file: str) -> str:
     """Имя файла без расширения из ссылки — как его понимает `/check-files` (FR-2).
@@ -1019,10 +1059,16 @@ class CommandDispatcher:
         # Урок Э3 (наблюдение №7) — «нельзя верить только `/check-*`», но и
         # ждать файл бесконечно нельзя: скачивание на кассе могло провалиться
         # (сетевой сбой, Диск не отдал ссылку). Агент пишет `status: failed` в
-        # `last-download.json` и сообщает его в `/check-files`. Закрываем задачу
-        # как `failed` с текстом ошибки, а не «висим» до таймаута (§11.4).
+        # `last-download.json` и сообщает его в `/check-files`.
+        #
+        # Д-33: временный отказ Диска (`429 Too Many Requests`, `5xx`, сетевой
+        # сбой) задачу не роняет — скачивание уходит на кассу заново после
+        # паузы. Постоянный (`404`, `403`, «ссылка не получена») закрывает её
+        # `failed` сразу, как и раньше (Д-7а): повторять нечего.
         if str(response.download_status or "") == "failed":
             reason = response.download_error or "неизвестная ошибка при скачивании"
+            if self._retry_download_if_temporary(session, command, reason, report):
+                return
             self._finish(
                 session,
                 command,
@@ -1065,6 +1111,59 @@ class CommandDispatcher:
             follow_up,
             f"Повторная проверка после скачивания (задача {command.id})",
         )
+
+    def _retry_download_if_temporary(
+        self,
+        session: Any,  # noqa: ANN401 - Session
+        command: Command,
+        reason: str,
+        report: DispatchReport,
+    ) -> bool:
+        """Повторить скачивание после временного отказа Диска (Д-33, §11.3).
+
+        Пакет скачивает **касса**, поэтому `429 Too Many Requests` — это лимит
+        на её IP: через паузу тот же запрос проходит. Закрывать из-за него
+        задачу `failed` нельзя (админу пришлось бы ставить её заново), поэтому
+        задача возвращается в `queued` и уходит на кассу заново
+        (`/download-file`) — как обычная повторная отправка, но с паузой
+        backoff, чтобы не добивать Диск частыми запросами.
+
+        Повторы не бесконечны: предел ожидания задачи один — `command_poll_timeout_sec`
+        (§11.4). Обычно его применяет `_expired`, но для `queued` он молчит
+        (там ждёт офлайн-касса, FR-16), поэтому та же проверка нужна и здесь.
+        Возвращает `True`, если задача отложена на повтор.
+        """
+        if not is_retryable_download_error(reason):
+            return False
+        attempts = int(command.attempts or 0)
+        limit = float(self._setting(session, POLL_TIMEOUT_SETTING))
+        if command_service.status_age_sec(command) >= limit:
+            command_service.add_log(
+                session,
+                command,
+                f"Повторы скачивания исчерпаны: {reason} (попыток: {attempts})",
+                level=JobLogLevel.WARNING,
+            )
+            return False
+
+        command.last_error = reason[: command_service.MAX_LOG_LINE_CHARS]
+        command_service.set_status(session, command, CommandStatus.QUEUED)
+        command_service.add_log(
+            session,
+            command,
+            f"Скачивание не удалось ({reason}) — временный отказ Яндекс.Диска, "
+            f"повторяем попытку (попыток: {attempts})",
+            level=JobLogLevel.WARNING,
+        )
+        self._schedule_backoff(command.id, attempts=attempts)
+        report.retried += 1
+        report.waiting += 1
+        logger.info(
+            "Задача id=%s: Яндекс.Диск ответил «%s» — скачивание будет повторено",
+            command.id,
+            reason,
+        )
+        return True
 
     def _cycle_id_for_follow_up(self, session: Any, command: Command) -> int | None:  # noqa: ANN401
         """Цикл обновления для автоматической задачи-продолжения (Д-32).

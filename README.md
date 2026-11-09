@@ -362,6 +362,7 @@ DoD (§12): 32 теста v2 перенесены и зелёные; `409` пр�
 | Операция переживает перезагрузку (§7.3) | `TestOperationStateFile` | `agent-state.json`: `running` → `finished`; после рестарта службы — `interrupted` и `interrupted_operation=update-db` в `/health` |
 | Приёмка П-1 (подстановка пароля) | `TestProfilePassword` | явный пароль побеждает; профиль используется, если пароля нет; зашифрованный профиль без расшифровки → пусто + предупреждение, агент не падает |
 | ФН2 (FR-1, I-2) | `TestDownloaderYandexDisk` | файл сохраняется по basename; `..\..\evil.exe` остаётся внутри рабочей папки; ошибки диска не выбрасываются наружу |
+| Ограничение частоты Диска (Д-33) | `tests/server/test_dispatcher.py::TestDownloadErrorClassification`, `TestDownloadScenario::test_temporary_download_error_is_retried_until_file_appears` | `429`/`5xx`/сетевой сбой не закрывают задачу: она возвращается в очередь и скачивание повторяется до появления файла (предел — `command_poll_timeout_sec`); `404`/`403`/«ссылка не получена» — сразу `failed`, без повторов |
 | Реальная 1С/сеть в тестах | `RecordingProvider`, `httpx.MockTransport` | `1cv8.exe`, `msg.exe`, `taskkill` и Яндекс.Диск в проверках не вызываются |
 
 ### Отклонения и решения, принятые по ходу этапа
